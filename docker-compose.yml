@@ -1,0 +1,452 @@
+name: forge
+
+services:
+  forge-runtime-init:
+    image: busybox:1.37
+    command:
+      - sh
+      - -c
+      - >-
+        mkdir -p /workspaces /runner-queue/offline/requests /runner-queue/offline/responses
+        /runner-queue/offline/cancellations /runner-queue/install/requests
+        /runner-queue/install/responses /runner-queue/install/cancellations &&
+        chown -R 10001:10001 /workspaces /runner-queue &&
+        chmod -R u+rwX,go-rwx /workspaces /runner-queue
+    volumes:
+      - forge-workspaces:/workspaces
+      - forge-runner-queue:/runner-queue
+    restart: "no"
+
+  forge-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-forge}
+      POSTGRES_USER: ${POSTGRES_USER:-forge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-forge_dev_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - forge-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  forge-redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - forge-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  forge-api:
+    build:
+      context: ./apps/api
+      target: runtime
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge_dev_password}@forge-postgres:5432/${POSTGRES_DB:-forge}
+      REDIS_URL: redis://forge-redis:6379/0
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      EVENT_STREAM_NAME: ${EVENT_STREAM_NAME:-forge.events}
+      EVENT_DLQ_STREAM_NAME: ${EVENT_DLQ_STREAM_NAME:-forge.events.dlq}
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-mock}
+      ALLOW_PAID_MODEL_CALLS: ${ALLOW_PAID_MODEL_CALLS:-false}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENAI_ENABLED: ${OPENAI_ENABLED:-true}
+      GEMINI_ENABLED: ${GEMINI_ENABLED:-false}
+      OPENROUTER_ENABLED: ${OPENROUTER_ENABLED:-false}
+      MODEL_CATALOG: ${MODEL_CATALOG:-[]}
+      MODEL_REQUEST_TIMEOUT_SECONDS: ${MODEL_REQUEST_TIMEOUT_SECONDS:-120}
+      MODEL_TRANSIENT_MAX_ATTEMPTS: ${MODEL_TRANSIENT_MAX_ATTEMPTS:-3}
+      MODEL_RETRY_BASE_SECONDS: ${MODEL_RETRY_BASE_SECONDS:-0.25}
+      STORE_MODEL_INPUTS: ${STORE_MODEL_INPUTS:-false}
+      AGENT_RUN_STALE_SECONDS: ${AGENT_RUN_STALE_SECONDS:-300}
+      MODEL_DEFAULT: ${MODEL_DEFAULT:-gpt-5.4-mini}
+      MODEL_FAST: ${MODEL_FAST:-gpt-5.4-nano}
+      MODEL_REASONING: ${MODEL_REASONING:-gpt-5.4}
+      MODEL_CODING: ${MODEL_CODING:-gpt-5.4-mini}
+      MODEL_PLANNER: ${MODEL_PLANNER:-gpt-5.4-mini}
+      MODEL_DEVELOPER_FAST: ${MODEL_DEVELOPER_FAST:-gpt-5.4-nano}
+      MODEL_DEVELOPER_CODING: ${MODEL_DEVELOPER_CODING:-gpt-5.4-mini}
+      MODEL_DEVELOPER_REASONING: ${MODEL_DEVELOPER_REASONING:-gpt-5.4}
+      MODEL_QA_FAST: ${MODEL_QA_FAST:-gpt-5.4-nano}
+      MODEL_QA_VISUAL: ${MODEL_QA_VISUAL:-gpt-5.4-mini}
+      MAX_MODEL_CALLS_PER_TASK: ${MAX_MODEL_CALLS_PER_TASK:-24}
+      MAX_MODEL_CALLS_PER_MISSION: ${MAX_MODEL_CALLS_PER_MISSION:-100}
+      MAX_FREE_MODEL_CALLS_PER_TASK: ${MAX_FREE_MODEL_CALLS_PER_TASK:-24}
+      MAX_PAID_MODEL_CALLS_PER_TASK: ${MAX_PAID_MODEL_CALLS_PER_TASK:-8}
+      MAX_AI_SPEND_PER_TASK: ${MAX_AI_SPEND_PER_TASK:-}
+      MAX_AI_SPEND_PER_MISSION: ${MAX_AI_SPEND_PER_MISSION:-}
+      MAX_MODEL_CALLS_PER_ITERATION: ${MAX_MODEL_CALLS_PER_ITERATION:-24}
+      MAX_INPUT_TOKENS_PER_TASK: ${MAX_INPUT_TOKENS_PER_TASK:-240000}
+      MAX_OUTPUT_TOKENS_PER_TASK: ${MAX_OUTPUT_TOKENS_PER_TASK:-48000}
+      MODEL_BUDGET_WARNING_RATIO: ${MODEL_BUDGET_WARNING_RATIO:-0.8}
+      CONTEXT_RECENT_OBSERVATIONS: ${CONTEXT_RECENT_OBSERVATIONS:-3}
+      DUPLICATE_TOOL_TURN_THRESHOLD: ${DUPLICATE_TOOL_TURN_THRESHOLD:-2}
+      PRODUCT_QA_ENABLED: ${PRODUCT_QA_ENABLED:-true}
+      MODEL_PRICING: ${MODEL_PRICING:-{}}
+      MISSION_MAX_AGENTS: ${MISSION_MAX_AGENTS:-8}
+      MISSION_MAX_TASKS: ${MISSION_MAX_TASKS:-30}
+      MISSION_MAX_DEPENDENCIES: ${MISSION_MAX_DEPENDENCIES:-100}
+      MISSION_MAX_PLANNING_ATTEMPTS: ${MISSION_MAX_PLANNING_ATTEMPTS:-3}
+      PLANNING_RUN_STALE_SECONDS: ${PLANNING_RUN_STALE_SECONDS:-300}
+      PLANNER_REQUEST_TIMEOUT_SECONDS: ${PLANNER_REQUEST_TIMEOUT_SECONDS:-30}
+      PLANNER_PROVIDER_MAX_ATTEMPTS: ${PLANNER_PROVIDER_MAX_ATTEMPTS:-3}
+      PLANNER_RETRY_BASE_SECONDS: ${PLANNER_RETRY_BASE_SECONDS:-0.5}
+      TOOLS_ENABLED: ${TOOLS_ENABLED:-true}
+      FILESYSTEM_LIST_ENABLED: ${FILESYSTEM_LIST_ENABLED:-true}
+      FILESYSTEM_READ_ENABLED: ${FILESYSTEM_READ_ENABLED:-true}
+      FILESYSTEM_WRITE_ENABLED: ${FILESYSTEM_WRITE_ENABLED:-true}
+      SHELL_RUN_ENABLED: ${SHELL_RUN_ENABLED:-false}
+      TOOL_WORKSPACE_ROOT: /workspaces
+      FILESYSTEM_TOOL_TIMEOUT_SECONDS: ${FILESYSTEM_TOOL_TIMEOUT_SECONDS:-10}
+      TOOL_FILE_READ_MAX_BYTES: ${TOOL_FILE_READ_MAX_BYTES:-262144}
+      TOOL_FILE_WRITE_MAX_BYTES: ${TOOL_FILE_WRITE_MAX_BYTES:-262144}
+      TOOL_OBSERVATION_MAX_CHARS: ${TOOL_OBSERVATION_MAX_CHARS:-50000}
+      AGENT_MAX_TOOL_STEPS: ${AGENT_MAX_TOOL_STEPS:-10}
+      TOOL_CALL_STALE_SECONDS: ${TOOL_CALL_STALE_SECONDS:-300}
+      AUTONOMY_ENABLED: ${AUTONOMY_ENABLED:-false}
+      ORCHESTRATOR_RECONCILE_INTERVAL_SECONDS: ${ORCHESTRATOR_RECONCILE_INTERVAL_SECONDS:-5}
+      WORKER_STALE_SECONDS: ${WORKER_STALE_SECONDS:-30}
+      FORGE_MAX_CONCURRENT_TASKS: ${FORGE_MAX_CONCURRENT_TASKS:-4}
+      DEVELOPMENT_ENABLED: ${DEVELOPMENT_ENABLED:-true}
+      DEVELOPMENT_RUNNER_MODE: queue
+      DEVELOPMENT_RUNNER_QUEUE_ROOT: /runner-queue
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - forge-workspaces:/workspaces
+      - forge-runner-queue:/runner-queue
+    depends_on:
+      forge-runtime-init:
+        condition: service_completed_successfully
+      forge-postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  forge-api-test:
+    profiles: ["test"]
+    build:
+      context: ./apps/api
+      target: test
+    user: "10001:10001"
+    environment:
+      HOME: /tmp
+      APP_ENV: test
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge_dev_password}@forge-postgres:5432/forge_test
+      TEST_DATABASE_ADMIN_URL: postgresql://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge_dev_password}@forge-postgres:5432/postgres
+      REDIS_URL: redis://forge-redis:6379/1
+      LOG_LEVEL: WARNING
+      CORS_ORIGINS: http://localhost:3000
+      EVENT_STREAM_NAME: forge.events.test
+      EVENT_DLQ_STREAM_NAME: forge.events.dlq.test
+      MODEL_PROVIDER: mock
+      ALLOW_PAID_MODEL_CALLS: "false"
+      OPENAI_API_KEY: ""
+      STORE_MODEL_INPUTS: "false"
+      TOOLS_ENABLED: "true"
+      TOOL_WORKSPACE_ROOT: /workspaces
+      DEVELOPMENT_RUNNER_MODE: queue
+      DEVELOPMENT_RUNNER_QUEUE_ROOT: /runner-queue
+    volumes:
+      - forge-workspaces:/workspaces
+      - forge-runner-queue:/runner-queue
+    depends_on:
+      forge-runtime-init:
+        condition: service_completed_successfully
+      forge-postgres:
+        condition: service_healthy
+      forge-redis:
+        condition: service_healthy
+      forge-dev-runner:
+        condition: service_started
+      forge-dev-install-runner:
+        condition: service_started
+
+  forge-event-publisher:
+    build:
+      context: ./apps/api
+      target: runtime
+    command: ["python", "-m", "app.workers.event_publisher"]
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge_dev_password}@forge-postgres:5432/${POSTGRES_DB:-forge}
+      REDIS_URL: redis://forge-redis:6379/0
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      EVENT_STREAM_NAME: ${EVENT_STREAM_NAME:-forge.events}
+      EVENT_DLQ_STREAM_NAME: ${EVENT_DLQ_STREAM_NAME:-forge.events.dlq}
+      EVENT_PUBLISH_BATCH_SIZE: ${EVENT_PUBLISH_BATCH_SIZE:-50}
+      EVENT_PUBLISH_INTERVAL_MS: ${EVENT_PUBLISH_INTERVAL_MS:-500}
+      EVENT_PROCESSING_LEASE_SECONDS: ${EVENT_PROCESSING_LEASE_SECONDS:-30}
+    depends_on:
+      forge-runtime-init:
+        condition: service_completed_successfully
+      forge-api:
+        condition: service_healthy
+      forge-redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  forge-event-consumer:
+    build:
+      context: ./apps/api
+      target: runtime
+    command: ["python", "-m", "app.workers.event_consumer"]
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge_dev_password}@forge-postgres:5432/${POSTGRES_DB:-forge}
+      REDIS_URL: redis://forge-redis:6379/0
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      EVENT_STREAM_NAME: ${EVENT_STREAM_NAME:-forge.events}
+      EVENT_DLQ_STREAM_NAME: ${EVENT_DLQ_STREAM_NAME:-forge.events.dlq}
+      EVENT_MAX_RETRIES: ${EVENT_MAX_RETRIES:-5}
+      EVENT_RETRY_BASE_SECONDS: ${EVENT_RETRY_BASE_SECONDS:-1.0}
+      EVENT_CONSUMER_BLOCK_MS: ${EVENT_CONSUMER_BLOCK_MS:-1000}
+      EVENT_PROCESSING_LEASE_SECONDS: ${EVENT_PROCESSING_LEASE_SECONDS:-30}
+    depends_on:
+      forge-api:
+        condition: service_healthy
+      forge-redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  forge-orchestrator:
+    build:
+      context: ./apps/api
+      target: runtime
+    command: ["python", "-m", "app.workers.orchestrator"]
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge_dev_password}@forge-postgres:5432/${POSTGRES_DB:-forge}
+      REDIS_URL: redis://forge-redis:6379/0
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      EVENT_SOURCE: forge-orchestrator
+      EVENT_STREAM_NAME: ${EVENT_STREAM_NAME:-forge.events}
+      EVENT_DLQ_STREAM_NAME: ${EVENT_DLQ_STREAM_NAME:-forge.events.dlq}
+      EVENT_MAX_RETRIES: ${EVENT_MAX_RETRIES:-5}
+      EVENT_RETRY_BASE_SECONDS: ${EVENT_RETRY_BASE_SECONDS:-1.0}
+      EVENT_CONSUMER_BLOCK_MS: ${EVENT_CONSUMER_BLOCK_MS:-1000}
+      EVENT_PROCESSING_LEASE_SECONDS: ${EVENT_PROCESSING_LEASE_SECONDS:-30}
+      AUTONOMY_ENABLED: ${AUTONOMY_ENABLED:-false}
+      ORCHESTRATOR_RECONCILE_INTERVAL_SECONDS: ${ORCHESTRATOR_RECONCILE_INTERVAL_SECONDS:-5}
+      ORCHESTRATOR_RECOVERY_INTERVAL_SECONDS: ${ORCHESTRATOR_RECOVERY_INTERVAL_SECONDS:-10}
+      WORKER_STALE_SECONDS: ${WORKER_STALE_SECONDS:-30}
+      JOB_RETRY_BASE_SECONDS: ${JOB_RETRY_BASE_SECONDS:-5}
+      EXECUTION_JOB_MAX_ATTEMPTS: ${EXECUTION_JOB_MAX_ATTEMPTS:-3}
+      PLANNING_RUN_STALE_SECONDS: ${PLANNING_RUN_STALE_SECONDS:-300}
+      TOOL_WORKSPACE_ROOT: /workspaces
+    volumes:
+      - forge-workspaces:/workspaces:ro
+    depends_on:
+      forge-api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://forge-api:8000/api/v1/orchestrator/health', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  forge-agent-worker:
+    build:
+      context: ./apps/api
+      target: runtime
+    command: ["python", "-m", "app.workers.agent_worker"]
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge_dev_password}@forge-postgres:5432/${POSTGRES_DB:-forge}
+      REDIS_URL: redis://forge-redis:6379/0
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      EVENT_SOURCE: forge-agent-worker
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-mock}
+      ALLOW_PAID_MODEL_CALLS: ${ALLOW_PAID_MODEL_CALLS:-false}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENAI_ENABLED: ${OPENAI_ENABLED:-true}
+      GEMINI_ENABLED: ${GEMINI_ENABLED:-false}
+      OPENROUTER_ENABLED: ${OPENROUTER_ENABLED:-false}
+      MODEL_CATALOG: ${MODEL_CATALOG:-[]}
+      MODEL_REQUEST_TIMEOUT_SECONDS: ${MODEL_REQUEST_TIMEOUT_SECONDS:-120}
+      MODEL_TRANSIENT_MAX_ATTEMPTS: ${MODEL_TRANSIENT_MAX_ATTEMPTS:-3}
+      MODEL_RETRY_BASE_SECONDS: ${MODEL_RETRY_BASE_SECONDS:-0.25}
+      STORE_MODEL_INPUTS: ${STORE_MODEL_INPUTS:-false}
+      MODEL_DEFAULT: ${MODEL_DEFAULT:-gpt-5.4-mini}
+      MODEL_FAST: ${MODEL_FAST:-gpt-5.4-nano}
+      MODEL_REASONING: ${MODEL_REASONING:-gpt-5.4}
+      MODEL_CODING: ${MODEL_CODING:-gpt-5.4-mini}
+      MODEL_PLANNER: ${MODEL_PLANNER:-gpt-5.4-mini}
+      MODEL_DEVELOPER_FAST: ${MODEL_DEVELOPER_FAST:-gpt-5.4-nano}
+      MODEL_DEVELOPER_CODING: ${MODEL_DEVELOPER_CODING:-gpt-5.4-mini}
+      MODEL_DEVELOPER_REASONING: ${MODEL_DEVELOPER_REASONING:-gpt-5.4}
+      MODEL_QA_FAST: ${MODEL_QA_FAST:-gpt-5.4-nano}
+      MODEL_QA_VISUAL: ${MODEL_QA_VISUAL:-gpt-5.4-mini}
+      MAX_MODEL_CALLS_PER_TASK: ${MAX_MODEL_CALLS_PER_TASK:-24}
+      MAX_MODEL_CALLS_PER_MISSION: ${MAX_MODEL_CALLS_PER_MISSION:-100}
+      MAX_FREE_MODEL_CALLS_PER_TASK: ${MAX_FREE_MODEL_CALLS_PER_TASK:-24}
+      MAX_PAID_MODEL_CALLS_PER_TASK: ${MAX_PAID_MODEL_CALLS_PER_TASK:-8}
+      MAX_AI_SPEND_PER_TASK: ${MAX_AI_SPEND_PER_TASK:-}
+      MAX_AI_SPEND_PER_MISSION: ${MAX_AI_SPEND_PER_MISSION:-}
+      MAX_MODEL_CALLS_PER_ITERATION: ${MAX_MODEL_CALLS_PER_ITERATION:-24}
+      MAX_INPUT_TOKENS_PER_TASK: ${MAX_INPUT_TOKENS_PER_TASK:-240000}
+      MAX_OUTPUT_TOKENS_PER_TASK: ${MAX_OUTPUT_TOKENS_PER_TASK:-48000}
+      MODEL_BUDGET_WARNING_RATIO: ${MODEL_BUDGET_WARNING_RATIO:-0.8}
+      CONTEXT_RECENT_OBSERVATIONS: ${CONTEXT_RECENT_OBSERVATIONS:-3}
+      DUPLICATE_TOOL_TURN_THRESHOLD: ${DUPLICATE_TOOL_TURN_THRESHOLD:-2}
+      PRODUCT_QA_ENABLED: ${PRODUCT_QA_ENABLED:-true}
+      MODEL_PRICING: ${MODEL_PRICING:-{}}
+      TOOLS_ENABLED: ${TOOLS_ENABLED:-true}
+      FILESYSTEM_LIST_ENABLED: ${FILESYSTEM_LIST_ENABLED:-true}
+      FILESYSTEM_READ_ENABLED: ${FILESYSTEM_READ_ENABLED:-true}
+      FILESYSTEM_WRITE_ENABLED: ${FILESYSTEM_WRITE_ENABLED:-true}
+      SHELL_RUN_ENABLED: ${SHELL_RUN_ENABLED:-false}
+      TOOL_WORKSPACE_ROOT: /workspaces
+      FILESYSTEM_TOOL_TIMEOUT_SECONDS: ${FILESYSTEM_TOOL_TIMEOUT_SECONDS:-10}
+      TOOL_FILE_READ_MAX_BYTES: ${TOOL_FILE_READ_MAX_BYTES:-262144}
+      TOOL_FILE_WRITE_MAX_BYTES: ${TOOL_FILE_WRITE_MAX_BYTES:-262144}
+      TOOL_OBSERVATION_MAX_CHARS: ${TOOL_OBSERVATION_MAX_CHARS:-50000}
+      AGENT_MAX_TOOL_STEPS: ${AGENT_MAX_TOOL_STEPS:-10}
+      AUTONOMY_ENABLED: ${AUTONOMY_ENABLED:-false}
+      WORKER_POLL_INTERVAL_MS: ${WORKER_POLL_INTERVAL_MS:-500}
+      WORKER_HEARTBEAT_INTERVAL_SECONDS: ${WORKER_HEARTBEAT_INTERVAL_SECONDS:-10}
+      WORKER_STALE_SECONDS: ${WORKER_STALE_SECONDS:-30}
+      AGENT_WORKER_CONCURRENCY: ${AGENT_WORKER_CONCURRENCY:-2}
+      FORGE_MAX_CONCURRENT_TASKS: ${FORGE_MAX_CONCURRENT_TASKS:-4}
+      JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-60}
+      JOB_LEASE_RENEW_INTERVAL_SECONDS: ${JOB_LEASE_RENEW_INTERVAL_SECONDS:-20}
+      JOB_RETRY_BASE_SECONDS: ${JOB_RETRY_BASE_SECONDS:-5}
+      EXECUTION_JOB_MAX_ATTEMPTS: ${EXECUTION_JOB_MAX_ATTEMPTS:-3}
+      WORKER_SHUTDOWN_GRACE_SECONDS: ${WORKER_SHUTDOWN_GRACE_SECONDS:-30}
+      DEVELOPMENT_ENABLED: ${DEVELOPMENT_ENABLED:-true}
+      DEVELOPMENT_RUNNER_MODE: queue
+      DEVELOPMENT_RUNNER_QUEUE_ROOT: /runner-queue
+      DEVELOPMENT_MAX_EXECUTIONS: ${DEVELOPMENT_MAX_EXECUTIONS:-8}
+      DEVELOPER_MAX_STEPS: ${DEVELOPER_MAX_STEPS:-20}
+      DEVELOPER_MAX_FIX_ATTEMPTS: ${DEVELOPER_MAX_FIX_ATTEMPTS:-3}
+      DEVELOPMENT_PROJECT_LEASE_SECONDS: ${DEVELOPMENT_PROJECT_LEASE_SECONDS:-900}
+    volumes:
+      - forge-workspaces:/workspaces
+      - forge-runner-queue:/runner-queue
+    depends_on:
+      forge-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.commands.worker_health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  forge-dev-runner:
+    build:
+      context: ./services/dev-runner
+    environment:
+      RUNNER_CHANNEL: offline
+      RUNNER_QUEUE_ROOT: /runner-queue
+      RUNNER_WORKSPACE_ROOT: /workspaces
+    volumes:
+      - forge-workspaces:/workspaces
+      - forge-runner-queue:/runner-queue
+    depends_on:
+      forge-runtime-init:
+        condition: service_completed_successfully
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+
+  forge-dev-install-runner:
+    build:
+      context: ./services/dev-runner
+    environment:
+      RUNNER_CHANNEL: install
+      RUNNER_QUEUE_ROOT: /runner-queue
+      RUNNER_WORKSPACE_ROOT: /workspaces
+    volumes:
+      - forge-workspaces:/workspaces
+      - forge-runner-queue:/runner-queue
+    depends_on:
+      forge-runtime-init:
+        condition: service_completed_successfully
+    networks:
+      - forge-install-network
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+
+  forge-web:
+    build:
+      context: ./apps/web
+      target: runner
+    environment:
+      INTERNAL_API_URL: http://forge-api:8000
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      forge-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  forge-postgres-data:
+  forge-redis-data:
+  forge-workspaces:
+  forge-runner-queue:
+
+networks:
+  forge-install-network:

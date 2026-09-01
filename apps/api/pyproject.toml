@@ -1,0 +1,15 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+# Preserve already-applied historical migrations verbatim.
+"alembic/versions/20260820_0008_orchestrator_worker_runtime.py" = ["E501"]
+"alembic/versions/20260820_0009_missions_planning_and_dependencies.py" = ["E501"]

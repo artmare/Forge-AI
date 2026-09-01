@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClipMind</title>
+    <link rel="stylesheet" href="styles/sidepanel.css" />
+  </head>
+  <body>
+    <main id="app" class="app" data-state="idle">
+      <header class="app__header">
+        <h1>ClipMind</h1>
+        <p class="app__subtitle">Turn selected text into an editable structured draft.</p>
+      </header>
+
+      <section id="status" class="status" role="status" aria-live="polite">Ready.</section>
+
+      <section id="emptySelection" class="empty-selection" hidden>
+        <p>Select text on a page, then use the ClipMind context menu to capture it here.</p>
+      </section>
+
+      <section id="editor" class="editor">
+        <div class="toolbar">
+          <button id="generateBtn" class="primary" type="button">Generate</button>
+          <button id="retryBtn" type="button">Retry</button>
+          <button id="saveBtn" type="button">Save</button>
+          <button id="historyBtn" type="button">History</button>
+          <button id="backBtn" type="button" hidden>Back</button>
+        </div>
+
+        <div id="formView" class="form-grid">
+          <label>Summary
+            <textarea id="summary" rows="3"></textarea>
+          </label>
+          <label>Key Ideas
+            <textarea id="keyIdeas" rows="4"></textarea>
+          </label>
+          <label>Action Items
+            <textarea id="actionItems" rows="4"></textarea>
+          </label>
+          <label>Important Facts
+            <textarea id="importantFacts" rows="4"></textarea>
+          </label>
+          <label>My Notes
+            <textarea id="userNotes" rows="4"></textarea>
+          </label>
+          <label>Tags
+            <input id="suggestedTags" type="text" />
+          </label>
+          <section class="source-block">
+            <h2>Source</h2>
+            <p id="sourceMeta"></p>
+            <pre id="sourceExcerpt"></pre>
+          </section>
+        </div>
+
+        <section id="historyView" hidden>
+          <h2>Saved Notes</h2>
+          <p id="emptyHistoryMessage" hidden>No saved notes yet.</p>
+          <ul id="historyList" class="history-list"></ul>
+        </section>
+      </section>
+
+      <script type="module" src="src/sidepanel.mjs"></script>
+    </main>
+  </body>
+</html>

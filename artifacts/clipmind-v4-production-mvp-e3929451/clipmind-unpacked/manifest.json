@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "ClipMind",
+  "version": "0.1.0",
+  "description": "Capture selected text, generate a structured draft, and save locally.",
+  "permissions": ["sidePanel", "contextMenus", "storage", "activeTab", "scripting"],
+  "background": {
+    "service_worker": "src/background.mjs",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "ClipMind"
+  }
+}

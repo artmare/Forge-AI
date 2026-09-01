@@ -1,0 +1,1 @@
+"""Forge persistent domain types."""

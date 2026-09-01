@@ -1,0 +1,12 @@
+node_modules/
+.next/
+.vinext/
+.wrangler/
+dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

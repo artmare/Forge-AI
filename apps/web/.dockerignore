@@ -1,0 +1,7 @@
+node_modules
+.next
+.vinext
+dist
+tsconfig.tsbuildinfo
+npm-debug.log*
+.env*
