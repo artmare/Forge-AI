@@ -21,6 +21,7 @@ from app.domain.enums import (
     AgentStatus,
     DevelopmentAction,
     DevelopmentExecutionStatus,
+    DevelopmentProjectType,
     QADecision,
     TaskKind,
     TaskStatus,
@@ -171,10 +172,9 @@ class DevelopmentQAService:
         await self.session.commit()
 
         profile = preconditions.profile
-        actions = [
+        profile_actions = [
             action
             for action in (
-                DevelopmentAction.GIT_STATUS,
                 profile.lint_action,
                 profile.typecheck_action,
                 profile.test_action,
@@ -182,6 +182,7 @@ class DevelopmentQAService:
             )
             if action is not None
         ]
+        actions = [DevelopmentAction.GIT_STATUS, *profile_actions]
         context = ToolExecutionContext(
             company_id=task.company_id,
             project_id=task.project_id,
@@ -189,6 +190,7 @@ class DevelopmentQAService:
             task_run_id=task_run.id,
             agent_id=qa_agent.id,
             agent_run_id=qa_run.id,
+            execution_origin="FORGE_QA",
         )
         service = DevelopmentExecutionService(
             self.session, settings=self.settings, runner=self.runner
@@ -196,15 +198,34 @@ class DevelopmentQAService:
         checks: list[dict[str, Any]] = []
         executions = []
         unavailable_actions = self._unavailable_actions(preconditions)
-        for action, message in unavailable_actions.items():
+        for issue in preconditions.implementation_errors:
+            action_name = next(
+                (
+                    action.value
+                    for action in (
+                        DevelopmentAction.NODE_TEST,
+                        DevelopmentAction.NODE_BUILD,
+                        DevelopmentAction.NODE_LINT,
+                        DevelopmentAction.NODE_TYPECHECK,
+                    )
+                    if issue["message"].startswith(action.value)
+                ),
+                issue["code"],
+            )
             checks.append(
                 {
-                    "name": action,
+                    "name": action_name,
                     "status": "NOT_VERIFIED",
-                    "evidence": message,
-                    "error_code": "DEVELOPMENT_ACTION_UNSUPPORTED",
+                    "evidence": issue["message"],
+                    "error_code": issue["code"],
                 }
             )
+        if (
+            not profile_actions
+            and not preconditions.implementation_errors
+            and profile.project_type != DevelopmentProjectType.STATIC_WEB
+        ):
+            checks.append(self._missing_implementation_evidence_check(profile.project_type.value))
         for action in actions:
             execution = await service.execute(action, {}, context)
             executions.append(execution)
@@ -234,8 +255,20 @@ class DevelopmentQAService:
         product_qa = await ProductQAService(self.session, self.settings).evaluate(
             task,
             task_run,
-            functional_passed=bool(checks) and all(check["status"] == "PASSED" for check in checks),
+            functional_passed=bool(profile_actions)
+            and all(
+                execution.status == DevelopmentExecutionStatus.SUCCEEDED
+                for execution in executions
+                if execution.action in profile_actions
+            ),
         )
+        if (
+            not profile_actions
+            and not preconditions.implementation_errors
+            and profile.project_type == DevelopmentProjectType.STATIC_WEB
+            and product_qa is None
+        ):
+            checks.append(self._missing_implementation_evidence_check(profile.project_type.value))
         if product_qa is not None:
             self._apply_product_criteria(verifications, product_qa.dimensions)
             checks.append(
@@ -575,6 +608,19 @@ class DevelopmentQAService:
                 if issue["message"].startswith(action.value):
                     actions[action.value] = issue["message"]
         return actions
+
+    @staticmethod
+    def _missing_implementation_evidence_check(project_type: str) -> dict[str, str]:
+        return {
+            "name": "DETERMINISTIC_IMPLEMENTATION_EVIDENCE",
+            "status": "NOT_VERIFIED",
+            "evidence": (
+                f"The {project_type} profile exposes no deterministic test, build, lint, "
+                "typecheck, or static product QA evidence. Git status alone cannot verify "
+                "the implementation."
+            ),
+            "error_code": "DEVELOPMENT_VERIFICATION_UNAVAILABLE",
+        }
 
 
 class DevelopmentWorkflowService:

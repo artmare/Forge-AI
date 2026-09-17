@@ -41,9 +41,9 @@ from tests.helpers import (
 
 
 async def queued_domain(
-    client: AsyncClient, role: str = "GENERAL"
+    client: AsyncClient, role: str = "GENERAL", slug: str = "test-company"
 ) -> dict[str, dict[str, object]]:
-    company = await create_company(client)
+    company = await create_company(client, slug=slug)
     project = await create_project(client, company["id"])
     agent = await create_agent(client, company["id"], role=role)
     task = await create_task(client, company["id"], project["id"], agent["id"])
@@ -126,7 +126,7 @@ async def test_mock_execution_end_to_end(client: AsyncClient) -> None:
         )
 
 
-async def test_durable_acceptance_evidence_skips_an_unnecessary_model_call(
+async def test_previous_iteration_acceptance_evidence_does_not_skip_requested_fix(
     client: AsyncClient,
 ) -> None:
     domain = await queued_domain(client)
@@ -158,22 +158,34 @@ async def test_durable_acceptance_evidence_skips_an_unnecessary_model_call(
     await transition_task(client, task_id, "FIX_REQUIRED", "Re-inspect persisted evidence")
     await transition_task(client, task_id, "QUEUED")
 
-    class FailIfCalled(MockModelProvider):
+    class CountingProvider(MockModelProvider):
         async def generate(self, request: ModelRequest) -> ModelResponse:
-            raise AssertionError(f"Unexpected model request: {request.model}")
+            self.call_count += 1
+            self.requests.append(request)
+            return ModelResponse(
+                output={
+                    "status": "completed",
+                    "summary": "Developer processed the QA feedback.",
+                    "output": {},
+                    "notes": [],
+                },
+                usage=self.usage,
+            )
 
+    provider = CountingProvider()
     async with get_session_factory()() as session:
         completed = await AgentRuntime(
             session,
             settings=Settings(model_provider="mock"),
-            provider=FailIfCalled(),
+            provider=provider,
         ).execute(UUID(task_id))
-        assert completed.provider == "deterministic"
-        assert completed.model_id == "persisted-acceptance-evidence"
-        assert "no model call" in completed.selection_reason.lower()
+        assert completed.provider == "mock"
+        assert provider.call_count == 1
 
     async with get_session_factory()() as session:
-        assert await session.scalar(select(func.count()).select_from(ModelCallRecord)) == 1
+        task = await session.get(Task, UUID(task_id))
+        assert task is not None and task.iteration == 2
+        assert await session.scalar(select(func.count()).select_from(ModelCallRecord)) == 2
 
 
 async def test_concurrent_execute_creates_exactly_one_agent_run(client: AsyncClient) -> None:
@@ -240,6 +252,103 @@ async def test_failures_are_normalized_and_persisted(
         assert task is not None and task.status == TaskStatus.FAILED
         assert task_run is not None and task_run.status == TaskRunStatus.FAILED
         assert task_run.error["code"] == expected_code
+
+
+@pytest.mark.parametrize(
+    "refusal_code",
+    [
+        "MODEL_BUDGET_UNAVAILABLE",
+        "MODEL_CALL_BUDGET_EXHAUSTED",
+        "MISSION_MODEL_CALL_LIMIT_EXHAUSTED",
+        "FREE_MODEL_CALL_LIMIT_EXHAUSTED",
+        "PAID_MODEL_CALL_LIMIT_EXHAUSTED",
+        "MODEL_ACCOUNTING_STATE_LOST",
+    ],
+)
+async def test_pre_provider_economic_refusal_finalizes_execution_without_provider_call(
+    client: AsyncClient, refusal_code: str
+) -> None:
+    domain = await queued_domain(client)
+    provider = MockModelProvider()
+
+    async def refuse_reservation(*_args, **_kwargs):
+        raise ProviderCallError(refusal_code, "The durable model budget refused this call.")
+
+    async with get_session_factory()() as session:
+        runtime = AgentRuntime(session, settings=Settings(model_provider="mock"), provider=provider)
+        runtime.economics.begin_call = refuse_reservation  # type: ignore[method-assign]
+        with pytest.raises(AgentRuntimeDomainError) as raised:
+            await runtime.execute(UUID(str(domain["task"]["id"])))
+        assert raised.value.code == refusal_code
+        assert raised.value.status_code == 409
+
+    assert provider.call_count == 0
+    async with get_session_factory()() as session:
+        task = await session.get(Task, UUID(str(domain["task"]["id"])))
+        run = await session.scalar(select(AgentRun))
+        task_run = await session.scalar(select(TaskRun))
+        assert task is not None and task.status == TaskStatus.FAILED
+        assert run is not None and run.status == AgentRunStatus.FAILED
+        assert run.error_code == refusal_code
+        assert task_run is not None and task_run.status == TaskRunStatus.FAILED
+        assert task_run.error["code"] == refusal_code
+        assert await session.scalar(select(func.count()).select_from(ModelCallRecord)) == 0
+
+
+async def test_zero_paid_budget_allows_free_call_and_finalizes_paid_refusal(
+    client: AsyncClient,
+) -> None:
+    free_domain = await queued_domain(client)
+    free_provider = MockModelProvider()
+    async with get_session_factory()() as session:
+        free_run = await AgentRuntime(
+            session,
+            settings=Settings(model_provider="mock", allow_paid_model_calls=False),
+            provider=free_provider,
+        ).execute(UUID(str(free_domain["task"]["id"])))
+        assert float(free_run.estimated_cost or 0) == 0
+
+    paid_domain = await queued_domain(client, slug="paid-budget-company")
+
+    class PaidProvider:
+        name = "openai"
+        paid = True
+
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            self.call_count += 1
+            raise AssertionError(f"Paid provider must not be called: {request.model}")
+
+    paid_provider = PaidProvider()
+    paid_settings = Settings(
+        model_provider="openai",
+        openai_enabled=True,
+        openai_api_key="test-only-placeholder",
+        allow_paid_model_calls=True,
+    )
+    async with get_session_factory()() as session:
+        with pytest.raises(AgentRuntimeDomainError) as raised:
+            await AgentRuntime(
+                session, settings=paid_settings, provider=paid_provider
+            ).execute(UUID(str(paid_domain["task"]["id"])))
+        assert raised.value.code == "MODEL_BUDGET_UNAVAILABLE"
+
+    assert free_provider.call_count == 1
+    assert paid_provider.call_count == 0
+    async with get_session_factory()() as session:
+        paid_task = await session.get(Task, UUID(str(paid_domain["task"]["id"])))
+        paid_run = await session.scalar(
+            select(AgentRun).where(AgentRun.task_id == UUID(str(paid_domain["task"]["id"])))
+        )
+        calls = list(await session.scalars(select(ModelCallRecord)))
+        assert paid_task is not None and paid_task.status == TaskStatus.FAILED
+        assert paid_run is not None and paid_run.status == AgentRunStatus.FAILED
+        assert paid_run.error_code == "MODEL_BUDGET_UNAVAILABLE"
+        assert len(calls) == 1
+        assert calls[0].provider == "mock" and calls[0].economic_tier == "FREE"
+        assert float(calls[0].estimated_cost) == 0
 
 
 async def test_model_timeout_retries_within_same_task_run(client: AsyncClient) -> None:

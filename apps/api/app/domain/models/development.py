@@ -111,6 +111,10 @@ class DevelopmentExecution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint("timeout_seconds > 0", name="timeout_positive"),
         CheckConstraint("duration_ms IS NULL OR duration_ms >= 0", name="duration_nonnegative"),
         CheckConstraint("stdout_bytes >= 0 AND stderr_bytes >= 0", name="output_bytes_nonnegative"),
+        CheckConstraint(
+            "execution_origin IN ('MODEL_REQUESTED', 'FORGE_QA')",
+            name="execution_origin_valid",
+        ),
         Index("ix_development_executions_task_id_created_at", "task_id", "created_at"),
         Index("ix_development_executions_project_id_status", "project_id", "status"),
         Index("ix_development_executions_agent_run_id", "agent_run_id"),
@@ -145,6 +149,9 @@ class DevelopmentExecution(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     working_directory: Mapped[str] = mapped_column(Text, nullable=False)
     safe_arguments: Mapped[dict[str, Any]] = mapped_column(
         JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    execution_origin: Mapped[str] = mapped_column(
+        Text, default="MODEL_REQUESTED", server_default="MODEL_REQUESTED", nullable=False
     )
     exit_code: Mapped[int | None] = mapped_column(Integer)
     stdout_excerpt: Mapped[str | None] = mapped_column(Text)

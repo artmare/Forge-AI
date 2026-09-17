@@ -10,11 +10,12 @@ services:
         mkdir -p /workspaces /runner-queue/offline/requests /runner-queue/offline/responses
         /runner-queue/offline/cancellations /runner-queue/install/requests
         /runner-queue/install/responses /runner-queue/install/cancellations &&
-        chown -R 10001:10001 /workspaces /runner-queue &&
-        chmod -R u+rwX,go-rwx /workspaces /runner-queue
+        chown -R 10001:10001 /workspaces /runner-queue /sandboxes &&
+        chmod -R u+rwX,go-rwx /workspaces /runner-queue /sandboxes
     volumes:
       - forge-workspaces:/workspaces
       - forge-runner-queue:/runner-queue
+      - forge-runner-sandboxes:/sandboxes
     restart: "no"
 
   forge-postgres:
@@ -74,6 +75,7 @@ services:
       MODEL_REQUEST_TIMEOUT_SECONDS: ${MODEL_REQUEST_TIMEOUT_SECONDS:-120}
       MODEL_TRANSIENT_MAX_ATTEMPTS: ${MODEL_TRANSIENT_MAX_ATTEMPTS:-3}
       MODEL_RETRY_BASE_SECONDS: ${MODEL_RETRY_BASE_SECONDS:-0.25}
+      MODEL_PROVIDER_HEALTH_COOLDOWN_SECONDS: ${MODEL_PROVIDER_HEALTH_COOLDOWN_SECONDS:-300}
       STORE_MODEL_INPUTS: ${STORE_MODEL_INPUTS:-false}
       AGENT_RUN_STALE_SECONDS: ${AGENT_RUN_STALE_SECONDS:-300}
       MODEL_DEFAULT: ${MODEL_DEFAULT:-gpt-5.4-mini}
@@ -175,9 +177,11 @@ services:
       TOOL_WORKSPACE_ROOT: /workspaces
       DEVELOPMENT_RUNNER_MODE: queue
       DEVELOPMENT_RUNNER_QUEUE_ROOT: /runner-queue
+      FORGE_DEV_RUNNER_SOURCE: /dev-runner/runner.py
     volumes:
       - forge-workspaces:/workspaces
       - forge-runner-queue:/runner-queue
+      - ./services/dev-runner:/dev-runner:ro
     depends_on:
       forge-runtime-init:
         condition: service_completed_successfully
@@ -261,6 +265,8 @@ services:
       JOB_RETRY_BASE_SECONDS: ${JOB_RETRY_BASE_SECONDS:-5}
       EXECUTION_JOB_MAX_ATTEMPTS: ${EXECUTION_JOB_MAX_ATTEMPTS:-3}
       PLANNING_RUN_STALE_SECONDS: ${PLANNING_RUN_STALE_SECONDS:-300}
+      ALLOW_PAID_MODEL_CALLS: ${ALLOW_PAID_MODEL_CALLS:-false}
+      OPENAI_ENABLED: ${OPENAI_ENABLED:-false}
       TOOL_WORKSPACE_ROOT: /workspaces
     volumes:
       - forge-workspaces:/workspaces:ro
@@ -304,6 +310,7 @@ services:
       MODEL_REQUEST_TIMEOUT_SECONDS: ${MODEL_REQUEST_TIMEOUT_SECONDS:-120}
       MODEL_TRANSIENT_MAX_ATTEMPTS: ${MODEL_TRANSIENT_MAX_ATTEMPTS:-3}
       MODEL_RETRY_BASE_SECONDS: ${MODEL_RETRY_BASE_SECONDS:-0.25}
+      MODEL_PROVIDER_HEALTH_COOLDOWN_SECONDS: ${MODEL_PROVIDER_HEALTH_COOLDOWN_SECONDS:-300}
       STORE_MODEL_INPUTS: ${STORE_MODEL_INPUTS:-false}
       MODEL_DEFAULT: ${MODEL_DEFAULT:-gpt-5.4-mini}
       MODEL_FAST: ${MODEL_FAST:-gpt-5.4-nano}
@@ -379,9 +386,11 @@ services:
       RUNNER_CHANNEL: offline
       RUNNER_QUEUE_ROOT: /runner-queue
       RUNNER_WORKSPACE_ROOT: /workspaces
+      RUNNER_SANDBOX_ROOT: /sandboxes
     volumes:
       - forge-workspaces:/workspaces
       - forge-runner-queue:/runner-queue
+      - forge-runner-sandboxes:/sandboxes
     depends_on:
       forge-runtime-init:
         condition: service_completed_successfully
@@ -404,9 +413,11 @@ services:
       RUNNER_CHANNEL: install
       RUNNER_QUEUE_ROOT: /runner-queue
       RUNNER_WORKSPACE_ROOT: /workspaces
+      RUNNER_SANDBOX_ROOT: /sandboxes
     volumes:
       - forge-workspaces:/workspaces
       - forge-runner-queue:/runner-queue
+      - forge-runner-sandboxes:/sandboxes
     depends_on:
       forge-runtime-init:
         condition: service_completed_successfully
@@ -447,6 +458,7 @@ volumes:
   forge-redis-data:
   forge-workspaces:
   forge-runner-queue:
+  forge-runner-sandboxes:
 
 networks:
   forge-install-network:

@@ -183,6 +183,57 @@ async def test_filesystem_tools_and_security_boundaries(tmp_path: Path) -> None:
     assert raised.value.code == "FILE_TOO_LARGE"
 
 
+@pytest.mark.parametrize(
+    "reserved_path",
+    [
+        ".git/config",
+        ".git/HEAD",
+        ".git/hooks/pre-commit",
+        "nested/.git/config",
+        ".GIT/config",
+        ".git./config",
+        ".git /config",
+        r".git\config",
+        ".gitattributes",
+        "nested/.gitattributes",
+        ".gitmodules",
+    ],
+)
+async def test_model_filesystem_write_cannot_mutate_git_administration_paths(
+    tmp_path: Path, reserved_path: str
+) -> None:
+    manager = WorkspaceManager(tmp_path / "workspaces")
+    tools = FilesystemTools(manager, read_max_bytes=1024, write_max_bytes=1024)
+    context = execution_context()
+
+    with pytest.raises(ToolSystemError) as raised:
+        await tools.write_file(
+            FilesystemWriteInput(path=reserved_path, content="blocked"), context
+        )
+    assert raised.value.code == "RESERVED_WORKSPACE_PATH"
+
+    workspace = manager.project_workspace(context.company_id, context.project_id)  # type: ignore[arg-type]
+    assert not (workspace / reserved_path.replace("\\", "/")).exists()
+
+
+async def test_model_filesystem_write_keeps_normal_source_and_gitignore_paths_available(
+    tmp_path: Path,
+) -> None:
+    manager = WorkspaceManager(tmp_path / "workspaces")
+    tools = FilesystemTools(manager, read_max_bytes=1024, write_max_bytes=1024)
+    context = execution_context()
+
+    source = await tools.write_file(
+        FilesystemWriteInput(path="src/widget.ts", content="export const ok = true;"), context
+    )
+    ignored = await tools.write_file(
+        FilesystemWriteInput(path=".gitignore", content="node_modules/\n"), context
+    )
+
+    assert source.path == "src/widget.ts"
+    assert ignored.path == ".gitignore"
+
+
 async def test_symlink_escape_is_denied_when_supported(tmp_path: Path) -> None:
     manager = WorkspaceManager(tmp_path / "workspaces")
     tools = FilesystemTools(manager, read_max_bytes=1024, write_max_bytes=1024)
@@ -202,6 +253,25 @@ async def test_symlink_escape_is_denied_when_supported(tmp_path: Path) -> None:
     with pytest.raises(ToolSystemError) as raised:
         await tools.write_file(
             FilesystemWriteInput(path="escape/new.txt", content="blocked"), context
+        )
+    assert raised.value.code == "SYMLINK_NOT_ALLOWED"
+
+
+async def test_symlink_alias_into_git_metadata_is_denied(tmp_path: Path) -> None:
+    manager = WorkspaceManager(tmp_path / "workspaces")
+    tools = FilesystemTools(manager, read_max_bytes=1024, write_max_bytes=1024)
+    context = execution_context()
+    workspace = manager.project_workspace(context.company_id, context.project_id)  # type: ignore[arg-type]
+    git_directory = workspace / ".git"
+    git_directory.mkdir()
+    try:
+        os.symlink(git_directory, workspace / "git-admin", target_is_directory=True)
+    except OSError:
+        pytest.skip("Symlink creation is unavailable on this platform")
+
+    with pytest.raises(ToolSystemError) as raised:
+        await tools.write_file(
+            FilesystemWriteInput(path="git-admin/config", content="blocked"), context
         )
     assert raised.value.code == "SYMLINK_NOT_ALLOWED"
 

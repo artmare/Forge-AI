@@ -14,6 +14,7 @@ from app.agent_runtime.providers import MockModelProvider
 from app.agent_runtime.runtime import AgentRuntime
 from app.core.config import Settings
 from app.development.contracts import RunnerResponse, SafeTarget
+from app.development.profile import DevelopmentProfileService
 from app.development.qa import DevelopmentWorkflowService
 from app.development.registry import CommandRegistry
 from app.development.runner_client import FakeRunnerClient
@@ -36,7 +37,7 @@ from app.domain.models import (
 from app.infrastructure.database import get_session_factory
 from app.orchestration.recovery import OrchestrationRecoveryService
 from app.orchestration.worker_service import WorkerExecutionService
-from app.tool_system.contracts import ToolExecutionContext
+from app.tool_system.contracts import ToolExecutionContext, ToolObservation
 from app.tool_system.errors import ToolSystemError
 from app.tool_system.permissions import PermissionEngine
 from app.tool_system.registry import ToolRegistry
@@ -141,7 +142,15 @@ async def test_developer_and_qa_roles_change_instructions_not_permissions(
 ) -> None:
     task, developer, _project, settings = await development_task(client, tmp_path, qa=False)
     async with get_session_factory()() as session:
+        await DevelopmentProfileService(session, settings).detect(
+            UUID(str(task["project_id"]))
+        )
         context = await ContextBuilder(session).build(UUID(str(task["id"])))
+        assert context.development_profile is not None
+        assert context.development_profile["available_actions"] == [
+            "NODE_TEST",
+            "NODE_BUILD",
+        ]
         instructions = InstructionBuilder().build(context)
         assert instructions.runtime_role == "DEVELOPER"
         assert "Writing code is not completion" in instructions.system_prompt
@@ -151,6 +160,8 @@ async def test_developer_and_qa_roles_change_instructions_not_permissions(
             "empty workspace that requires a scaffold is not complete"
             in instructions.system_prompt
         )
+        assert "return the final structured result immediately" in instructions.system_prompt
+        assert "Forge owns lifecycle checkpoints" in instructions.system_prompt
         agent = await session.get(Agent, developer["id"])
         assert agent is not None
         allowed = await PermissionEngine(session).list_allowed(
@@ -170,6 +181,7 @@ async def test_developer_and_qa_roles_change_instructions_not_permissions(
         no_permission["permissions"].get(name)
         for name in ("development.execute", "git.read", "git.write")
     )
+
 
     qa_agent = await create_agent(
         client,
@@ -204,6 +216,70 @@ async def test_developer_and_qa_roles_change_instructions_not_permissions(
             has_project_workspace=True,
         )
         assert {tool.name for tool in allowed} == {"filesystem.read"}
+
+
+async def test_developer_final_only_turn_requires_current_successful_validation_evidence(
+    client: AsyncClient, tmp_path: Path
+) -> None:
+    task, _developer, _project, _settings = await development_task(
+        client, tmp_path, qa=False
+    )
+    async with get_session_factory()() as session:
+        context = await ContextBuilder(session).build(UUID(str(task["id"])))
+
+    def observation(tool: str, result: dict) -> ToolObservation:
+        return ToolObservation(
+            tool_call_id=uuid4(), tool=tool, status="success", result=result
+        )
+
+    evidence = [
+        observation(
+            "filesystem.write",
+            {
+                "path": "package.json",
+                "profile_refresh": {
+                    "available_actions": ["NODE_TEST", "NODE_BUILD"]
+                },
+            },
+        ),
+        observation("development.execute", {"action": "NODE_TEST", "status": "SUCCEEDED"}),
+        observation("development.execute", {"action": "NODE_BUILD", "status": "SUCCEEDED"}),
+        observation("git.status", {"action": "GIT_STATUS", "status": "SUCCEEDED"}),
+        observation("git.diff", {"action": "GIT_DIFF", "status": "SUCCEEDED"}),
+    ]
+    assert AgentRuntime._developer_ready_for_final(context, evidence)
+    assert not AgentRuntime._developer_ready_for_final(context, evidence[:-1])
+    assert not AgentRuntime._developer_ready_for_final(
+        context, [item for item in evidence if item.result.get("action") != "NODE_BUILD"]
+    )
+    persisted_profile_context = context.model_copy(
+        update={
+            "development_profile": {
+                "project_type": "NODE",
+                "available_actions": ["NODE_TEST", "NODE_BUILD"],
+            }
+        }
+    )
+    assert AgentRuntime._developer_ready_for_final(
+        persisted_profile_context, evidence[1:]
+    )
+    failed_test = observation(
+        "development.execute", {"action": "NODE_TEST", "status": "FAILED"}
+    )
+    before_fix = [evidence[0], failed_test, *evidence[2:]]
+    assert not AgentRuntime._developer_ready_for_final(context, before_fix)
+    after_fix = [
+        *before_fix,
+        observation("filesystem.write", {"path": "src/index.js"}),
+        observation(
+            "development.execute", {"action": "NODE_TEST", "status": "SUCCEEDED"}
+        ),
+    ]
+    assert AgentRuntime._developer_ready_for_final(context, after_fix)
+    final_instructions = InstructionBuilder().build(
+        context, observations=evidence, completion_required=True
+    )
+    assert "No tools are available now" in final_instructions.system_prompt
 
 
 def test_command_registry_and_arguments_reject_arbitrary_execution() -> None:
@@ -345,12 +421,66 @@ async def test_development_execution_is_durable_bounded_and_profile_controlled(
             session, settings=settings, runner=fake
         ).execute(DevelopmentAction.NODE_TEST, {}, context)
         assert execution.status == DevelopmentExecutionStatus.SUCCEEDED
+        assert execution.execution_origin == "MODEL_REQUESTED"
         assert execution.network_enabled is False
         assert execution.working_directory == f"{task['company_id']}/{task['project_id']}"
         assert fake.requests[0].action == DevelopmentAction.NODE_TEST
         assert not hasattr(fake.requests[0], "executable")
         stored = await session.get(DevelopmentExecution, execution.id)
         assert stored is not None and stored.stdout_excerpt == "ok"
+
+
+async def test_forge_qa_execution_does_not_consume_model_requested_budget(
+    client: AsyncClient, tmp_path: Path
+) -> None:
+    task, developer, _project, base_settings = await development_task(
+        client, tmp_path, qa=False
+    )
+    settings = base_settings.model_copy(update={"development_max_executions": 1})
+    run = await start_developer_run(str(task["id"]), settings)
+    fake = FakeRunnerClient(
+        [response(DevelopmentExecutionStatus.SUCCEEDED) for _ in range(3)]
+    )
+    base_context = dict(
+        company_id=UUID(str(task["company_id"])),
+        project_id=UUID(str(task["project_id"])),
+        task_id=UUID(str(task["id"])),
+        task_run_id=run.task_run_id,
+        agent_id=UUID(str(developer["id"])),
+        agent_run_id=run.id,
+    )
+    async with get_session_factory()() as session:
+        service = DevelopmentExecutionService(session, settings=settings, runner=fake)
+        forge_qa = await service.execute(
+            DevelopmentAction.NODE_TEST,
+            {},
+            ToolExecutionContext(**base_context, execution_origin="FORGE_QA"),
+        )
+        model_requested = await service.execute(
+            DevelopmentAction.NODE_BUILD,
+            {},
+            ToolExecutionContext(**base_context),
+        )
+        assert forge_qa.execution_origin == "FORGE_QA"
+        assert model_requested.execution_origin == "MODEL_REQUESTED"
+        with pytest.raises(ToolSystemError) as raised:
+            await service.execute(
+                DevelopmentAction.NODE_TEST,
+                {},
+                ToolExecutionContext(**base_context),
+            )
+        assert raised.value.code == "DEVELOPMENT_EXECUTION_LIMIT"
+        rows = list(
+            await session.scalars(
+                select(DevelopmentExecution).where(
+                    DevelopmentExecution.task_run_id == run.task_run_id
+                )
+            )
+        )
+        assert [row.execution_origin for row in rows] == [
+            "FORGE_QA",
+            "MODEL_REQUESTED",
+        ]
 
 
 async def test_qa_pass_persists_evidence_and_moves_to_human_review(
@@ -375,6 +505,15 @@ async def test_qa_pass_persists_evidence_and_moves_to_human_review(
         )
         assert len(checks) == 3
         assert all(item.status == AcceptanceVerificationStatus.PASSED for item in checks)
+        command_rows = list(
+            await session.scalars(
+                select(DevelopmentExecution).where(
+                    DevelopmentExecution.task_run_id == run.task_run_id
+                )
+            )
+        )
+        assert command_rows
+        assert {row.execution_origin for row in command_rows} == {"FORGE_QA"}
     graph = (await client.get(f"/api/v1/projects/{task['project_id']}/graph")).json()
     assert graph["nodes"][0]["kind"] == "DEVELOPMENT"
     assert graph["nodes"][0]["qa_results"][0]["decision"] == "PASS"

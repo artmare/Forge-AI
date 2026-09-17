@@ -91,6 +91,92 @@ def valid_proposal() -> dict:
     }
 
 
+def valid_development_proposal() -> dict:
+    return {
+        "project": {
+            "name": "Executable Project",
+            "description": "Build and verify a deterministic software change.",
+        },
+        "agents": [
+            {
+                "key": "developer",
+                "name": "Developer",
+                "role": "DEVELOPER",
+                "description": "Implements the bounded change.",
+                "model_alias": "default",
+                "requested_permissions": {
+                    "filesystem.list": True,
+                    "filesystem.read": True,
+                    "filesystem.write": True,
+                    "development.execute": True,
+                    "git.read": True,
+                },
+            },
+            {
+                "key": "qa",
+                "name": "QA",
+                "role": "QA",
+                "description": "Independently verifies deterministic evidence.",
+                "model_alias": "default",
+                "requested_permissions": {
+                    "filesystem.list": True,
+                    "filesystem.read": True,
+                    "development.execute": True,
+                    "git.read": True,
+                },
+            },
+        ],
+        "tasks": [
+            {
+                "key": "implement",
+                "title": "Implement bounded feature",
+                "description": "Write source and pass the declared deterministic checks.",
+                "assigned_agent_key": "developer",
+                "priority": "NORMAL",
+                "kind": "DEVELOPMENT",
+                "input": {
+                    "objective": "Implement the feature.",
+                    "deliverables": ["src/index.js"],
+                    "source_files": ["src/index.js"],
+                    "constraints": ["No network access"],
+                },
+                "acceptance_criteria": [
+                    "src/index.js exists",
+                    "npm test exits successfully",
+                ],
+                "max_iterations": 4,
+            }
+        ],
+        "dependencies": [],
+    }
+
+
+def terminal_propagation_proposal() -> dict:
+    proposal = valid_proposal()
+    proposal["project"] = {
+        "name": "Terminal DAG",
+        "description": "Verify deterministic terminal dependency propagation.",
+    }
+    proposal["tasks"] = [
+        {
+            "key": key,
+            "title": f"Task {key.upper()}",
+            "description": f"Produce {key}.txt.",
+            "assigned_agent_key": "generalist",
+            "priority": "NORMAL",
+            "input": {"path": f"{key}.txt"},
+            "acceptance_criteria": [f"{key}.txt exists"],
+            "max_iterations": 2,
+        }
+        for key in ("a", "b", "c", "d")
+    ]
+    proposal["dependencies"] = [
+        {"task": "b", "depends_on": "a"},
+        {"task": "c", "depends_on": "b"},
+    ]
+    return proposal
+
+
 async def create_mission(client: AsyncClient, title: str = "Phase 08 Mission") -> dict:
     response = await client.post(
         "/api/v1/missions",
@@ -196,6 +282,88 @@ def test_plan_limits_and_duplicate_keys_are_deterministic() -> None:
         PlanProposal.model_validate(dependencies)
     )
     assert "PLAN_LIMIT_EXCEEDED" in {error.code for error in dependency_result.errors}
+
+
+def test_development_plan_contract_and_capability_manifest_are_executable() -> None:
+    validator = PlanValidator(Settings())
+    result = validator.validate(PlanProposal.model_validate(valid_development_proposal()))
+    assert result.valid, result.errors
+    manifest = validator.capability_manifest
+    assert set(manifest["tools"]) >= {
+        "development.execute",
+        "git.init",
+        "git.status",
+        "git.diff",
+        "git.log",
+        "git.commit",
+    }
+    development = manifest["development"]
+    assert isinstance(development, dict)
+    assert development["qa_role_required"] is True
+    assert development["minimum_iterations"] == 4
+    assert set(development["required_permissions"]) == {
+        "filesystem.list",
+        "filesystem.read",
+        "filesystem.write",
+        "development.execute",
+        "git.read",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_code"),
+    [
+        (
+            lambda plan: plan["agents"].pop(),
+            "DEVELOPMENT_QA_PATH_REQUIRED",
+        ),
+        (
+            lambda plan: plan["tasks"][0].update({"max_iterations": 1}),
+            "DEVELOPMENT_ITERATION_BUDGET_INVALID",
+        ),
+        (
+            lambda plan: plan["agents"][0]["requested_permissions"].pop(
+                "filesystem.write"
+            ),
+            "DEVELOPMENT_PERMISSION_REQUIRED",
+        ),
+        (
+            lambda plan: plan["agents"][0]["requested_permissions"].pop(
+                "development.execute"
+            ),
+            "DEVELOPMENT_PERMISSION_REQUIRED",
+        ),
+        (
+            lambda plan: plan["agents"][0]["requested_permissions"].pop("git.read"),
+            "DEVELOPMENT_PERMISSION_REQUIRED",
+        ),
+        (
+            lambda plan: plan["agents"][0].update({"role": "GENERAL"}),
+            "TASK_ROLE_MISMATCH",
+        ),
+        (
+            lambda plan: plan["tasks"][0].update(
+                {"acceptance_criteria": ["The result should be good"]}
+            ),
+            "UNVERIFIABLE_ACCEPTANCE_CRITERION",
+        ),
+    ],
+)
+def test_development_plan_contract_rejects_operationally_impossible_plans(
+    mutate,
+    expected_code: str,
+) -> None:  # type: ignore[no-untyped-def]
+    proposal = valid_development_proposal()
+    mutate(proposal)
+    result = PlanValidator(Settings()).validate(PlanProposal.model_validate(proposal))
+    assert expected_code in {error.code for error in result.errors}
+
+
+def test_development_plan_contract_rejects_disabled_runtime() -> None:
+    result = PlanValidator(Settings(development_enabled=False)).validate(
+        PlanProposal.model_validate(valid_development_proposal())
+    )
+    assert "DEVELOPMENT_RUNTIME_UNAVAILABLE" in {error.code for error in result.errors}
 
 
 async def test_paid_planning_gate_blocks_before_provider_call(client: AsyncClient) -> None:
@@ -414,7 +582,34 @@ async def test_planner_transient_retry_succeeds_in_same_run(client: AsyncClient)
         assert stored is not None and stored.planning_attempts == 1
 
 
-async def test_malformed_and_schema_invalid_planner_outputs_do_not_retry(
+async def test_canonical_plan_validation_receives_one_targeted_repair(
+    client: AsyncClient,
+) -> None:
+    mission = await create_mission(client, "Canonical plan repair")
+    invalid = valid_development_proposal()
+    invalid["tasks"][0]["max_iterations"] = 1
+    provider = ScriptedPlannerProvider([invalid, valid_development_proposal()])
+
+    async with get_session_factory()() as session:
+        run = await MissionPlanner(session, provider=provider).plan(UUID(mission["id"]))
+
+    assert run.status == PlanningRunStatus.SUCCEEDED
+    assert run.provider_attempts == 2
+    assert provider.call_count == 2
+    repair = provider.requests[1]
+    assert repair.metadata["repair"] == "true"
+    assert repair.metadata["repair_category"] == "CANONICAL_VALIDATION"
+    assert "Create a validated project proposal" not in repair.user_prompt
+    assert "DEVELOPMENT_ITERATION_BUDGET_INVALID" in repair.user_prompt
+    assert "tasks.0.max_iterations" in repair.user_prompt
+    assert '"prior_candidate"' in repair.user_prompt
+    assert [entry["outcome"] for entry in run.retry_history] == [
+        "SUCCEEDED",
+        "REPAIR_SUCCEEDED",
+    ]
+
+
+async def test_malformed_and_schema_invalid_planner_outputs_receive_one_targeted_repair(
     client: AsyncClient,
 ) -> None:
     malformed_mission = await create_mission(client, "Malformed response")
@@ -444,48 +639,108 @@ async def test_malformed_and_schema_invalid_planner_outputs_do_not_retry(
                     ],
                     "unsafe_raw_response": "secret-must-never-be-public",
                 },
-            )
+            ),
+            valid_proposal(),
         ]
     )
     async with get_session_factory()() as session:
-        with pytest.raises(MissionPlanningError) as raised:
-            await MissionPlanner(session, provider=malformed).plan(
-                UUID(malformed_mission["id"])
-            )
-    assert raised.value.code == "PLANNER_MALFORMED_RESPONSE"
-    assert raised.value.details["provider_status"] == 200
-    assert raised.value.details["finish_reason"] == "STOP"
-    assert raised.value.details["validation_errors"][0]["field"] == (
-        "$.tasks[0].acceptance_criteria"
-    )
-    assert raised.value.details["validation_errors"][0]["received"] == {
-        "type": "string",
-        "length": 18,
-    }
-    assert "unsafe_raw_response" not in raised.value.details
-    assert "secret-must-never-be-public" not in str(raised.value.details)
-    assert malformed.call_count == 1
+        run = await MissionPlanner(session, provider=malformed).plan(
+            UUID(malformed_mission["id"])
+        )
+    assert run.status == PlanningRunStatus.SUCCEEDED
+    assert malformed.call_count == 2
+    repair_request = malformed.requests[1]
+    repair_payload = repair_request.user_prompt
+    assert repair_request.metadata["repair"] == "true"
+    assert repair_request.metadata["repair_category"] == "SCHEMA_PARSE"
+    assert "Create a validated project proposal" not in repair_payload
+    assert "$.tasks[0].acceptance_criteria" in repair_payload
+    assert "canonical_schema" in repair_payload
+    assert "secret-must-never-be-public" not in repair_payload
 
     async with get_session_factory()() as session:
-        stored_run = await session.get(PlanningRun, UUID(raised.value.details["planning_run_id"]))
+        stored_run = await session.get(PlanningRun, run.id)
         assert stored_run is not None
-        assert stored_run.error["validation_errors"][0]["field"] == (
-            "$.tasks[0].acceptance_criteria"
-        )
-        assert "secret-must-never-be-public" not in str(stored_run.error)
+        assert stored_run.provider_attempts == 2
+        assert [item["outcome"] for item in stored_run.retry_history] == [
+            "REPAIR_SCHEDULED",
+            "REPAIR_SUCCEEDED",
+        ]
         assert "secret-must-never-be-public" not in str(stored_run.internal_diagnostics)
+        mission = await session.get(Mission, UUID(malformed_mission["id"]))
+        assert mission is not None and mission.planning_attempts == 1
 
     schema_mission = await create_mission(client, "Schema invalid response")
-    schema_provider = ScriptedPlannerProvider([{"unexpected": True}])
+    schema_provider = ScriptedPlannerProvider([{"unexpected": True}, valid_proposal()])
     async with get_session_factory()() as session:
         run = await MissionPlanner(session, provider=schema_provider).plan(
             UUID(schema_mission["id"])
         )
-    assert run.status == PlanningRunStatus.INVALID
-    assert run.error["code"] == "PLANNER_SCHEMA_VALIDATION_FAILED"
-    assert run.error["retryable"] is False
-    assert run.provider_attempts == 1
-    assert schema_provider.call_count == 1
+    assert run.status == PlanningRunStatus.SUCCEEDED
+    assert run.provider_attempts == 2
+    assert schema_provider.call_count == 2
+    schema_repair = schema_provider.requests[1]
+    assert schema_repair.metadata["repair_category"] == "SCHEMA_PARSE"
+    assert "$.project" in schema_repair.user_prompt
+    assert "$.agents" in schema_repair.user_prompt
+    assert "$.tasks" in schema_repair.user_prompt
+
+
+async def test_malformed_planner_repair_is_bounded_and_persists_safe_failure(
+    client: AsyncClient,
+) -> None:
+    mission = await create_mission(client, "Malformed repair exhausted")
+    unsafe = ProviderCallError(
+        "INVALID_MODEL_OUTPUT",
+        "unsafe raw malformed payload",
+        category="RESPONSE_VALIDATION",
+        http_status=200,
+        details={
+            "validation_errors": [
+                {
+                    "field": "$.tasks[0].acceptance_criteria",
+                    "expected": "array",
+                    "received": {"type": "string", "length": 18},
+                    "error_type": "list_type",
+                }
+            ],
+            "unsafe_raw_response": "secret-must-never-be-public",
+        },
+    )
+    provider = ScriptedPlannerProvider([unsafe])
+    settings = Settings(planner_provider_max_attempts=3, planner_retry_base_seconds=0)
+
+    async with get_session_factory()() as session:
+        with pytest.raises(MissionPlanningError) as raised:
+            await MissionPlanner(session, settings=settings, provider=provider).plan(
+                UUID(mission["id"])
+            )
+
+    assert raised.value.code == "PLANNER_MALFORMED_RESPONSE"
+    assert raised.value.details["failure_category"] == "SCHEMA_PARSE"
+    assert raised.value.details["repair_attempted"] is True
+    assert raised.value.details["repair_eligible"] is False
+    assert raised.value.details["provider_attempts"] == 2
+    assert provider.call_count == 2
+    assert provider.requests[1].metadata["repair"] == "true"
+    assert "secret-must-never-be-public" not in str(raised.value.details)
+
+    async with get_session_factory()() as session:
+        stored = await session.get(PlanningRun, UUID(raised.value.details["planning_run_id"]))
+        assert stored is not None
+        assert [item["outcome"] for item in stored.retry_history] == [
+            "REPAIR_SCHEDULED",
+            "REPAIR_FAILED",
+        ]
+        assert stored.error["repair_attempted"] is True
+        assert stored.error["failure_category"] == "SCHEMA_PARSE"
+        assert stored.error["last_failure_at"]
+        assert "secret-must-never-be-public" not in str(stored.error)
+        assert "secret-must-never-be-public" not in str(stored.internal_diagnostics)
+        stored_mission = await session.get(Mission, UUID(mission["id"]))
+        assert stored_mission is not None
+        assert stored_mission.status == MissionStatus.DRAFT
+        assert stored_mission.planning_attempts == 0
 
 
 async def test_mission_context_rejects_secret_fields(client: AsyncClient) -> None:
@@ -733,7 +988,7 @@ async def test_multi_dependency_waits_for_every_approved_task(client: AsyncClien
     assert ready["status"] == TaskStatus.QUEUED.value
 
 
-async def test_failed_dependency_stays_blocked_without_redis_wakeup(
+async def test_failed_dependency_terminalizes_without_redis_wakeup(
     client: AsyncClient,
 ) -> None:
     planned = await plan_with(client, valid_proposal(), "Failed Dependency")
@@ -749,8 +1004,107 @@ async def test_failed_dependency_stays_blocked_without_redis_wakeup(
         await DependencyResolver(session).reconcile()
     graph = (await client.get(f"/api/v1/projects/{active['project_id']}/graph")).json()
     blocked = next(node for node in graph["nodes"] if node["id"] == downstream["id"])
-    assert blocked["status"] == TaskStatus.CREATED.value
+    assert blocked["status"] == TaskStatus.CANCELLED.value
     assert blocked["blocked_reason"] == "BLOCKED_BY_FAILED_DEPENDENCY"
+    async with get_session_factory()() as session:
+        stored = await session.get(Task, UUID(downstream["id"]))
+        assert stored is not None
+        assert stored.terminal_reason["code"] == "BLOCKED_BY_FAILED_DEPENDENCY"
+        assert stored.terminal_reason["dependency_ids"] == [root["id"]]
+
+
+async def test_recursive_terminal_failure_waits_for_independent_work_then_ends_mission(
+    client: AsyncClient,
+) -> None:
+    planned = await plan_with(client, terminal_propagation_proposal(), "Recursive terminal DAG")
+    mission_id = UUID(planned["mission"]["id"])
+    active = (await client.post(f"/api/v1/missions/{mission_id}/activate")).json()
+    graph = (await client.get(f"/api/v1/projects/{active['project_id']}/graph")).json()
+    by_title = {node["title"]: node for node in graph["nodes"]}
+    a = by_title["Task A"]
+    b = by_title["Task B"]
+    c = by_title["Task C"]
+    d = by_title["Task D"]
+    assert a["status"] == d["status"] == TaskStatus.QUEUED.value
+    assert b["status"] == c["status"] == TaskStatus.CREATED.value
+
+    async with get_session_factory()() as session:
+        await TaskStateMachine(session).transition(
+            UUID(a["id"]), TaskStatus.FAILED, "Permanent deterministic failure."
+        )
+    async with get_session_factory()() as session:
+        result = await DependencyResolver(session).reconcile()
+        assert result.terminally_blocked_tasks == 2
+
+    still_active = await client.get(f"/api/v1/missions/{mission_id}")
+    assert still_active.json()["status"] == MissionStatus.ACTIVE.value
+    async with get_session_factory()() as session:
+        tasks = {
+            task.title: task
+            for task in await session.scalars(
+                select(Task).where(Task.project_id == UUID(active["project_id"]))
+            )
+        }
+        assert tasks["Task B"].status == TaskStatus.CANCELLED
+        assert tasks["Task B"].terminal_reason == {
+            "code": "BLOCKED_BY_FAILED_DEPENDENCY",
+            "message": (
+                "Task cannot execute because required dependencies are terminal: "
+                f"{a['id']}"
+            ),
+            "dependency_ids": [a["id"]],
+            "propagated": True,
+        }
+        assert tasks["Task C"].status == TaskStatus.CANCELLED
+        assert tasks["Task C"].terminal_reason["dependency_ids"] == [b["id"]]
+        assert tasks["Task D"].status == TaskStatus.QUEUED
+
+        machine = TaskStateMachine(session)
+        await machine.transition(UUID(d["id"]), TaskStatus.IN_PROGRESS)
+        await machine.transition(UUID(d["id"]), TaskStatus.REVIEW)
+        await machine.transition(UUID(d["id"]), TaskStatus.DONE)
+        await DependencyResolver(session).reconcile()
+
+    finished = (await client.get(f"/api/v1/missions/{mission_id}")).json()
+    project = (await client.get(f"/api/v1/projects/{active['project_id']}")).json()
+    assert project["status"] == ProjectStatus.FAILED.value
+    assert finished["status"] == MissionStatus.FAILED.value
+    assert finished["failure_reason"] == "REQUIRED_TASK_FAILED"
+    async with get_session_factory()() as session:
+        stranded = await session.scalar(
+            select(func.count(Task.id)).where(
+                Task.project_id == UUID(active["project_id"]),
+                Task.status == TaskStatus.CREATED,
+            )
+        )
+        assert stranded == 0
+
+
+async def test_cancelled_dependency_propagates_cancelled_terminal_contract(
+    client: AsyncClient,
+) -> None:
+    proposal = valid_proposal()
+    planned = await plan_with(client, proposal, "Cancelled terminal DAG")
+    mission_id = UUID(planned["mission"]["id"])
+    active = (await client.post(f"/api/v1/missions/{mission_id}/activate")).json()
+    graph = (await client.get(f"/api/v1/projects/{active['project_id']}/graph")).json()
+    root = next(node for node in graph["nodes"] if node["status"] == "QUEUED")
+    downstream = next(node for node in graph["nodes"] if node["status"] == "CREATED")
+
+    async with get_session_factory()() as session:
+        await TaskStateMachine(session).transition(UUID(root["id"]), TaskStatus.CANCELLED)
+        await DependencyResolver(session).reconcile()
+
+    downstream_detail = (await client.get(f"/api/v1/tasks/{downstream['id']}")).json()
+    project = (await client.get(f"/api/v1/projects/{active['project_id']}")).json()
+    mission = (await client.get(f"/api/v1/missions/{mission_id}")).json()
+    assert downstream_detail["status"] == TaskStatus.CANCELLED.value
+    assert downstream_detail["terminal_reason"]["code"] == (
+        "BLOCKED_BY_CANCELLED_DEPENDENCY"
+    )
+    assert project["status"] == ProjectStatus.CANCELLED.value
+    assert mission["status"] == MissionStatus.CANCELLED.value
+    assert mission["failure_reason"] == "REQUIRED_TASK_CANCELLED"
 
 
 async def test_request_fix_and_mission_cancellation_use_state_machine(

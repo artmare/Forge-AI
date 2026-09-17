@@ -12,6 +12,7 @@ from app.agent_runtime.runtime import AgentRuntime
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.development.bootstrap import ProjectBootstrapService
+from app.development.profile import DevelopmentProfileService
 from app.development.qa import DevelopmentWorkflowService
 from app.domain.enums import ExecutionPhase, TaskKind, TaskStatus, WorkerStatus
 from app.domain.exceptions import DevelopmentInfrastructureError, DomainError
@@ -219,14 +220,7 @@ class AgentWorker:
                     },
                     "available_actions": [
                         action.value
-                        for action in (
-                            profile.install_action,
-                            profile.test_action,
-                            profile.build_action,
-                            profile.lint_action,
-                            profile.typecheck_action,
-                        )
-                        if action is not None
+                        for action in DevelopmentProfileService.available_actions(profile)
                     ],
                 }
                 await self._update_phase(job.id, ExecutionPhase.ENVIRONMENT_SETUP, profile_evidence)

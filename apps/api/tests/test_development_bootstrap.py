@@ -15,14 +15,16 @@ from app.development.contracts import RunnerRequest, RunnerResponse
 from app.development.profile import DevelopmentProfileService
 from app.development.qa import DevelopmentWorkflowService
 from app.domain.enums import (
+    AcceptanceVerificationStatus,
     DevelopmentAction,
     DevelopmentExecutionStatus,
     DevelopmentProjectType,
+    QADecision,
     TaskStatus,
     ToolCallStatus,
     ToolRiskLevel,
 )
-from app.domain.models import ProjectDevelopmentProfile, Task, ToolCall
+from app.domain.models import AcceptanceVerification, ProjectDevelopmentProfile, Task, ToolCall
 from app.infrastructure.database import get_session_factory
 from app.services.task_state_machine import TaskStateMachine
 from app.tool_system.contracts import ToolDefinition, ToolExecutionContext
@@ -435,6 +437,178 @@ async def test_implementation_failure_consumes_one_iteration_and_requeues(
         assert result.failure_classification == "IMPLEMENTATION_FAILURE"
         assert stored is not None and stored.status == TaskStatus.QUEUED
         assert stored.iteration == 1
+
+
+async def test_empty_development_workspace_cannot_pass_qa_with_git_status_only(
+    client: AsyncClient, tmp_path: Path
+) -> None:
+    task, _company, _project, settings = await create_development_domain(
+        client, tmp_path, criteria=["`manifest.json` exists"]
+    )
+    run_id = await start_task_run(str(task["id"]))
+    runner = SimulatedControlledRunner(Path(settings.tool_workspace_root))
+
+    async with get_session_factory()() as session:
+        result = await DevelopmentWorkflowService(
+            session, settings=settings, runner=runner
+        ).finalize(UUID(str(task["id"])), run_id)
+        stored = await session.get(Task, task["id"])
+
+    assert result.decision == QADecision.FAIL
+    assert result.failure_code == "DEVELOPMENT_MANIFEST_MISSING"
+    assert any(
+        check.get("error_code") == "DEVELOPMENT_MANIFEST_MISSING"
+        for check in result.checks
+    )
+    assert any(check["name"] == "GIT_STATUS" for check in result.checks)
+    assert stored is not None and stored.status != TaskStatus.REVIEW
+
+
+async def test_node_git_status_without_deterministic_actions_cannot_pass_qa(
+    client: AsyncClient, tmp_path: Path
+) -> None:
+    task, company, project, settings = await create_development_domain(
+        client, tmp_path, criteria=["`manifest.json` exists"]
+    )
+    workspace = WorkspaceManager(settings.tool_workspace_root).project_workspace(
+        UUID(str(company["id"])), UUID(str(project["id"]))
+    )
+    write_clipmind_fixture(workspace, scripts=False)
+    run_id = await start_task_run(str(task["id"]))
+
+    async with get_session_factory()() as session:
+        result = await DevelopmentWorkflowService(
+            session,
+            settings=settings,
+            runner=SimulatedControlledRunner(Path(settings.tool_workspace_root)),
+        ).finalize(UUID(str(task["id"])), run_id)
+
+    assert result.decision == QADecision.FAIL
+    assert any(
+        check.get("error_code") == "DEVELOPMENT_VERIFICATION_UNAVAILABLE"
+        for check in result.checks
+    )
+    assert any(
+        "Git status alone cannot verify" in check["evidence"] for check in result.checks
+    )
+
+
+async def test_file_criterion_cannot_hide_failed_profile_lint(
+    client: AsyncClient, tmp_path: Path
+) -> None:
+    task, company, project, settings = await create_development_domain(
+        client, tmp_path, criteria=["`manifest.json` exists"]
+    )
+    workspace = WorkspaceManager(settings.tool_workspace_root).project_workspace(
+        UUID(str(company["id"])), UUID(str(project["id"]))
+    )
+    write_clipmind_fixture(workspace, scripts=False)
+    (workspace / "sidepanel.html").write_text(
+        "<main><h1>ClipMind</h1></main>", encoding="utf-8"
+    )
+    (workspace / "package.json").write_text(
+        json.dumps({"name": "clipmind", "scripts": {"lint": "node scripts/lint.mjs"}}),
+        encoding="utf-8",
+    )
+    run_id = await start_task_run(str(task["id"]))
+    runner = SimulatedControlledRunner(
+        Path(settings.tool_workspace_root), fail_actions={DevelopmentAction.NODE_LINT}
+    )
+
+    async with get_session_factory()() as session:
+        result = await DevelopmentWorkflowService(
+            session, settings=settings, runner=runner
+        ).finalize(UUID(str(task["id"])), run_id)
+        verifications = list(
+            await session.scalars(
+                select(AcceptanceVerification).where(
+                    AcceptanceVerification.task_id == UUID(str(task["id"]))
+                )
+            )
+        )
+
+    assert result.decision == QADecision.FAIL
+    assert verifications[0].status == AcceptanceVerificationStatus.PASSED
+    assert any(
+        check["name"] == "NODE_LINT" and check["status"] == "FAILED"
+        for check in result.checks
+    )
+
+
+async def test_qa_fix_requeue_runs_developer_before_reusing_acceptance_evidence(
+    client: AsyncClient, tmp_path: Path
+) -> None:
+    task, company, project, settings = await create_development_domain(
+        client, tmp_path, criteria=["`manifest.json` exists"]
+    )
+    workspace = WorkspaceManager(settings.tool_workspace_root).project_workspace(
+        UUID(str(company["id"])), UUID(str(project["id"]))
+    )
+    write_clipmind_fixture(workspace, scripts=False)
+    (workspace / "sidepanel.html").write_text(
+        "<main><h1>ClipMind</h1></main>", encoding="utf-8"
+    )
+    (workspace / "package.json").write_text(
+        json.dumps({"name": "clipmind", "scripts": {"lint": "node scripts/lint.mjs"}}),
+        encoding="utf-8",
+    )
+    runner = SimulatedControlledRunner(
+        Path(settings.tool_workspace_root), fail_actions={DevelopmentAction.NODE_LINT}
+    )
+
+    async with get_session_factory()() as session:
+        first_run = await AgentRuntime(
+            session, settings=settings, provider=MockModelProvider()
+        ).execute(UUID(str(task["id"])), defer_review=True)
+        first_qa = await DevelopmentWorkflowService(
+            session, settings=settings, runner=runner
+        ).finalize(UUID(str(task["id"])), first_run.task_run_id)
+        assert first_qa.decision == QADecision.FAIL
+        assert all(
+            verification.status == AcceptanceVerificationStatus.PASSED
+            for verification in await session.scalars(
+                select(AcceptanceVerification).where(
+                    AcceptanceVerification.task_id == UUID(str(task["id"])),
+                    AcceptanceVerification.iteration == 1,
+                )
+            )
+        )
+
+    runner.fail_actions.clear()
+    fixing_provider = MockModelProvider(
+        responses=[
+            {
+                "type": "tool_call",
+                "tool_name": "filesystem.write",
+                "arguments": {
+                    "path": "src/qa-fix.mjs",
+                    "content": "export const fixed = true;\n",
+                },
+            },
+            {
+                "type": "final",
+                "result": {
+                    "status": "completed",
+                    "summary": "Applied the QA-requested fix.",
+                    "output": {},
+                    "notes": [],
+                },
+            },
+        ]
+    )
+    async with get_session_factory()() as session:
+        second_run = await AgentRuntime(
+            session, settings=settings, provider=fixing_provider
+        ).execute(UUID(str(task["id"])), defer_review=True)
+        second_qa = await DevelopmentWorkflowService(
+            session, settings=settings, runner=runner
+        ).finalize(UUID(str(task["id"])), second_run.task_run_id)
+        stored = await session.get(Task, task["id"])
+
+    assert fixing_provider.call_count == 2
+    assert (workspace / "src" / "qa-fix.mjs").is_file()
+    assert second_qa.decision == QADecision.PASS
+    assert stored is not None and stored.iteration == 2 and stored.status == TaskStatus.REVIEW
 
 
 async def test_unresolved_write_runtime_failure_is_infrastructure_unverifiable(

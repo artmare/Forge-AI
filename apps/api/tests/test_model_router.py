@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
@@ -29,7 +30,7 @@ from app.agent_runtime.routing import (
 )
 from app.core.config import Settings
 from app.domain.exceptions import AgentRuntimeDomainError, PaidModelCallDisabledError
-from app.domain.models import Mission, Task
+from app.domain.models import Mission, ModelProviderHealth, Task
 from app.infrastructure.database import get_session_factory
 from app.planning.contracts import PlanProposal
 from app.tool_system.contracts import AgentTurnResponse
@@ -134,6 +135,61 @@ def test_auth_failed_provider_is_excluded() -> None:
             )
         )
     assert raised.value.code == "MODEL_PROVIDER_UNAVAILABLE"
+
+
+async def test_transient_provider_health_recovers_after_bounded_cooldown() -> None:
+    target = profile("free", provider="gemini")
+    settings = Settings(
+        gemini_enabled=True,
+        gemini_api_key="test-key",
+        model_provider_health_cooldown_seconds=300,
+    )
+    async with get_session_factory()() as session:
+        session.add(
+            ModelProviderHealth(
+                provider=target.provider,
+                model_id=target.model_id,
+                status=ProviderHealthStatus.QUOTA_EXHAUSTED.value,
+                failure_code="MODEL_QUOTA_EXHAUSTED",
+                last_checked_at=datetime.now(UTC) - timedelta(seconds=301),
+            )
+        )
+        await session.commit()
+        health = await ModelEconomicsService(session, settings).provider_health((target,))
+    assert health[(target.provider, target.model_id)] == ProviderHealthStatus.HEALTHY
+
+
+async def test_fresh_quota_exhaustion_and_auth_failure_remain_fail_closed() -> None:
+    quota = profile("quota", provider="gemini")
+    auth = profile("auth", provider="openrouter")
+    settings = Settings(
+        gemini_enabled=True,
+        gemini_api_key="test-key",
+        openrouter_enabled=True,
+        openrouter_api_key="test-key",
+        model_provider_health_cooldown_seconds=300,
+    )
+    async with get_session_factory()() as session:
+        session.add_all(
+            [
+                ModelProviderHealth(
+                    provider=quota.provider,
+                    model_id=quota.model_id,
+                    status=ProviderHealthStatus.QUOTA_EXHAUSTED.value,
+                    last_checked_at=datetime.now(UTC),
+                ),
+                ModelProviderHealth(
+                    provider=auth.provider,
+                    model_id=auth.model_id,
+                    status=ProviderHealthStatus.AUTH_FAILED.value,
+                    last_checked_at=datetime.now(UTC) - timedelta(days=1),
+                ),
+            ]
+        )
+        await session.commit()
+        health = await ModelEconomicsService(session, settings).provider_health((quota, auth))
+    assert health[(quota.provider, quota.model_id)] == ProviderHealthStatus.QUOTA_EXHAUSTED
+    assert health[(auth.provider, auth.model_id)] == ProviderHealthStatus.AUTH_FAILED
 
 
 def test_paid_candidate_requires_budget() -> None:

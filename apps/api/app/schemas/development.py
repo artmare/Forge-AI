@@ -48,6 +48,7 @@ class DevelopmentExecutionResponse(ORMResponse):
     status: DevelopmentExecutionStatus
     working_directory: str
     safe_arguments: dict[str, Any]
+    execution_origin: str
     exit_code: int | None
     stdout_excerpt: str | None
     stderr_excerpt: str | None

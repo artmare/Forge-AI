@@ -21,6 +21,8 @@ export interface PlannerValidationEvidence {
 export interface PlannerErrorDetails {
   code?: string; message?: string; category?: string; phase?: string; retryable?: boolean;
   retry_exhausted?: boolean; provider_attempts?: number; max_provider_attempts?: number;
+  provider?: string; model?: string; failure_category?: string;
+  repair_attempted?: boolean; repair_eligible?: boolean; last_failure_at?: string;
   provider_status?: number; provider_error_code?: string; finish_reason?: string;
   candidate_count?: number; content_exists?: boolean;
   response_shape?: { type?: string; top_level_fields?: string[]; text_length?: number };
@@ -28,9 +30,10 @@ export interface PlannerErrorDetails {
 }
 export interface Plan {
   planning_run: {
-    status: string; provider: string; model_alias: string; estimated_cost: string | null;
+    status: string; provider: string; model_alias: string; resolved_model: string;
+    estimated_cost: string | null; completed_at?: string | null;
     validation_result: Validation | null; provider_attempts?: number;
-    retry_history?: Array<{ attempt: number; at: string; outcome: string; code?: string; message?: string; category?: string; retryable?: boolean }>;
+    retry_history?: Array<{ attempt: number; at: string; outcome: string; code?: string; message?: string; category?: string; retryable?: boolean; failure_category?: string; repair_attempted?: boolean }>;
     error?: PlannerErrorDetails | null;
   };
   proposal: {
@@ -49,6 +52,7 @@ export interface TaskReview {
 }
 export interface DevelopmentExecution {
   id: string; action: string; status: string; exit_code: number | null;
+  execution_origin?: "MODEL_REQUESTED" | "FORGE_QA";
   stdout_excerpt: string | null; stderr_excerpt: string | null; output_truncated: boolean;
   duration_ms: number | null; network_enabled: boolean; created_at: string;
   change_summary: { total?: number; added?: number; modified?: number; deleted?: number; files?: Array<{path:string;status:string}> } | null;
@@ -86,6 +90,7 @@ export interface InspectionAgentRun {
 }
 export interface InspectionCommand {
   id: string; action: string; status: string; safe_arguments: Record<string, unknown>;
+  execution_origin?: "MODEL_REQUESTED" | "FORGE_QA";
   started_at: string | null; finished_at: string | null; duration_ms: number | null;
   exit_code: number | null; stdout_excerpt: string | null; stderr_excerpt: string | null;
   output_truncated: boolean; error: InspectionError | null;

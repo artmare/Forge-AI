@@ -37,7 +37,7 @@ from app.domain.exceptions import (
     MissionPlanningError,
 )
 from app.domain.models import Mission, PlanningRun
-from app.planning.contracts import PlanProposal, PlanValidationError, PlanValidationResult
+from app.planning.contracts import PlanProposal, PlanValidationResult
 from app.planning.validator import PlanValidator
 from app.repositories.mission import MissionRepository
 from app.repositories.planning_run import PlanningRunRepository
@@ -57,6 +57,9 @@ class MissionPlanner:
         "and explicit loading/empty/error states where applicable. Do not claim screenshots or "
         "browser checks are available. You only propose structured data; you never mutate "
         "databases."
+        " A DEVELOPMENT plan must include a DEVELOPER with the required filesystem, "
+        "development.execute, and Git-read permissions, an independent QA Agent, and the "
+        "minimum fix-loop iterations declared in the capability manifest."
     )
 
     def __init__(
@@ -93,7 +96,7 @@ class MissionPlanner:
         started = perf_counter()
         request = self._request(mission, selections[0].profile.model_id)
         try:
-            response = await self._generate_with_retry(
+            response, repair_attempted, selection = await self._generate_with_retry(
                 run.id,
                 request,
                 mission,
@@ -110,43 +113,109 @@ class MissionPlanner:
             ) from None
 
         try:
-            proposal = (
-                response.output
-                if isinstance(response.output, PlanProposal)
-                else PlanProposal.model_validate(response.output)
-            )
-        except ValidationError:
-            validation = PlanValidationResult(
-                valid=False,
-                errors=[
-                    PlanValidationError(
-                        code="INVALID_PLAN",
-                        message="Planner output did not match the PlanProposal contract.",
+            proposal = self._proposal(response)
+        except ValidationError as exc:
+            schema_errors = self._schema_errors(exc)
+            if not repair_attempted:
+                repaired = await self._targeted_repair(
+                    run.id,
+                    mission,
+                    selection,
+                    capabilities,
+                    category="SCHEMA_PARSE",
+                    errors=schema_errors,
+                )
+                if repaired is not None:
+                    response = repaired
+                    repair_attempted = True
+                    try:
+                        proposal = self._proposal(response)
+                    except ValidationError as repair_exc:
+                        schema_errors = self._schema_errors(repair_exc)
+                    else:
+                        schema_errors = []
+            if schema_errors:
+                if repair_attempted:
+                    await self._finalize_repair_attempt(
+                        run.id, outcome="REPAIR_FAILED", failure_category="SCHEMA_PARSE"
                     )
-                ],
-                agent_count=0,
-                task_count=0,
-                dependency_count=0,
+                error = ProviderCallError(
+                    "PLANNER_MALFORMED_RESPONSE",
+                    "The planning provider returned a malformed structured response.",
+                    category="SCHEMA_PARSE",
+                    details={
+                        "validation_errors": schema_errors,
+                        "repair_attempted": repair_attempted,
+                        "failure_category": "SCHEMA_PARSE",
+                    },
+                )
+                failed = await self._fail(mission_id, run.id, error)
+                raise MissionPlanningError(
+                    error.code,
+                    error.message,
+                    self._status_code(error),
+                    details=self._failure_details(failed, error),
+                ) from None
+
+        validation = self.validator.validate(proposal)
+        if not validation.valid and not repair_attempted:
+            repaired = await self._targeted_repair(
+                run.id,
+                mission,
+                selection,
+                capabilities,
+                category="CANONICAL_VALIDATION",
+                errors=[item.model_dump(mode="json") for item in validation.errors],
+                prior=proposal,
             )
+            if repaired is not None:
+                response = repaired
+                repair_attempted = True
+                try:
+                    proposal = self._proposal(response)
+                except ValidationError as exc:
+                    await self._finalize_repair_attempt(
+                        run.id, outcome="REPAIR_FAILED", failure_category="SCHEMA_PARSE"
+                    )
+                    error = ProviderCallError(
+                        "PLANNER_MALFORMED_RESPONSE",
+                        "The planner repair returned a malformed structured response.",
+                        category="SCHEMA_PARSE",
+                        details={
+                            "validation_errors": self._schema_errors(exc),
+                            "repair_attempted": True,
+                            "failure_category": "SCHEMA_PARSE",
+                        },
+                    )
+                    failed = await self._fail(mission_id, run.id, error)
+                    raise MissionPlanningError(
+                        error.code,
+                        error.message,
+                        self._status_code(error),
+                        details=self._failure_details(failed, error),
+                    ) from None
+                validation = self.validator.validate(proposal)
+        if not validation.valid:
+            if repair_attempted:
+                await self._finalize_repair_attempt(
+                    run.id,
+                    outcome="REPAIR_FAILED",
+                    failure_category="CANONICAL_VALIDATION",
+                )
             completed = await self._complete_invalid(
                 mission_id,
                 run.id,
-                None,
+                proposal,
                 validation,
                 response,
-                error_code="PLANNER_SCHEMA_VALIDATION_FAILED",
-                error_message="Planner output did not match the required plan schema.",
+                repair_attempted=repair_attempted,
             )
             self._log(completed, started, validation)
             return completed
-
-        validation = self.validator.validate(proposal)
-        if not validation.valid:
-            completed = await self._complete_invalid(
-                mission_id, run.id, proposal, validation, response
+        if repair_attempted:
+            await self._finalize_repair_attempt(
+                run.id, outcome="REPAIR_SUCCEEDED", failure_category=None
             )
-            self._log(completed, started, validation)
-            return completed
         completed = await self._complete_success(mission_id, run.id, proposal, validation, response)
         self._log(completed, started, validation)
         return completed
@@ -193,10 +262,11 @@ class MissionPlanner:
         mission: Mission,
         selections: list[ModelSelection],
         capabilities: frozenset[ModelCapability],
-    ) -> ModelResponse:
+    ) -> tuple[ModelResponse, bool, ModelSelection]:
         max_attempts = max(self.settings.planner_provider_max_attempts, 1)
         total_attempt = 0
         previous: ModelSelection | None = None
+        repair_attempted = False
         final_error = ProviderCallError(
             "PLANNER_PROVIDER_ERROR", "No planning provider was available."
         )
@@ -222,17 +292,22 @@ class MissionPlanner:
             current_request = replace(request, model=selection.profile.model_id)
             for attempt in range(1, max_attempts + 1):
                 total_attempt += 1
-                call = await self.economics.begin_call(
-                    selection,
-                    capabilities=frozenset(item.value for item in capabilities),
-                    agent_role="PLANNER",
-                    mission=mission,
-                    planning_run_id=run_id,
-                    fallback_from=(
-                        (previous.profile.provider, previous.profile.model_id) if previous else None
-                    ),
-                    fallback_reason=final_error.code if previous else None,
-                )
+                try:
+                    call = await self.economics.begin_call(
+                        selection,
+                        capabilities=frozenset(item.value for item in capabilities),
+                        agent_role="PLANNER",
+                        mission=mission,
+                        planning_run_id=run_id,
+                        fallback_from=(
+                            (previous.profile.provider, previous.profile.model_id)
+                            if previous
+                            else None
+                        ),
+                        fallback_reason=final_error.code if previous else None,
+                    )
+                except ProviderCallError as accounting_error:
+                    raise self._normalize_provider_error(accounting_error) from None
                 try:
                     async with asyncio.timeout(self.settings.planner_request_timeout_seconds):
                         response = await provider.generate(current_request)
@@ -264,19 +339,59 @@ class MissionPlanner:
                 else:
                     await self.economics.complete_call(call.id, response=response)
                     await self._record_provider_attempt(
-                        run_id, total_attempt, None, outcome="SUCCEEDED"
+                        run_id,
+                        total_attempt,
+                        None,
+                        outcome="REPAIR_RESPONSE_RECEIVED" if repair_attempted else "SUCCEEDED",
+                        failure_category=("SCHEMA_PARSE" if repair_attempted else None),
+                        repair_attempted=repair_attempted,
                     )
-                    return response
+                    return response, repair_attempted, selection
                 await self.economics.complete_call(call.id, error=raw_error)
                 error = self._normalize_provider_error(raw_error)
+                if error.code == "PLANNER_MALFORMED_RESPONSE":
+                    error.details.update(
+                        {
+                            "failure_category": "SCHEMA_PARSE",
+                            "repair_attempted": repair_attempted,
+                        }
+                    )
                 final_error = error
+                can_repair = (
+                    error.code == "PLANNER_MALFORMED_RESPONSE"
+                    and not repair_attempted
+                    and total_attempt < max_attempts
+                )
                 should_retry = error.retryable and attempt < max_attempts
                 await self._record_provider_attempt(
                     run_id,
                     total_attempt,
                     error,
-                    outcome="RETRY_SCHEDULED" if should_retry else "FAILED",
+                    outcome=(
+                        "REPAIR_SCHEDULED"
+                        if can_repair
+                        else "REPAIR_FAILED"
+                        if error.code == "PLANNER_MALFORMED_RESPONSE" and repair_attempted
+                        else "RETRY_SCHEDULED"
+                        if should_retry
+                        else "FAILED"
+                    ),
+                    failure_category=(
+                        "SCHEMA_PARSE"
+                        if error.code == "PLANNER_MALFORMED_RESPONSE"
+                        else None
+                    ),
+                    repair_attempted=can_repair or repair_attempted,
                 )
+                if can_repair:
+                    repair_attempted = True
+                    current_request = self._repair_request(
+                        mission,
+                        selection.profile.model_id,
+                        category="SCHEMA_PARSE",
+                        errors=error.safe_details().get("validation_errors", []),
+                    )
+                    continue
                 if should_retry:
                     await asyncio.sleep(
                         self.settings.planner_retry_base_seconds * (2 ** max(attempt - 1, 0))
@@ -321,6 +436,8 @@ class MissionPlanner:
         error: ProviderCallError | None,
         *,
         outcome: str,
+        failure_category: str | None = None,
+        repair_attempted: bool = False,
     ) -> None:
         run = await self.runs.get(run_id)
         if run is None or run.status != PlanningRunStatus.RUNNING:
@@ -331,7 +448,10 @@ class MissionPlanner:
             "attempt": attempt,
             "at": datetime.now(UTC).isoformat(),
             "outcome": outcome,
+            "repair_attempted": repair_attempted,
         }
+        if failure_category is not None:
+            entry["failure_category"] = failure_category
         if error is not None:
             entry.update(
                 {
@@ -342,9 +462,15 @@ class MissionPlanner:
                 }
             )
             run.internal_diagnostics = {
-                "phase": "PROVIDER_REQUEST",
+                "phase": (
+                    "RESPONSE_VALIDATION"
+                    if failure_category in {"SCHEMA_PARSE", "CANONICAL_VALIDATION"}
+                    else "PROVIDER_REQUEST"
+                ),
                 "provider": run.provider,
                 "model": run.resolved_model,
+                "failure_category": failure_category or "PROVIDER_FAILURE",
+                "repair_attempted": repair_attempted,
                 "latest_error": error.diagnostics(),
             }
         run.retry_history = [*history, entry][-10:]
@@ -364,6 +490,38 @@ class MissionPlanner:
                 correlation_id=run.mission_id,
             )
         await self.session.commit()
+
+    async def _finalize_repair_attempt(
+        self,
+        run_id: UUID,
+        *,
+        outcome: str,
+        failure_category: str | None,
+    ) -> None:
+        """Finalize the semantic result of a repair response after canonical validation."""
+        run = await self.runs.get(run_id)
+        if run is None or run.status != PlanningRunStatus.RUNNING:
+            raise MissionPlanningError("PLANNER_STATE_LOST", "Planning state was not found", 409)
+        history = list(run.retry_history or [])
+        if history and history[-1].get("outcome") == "REPAIR_RESPONSE_RECEIVED":
+            history[-1] = {
+                **history[-1],
+                "outcome": outcome,
+                "failure_category": failure_category or "NONE",
+            }
+            run.retry_history = history
+            diagnostics = dict(run.internal_diagnostics or {})
+            diagnostics.update(
+                {
+                    "phase": "RESPONSE_VALIDATION",
+                    "repair_attempted": True,
+                    "repair_outcome": outcome,
+                }
+            )
+            if failure_category is not None:
+                diagnostics["failure_category"] = failure_category
+            run.internal_diagnostics = diagnostics
+            await self.session.commit()
 
     async def _start(
         self,
@@ -473,6 +631,191 @@ class MissionPlanner:
             response_model=PlanProposal,
         )
 
+    @staticmethod
+    def _proposal(response: ModelResponse) -> PlanProposal:
+        return (
+            response.output
+            if isinstance(response.output, PlanProposal)
+            else PlanProposal.model_validate(response.output)
+        )
+
+    @staticmethod
+    def _schema_errors(error: ValidationError) -> list[dict[str, str]]:
+        evidence: list[dict[str, str]] = []
+        for item in error.errors(include_url=False, include_context=False)[:20]:
+            location = item.get("loc", ())
+            path = "$" + "".join(
+                f"[{part}]" if isinstance(part, int) else f".{part}" for part in location
+            )
+            evidence.append(
+                {
+                    "field": path,
+                    "expected": str(item.get("msg", "valid canonical value"))[:300],
+                    "error_type": str(item.get("type", "validation_error"))[:120],
+                }
+            )
+        return evidence
+
+    def _repair_request(
+        self,
+        mission: Mission,
+        model_id: str,
+        *,
+        category: str,
+        errors: object,
+        prior: PlanProposal | None = None,
+    ) -> ModelRequest:
+        prior_value: object | None = None
+        if prior is not None:
+            candidate = prior.model_dump(mode="json")
+            encoded = json.dumps(candidate, sort_keys=True, separators=(",", ":"))
+            prior_value = (
+                candidate
+                if len(encoded) <= 24_000
+                else {
+                    "project": candidate["project"],
+                    "agent_keys": [item["key"] for item in candidate["agents"]],
+                    "task_keys": [item["key"] for item in candidate["tasks"]],
+                    "dependencies": candidate["dependencies"],
+                    "omitted": "Prior descriptions and task inputs exceeded the repair bound.",
+                }
+            )
+        repair = {
+            "repair_category": category,
+            "mission_summary": {"title": mission.title, "goal": mission.goal},
+            "validation_errors": errors,
+            "prior_candidate": prior_value,
+            "canonical_schema": PlanProposal.model_json_schema(),
+            "capability_manifest": self.validator.capability_manifest,
+            "instruction": (
+                "Return one corrected PlanProposal. Fix only the reported contract errors; "
+                "do not add unavailable capabilities or explanatory prose."
+            ),
+        }
+        return ModelRequest(
+            model=model_id,
+            system_prompt=(
+                "You repair one Forge MissionPlan candidate using exact validation evidence. "
+                "Return only the canonical structured result. This is not a new planning pass."
+            ),
+            user_prompt=json.dumps(repair, sort_keys=True, separators=(",", ":")),
+            metadata={
+                "mission_id": str(mission.id),
+                "mission_title": mission.title,
+                "planning_attempt": str(mission.planning_attempts),
+                "repair": "true",
+                "repair_category": category,
+            },
+            response_model=PlanProposal,
+        )
+
+    async def _targeted_repair(
+        self,
+        run_id: UUID,
+        mission: Mission,
+        selection: ModelSelection,
+        capabilities: frozenset[ModelCapability],
+        *,
+        category: str,
+        errors: object,
+        prior: PlanProposal | None = None,
+    ) -> ModelResponse | None:
+        run = await self.runs.get(run_id)
+        maximum = max(self.settings.planner_provider_max_attempts, 1)
+        if run is None or run.provider_attempts >= maximum:
+            return None
+        provider = (
+            self.provider
+            if self.provider is not None
+            else provider_for_profile(self.settings, selection.profile)
+        )
+        assert provider is not None
+        request = self._repair_request(
+            mission,
+            selection.profile.model_id,
+            category=category,
+            errors=errors,
+            prior=prior,
+        )
+        attempt = run.provider_attempts + 1
+        try:
+            call = await self.economics.begin_call(
+                selection,
+                capabilities=frozenset(item.value for item in capabilities),
+                agent_role="PLANNER",
+                mission=mission,
+                planning_run_id=run_id,
+            )
+        except ProviderCallError as accounting_error:
+            error = self._normalize_provider_error(accounting_error)
+            error.details.update(
+                {
+                    "repair_attempted": False,
+                    "repair_eligible": False,
+                    "repair_blocked_reason": accounting_error.code,
+                    "failure_category": "BUDGET",
+                }
+            )
+            failed = await self._fail(mission.id, run_id, error)
+            raise MissionPlanningError(
+                error.code,
+                error.message,
+                self._status_code(error),
+                details=self._failure_details(failed, error),
+            ) from None
+        try:
+            async with asyncio.timeout(self.settings.planner_request_timeout_seconds):
+                response = await provider.generate(request)
+        except TimeoutError:
+            raw_error = ProviderCallError(
+                "MODEL_TIMEOUT",
+                "The planning repair request timed out.",
+                retryable=True,
+                category="TIMEOUT",
+                exception_type="TimeoutError",
+            )
+        except ProviderCallError as exc:
+            raw_error = exc
+        except Exception as exc:
+            raw_error = ProviderCallError(
+                "MODEL_PROVIDER_ERROR",
+                "The planning repair request failed unexpectedly.",
+                category="INTERNAL",
+                exception_type=type(exc).__name__,
+            )
+        else:
+            await self.economics.complete_call(call.id, response=response)
+            await self._record_provider_attempt(
+                run_id,
+                attempt,
+                None,
+                outcome="REPAIR_RESPONSE_RECEIVED",
+                failure_category=category,
+                repair_attempted=True,
+            )
+            return response
+
+        await self.economics.complete_call(call.id, error=raw_error)
+        error = self._normalize_provider_error(raw_error)
+        error.details.update(
+            {"repair_attempted": True, "failure_category": category}
+        )
+        await self._record_provider_attempt(
+            run_id,
+            attempt,
+            error,
+            outcome="REPAIR_FAILED",
+            failure_category=category,
+            repair_attempted=True,
+        )
+        failed = await self._fail(mission.id, run_id, error)
+        raise MissionPlanningError(
+            error.code,
+            error.message,
+            self._status_code(error),
+            details=self._failure_details(failed, error),
+        ) from None
+
     async def _complete_success(
         self,
         mission_id: UUID,
@@ -516,23 +859,32 @@ class MissionPlanner:
         *,
         error_code: str = "INVALID_PLAN",
         error_message: str = "Plan validation failed.",
+        repair_attempted: bool = False,
     ) -> PlanningRun:
         mission, run, now = await self._locked_completion(mission_id, run_id)
         run.status = PlanningRunStatus.INVALID
         run.proposal = proposal.model_dump(mode="json") if proposal else None
         run.validation_result = validation.model_dump(mode="json")
+        self._replannable_or_failed(mission, error_code, now)
         run.error = {
             "code": error_code,
             "message": error_message,
-            "category": "SCHEMA_VALIDATION"
-            if error_code == "PLANNER_SCHEMA_VALIDATION_FAILED"
-            else "PLAN_VALIDATION",
+            "category": "CANONICAL_VALIDATION",
             "phase": "RESPONSE_VALIDATION",
-            "retryable": False,
+            "retryable": mission.status == MissionStatus.DRAFT,
+            "provider": run.provider,
+            "model": run.resolved_model,
+            "provider_attempts": run.provider_attempts,
+            "max_provider_attempts": max(self.settings.planner_provider_max_attempts, 1),
+            "failure_category": "CANONICAL_VALIDATION",
+            "repair_attempted": repair_attempted,
+            "repair_eligible": False,
+            "validation_errors": [item.model_dump(mode="json") for item in validation.errors],
+            "last_failure_at": now.isoformat(),
+            "mission_attempt_consumed": True,
         }
         self._usage(run, response)
         run.completed_at = now
-        self._replannable_or_failed(mission, error_code, now)
         await self.events.create(
             event_type="PLANNING_RUN_INVALID",
             message="Planning run produced an invalid proposal.",
@@ -689,6 +1041,26 @@ class MissionPlanner:
                 "The planning provider request failed.",
                 error.retryable,
             ),
+            "MISSION_MODEL_CALL_LIMIT_EXHAUSTED": (
+                "PLANNER_BUDGET_EXHAUSTED",
+                "The Mission planning model-call budget is exhausted.",
+                False,
+            ),
+            "MODEL_BUDGET_UNAVAILABLE": (
+                "PLANNER_BUDGET_EXHAUSTED",
+                "The configured planning model is not covered by the available budget.",
+                False,
+            ),
+            "FREE_MODEL_CALL_LIMIT_EXHAUSTED": (
+                "PLANNER_BUDGET_EXHAUSTED",
+                "The FREE planning model-call budget is exhausted.",
+                False,
+            ),
+            "PAID_MODEL_CALL_LIMIT_EXHAUSTED": (
+                "PLANNER_BUDGET_EXHAUSTED",
+                "The paid planning model-call budget is exhausted.",
+                False,
+            ),
         }
         code, message, retryable = mapping.get(
             error.code,
@@ -714,16 +1086,41 @@ class MissionPlanner:
     def _error_payload(self, run: PlanningRun, error: ProviderCallError) -> dict[str, object]:
         attempts = run.provider_attempts
         maximum = max(self.settings.planner_provider_max_attempts, 1)
+        repair_attempted = bool(error.details.get("repair_attempted"))
+        failure_category = str(
+            error.details.get("failure_category")
+            or (
+                "SCHEMA_PARSE"
+                if error.code == "PLANNER_MALFORMED_RESPONSE"
+                else "PROVIDER_FAILURE"
+            )
+        )
         payload: dict[str, object] = {
             "code": error.code,
             "message": error.message,
             "category": error.category,
-            "phase": "PROVIDER_REQUEST",
+            "phase": (
+                "RESPONSE_VALIDATION"
+                if failure_category in {"SCHEMA_PARSE", "CANONICAL_VALIDATION"}
+                else "PROVIDER_REQUEST"
+            ),
             "retryable": error.retryable,
+            "provider": run.provider,
+            "model": run.resolved_model,
             "provider_attempts": attempts,
             "max_provider_attempts": maximum,
             "retry_exhausted": error.retryable and attempts >= maximum,
             "mission_attempt_consumed": False,
+            "failure_category": failure_category,
+            "repair_attempted": repair_attempted,
+            "repair_eligible": (
+                bool(error.details.get("repair_eligible"))
+                if "repair_eligible" in error.details
+                else error.code == "PLANNER_MALFORMED_RESPONSE"
+                and not repair_attempted
+                and attempts < maximum
+            ),
+            "last_failure_at": datetime.now(UTC).isoformat(),
         }
         if error.http_status is not None:
             payload["provider_status"] = error.http_status
@@ -749,6 +1146,7 @@ class MissionPlanner:
             "PLANNER_AUTHENTICATION_FAILED": 502,
             "PLANNER_CONFIGURATION_ERROR": 502,
             "PLANNER_MALFORMED_RESPONSE": 502,
+            "PLANNER_BUDGET_EXHAUSTED": 429,
         }.get(error.code, 502)
 
     def _log(self, run: PlanningRun, started: float, validation: PlanValidationResult) -> None:

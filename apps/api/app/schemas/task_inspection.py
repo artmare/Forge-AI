@@ -62,6 +62,7 @@ class InspectionCommand(BaseModel):
     action: str
     status: DevelopmentExecutionStatus
     safe_arguments: dict[str, Any]
+    execution_origin: str
     started_at: datetime | None
     finished_at: datetime | None
     duration_ms: float | None

@@ -105,6 +105,21 @@ class DevelopmentProfileService:
         return refreshed
 
     @staticmethod
+    def available_actions(profile: ProjectDevelopmentProfile) -> tuple[DevelopmentAction, ...]:
+        """Return the one canonical ordered view of actions exposed by a persisted profile."""
+        return tuple(
+            action
+            for action in (
+                profile.install_action,
+                profile.test_action,
+                profile.build_action,
+                profile.lint_action,
+                profile.typecheck_action,
+            )
+            if action is not None
+        )
+
+    @staticmethod
     def _detect_files(workspace: Path) -> dict[str, object]:
         package = workspace / "package.json"
         if package.is_file() and not package.is_symlink():

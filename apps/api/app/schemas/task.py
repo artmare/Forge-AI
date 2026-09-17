@@ -72,6 +72,7 @@ class TaskResponse(ORMResponse):
     description: str | None
     input: dict[str, Any]
     acceptance_criteria: list[Any]
+    terminal_reason: dict[str, Any] | None
     status: TaskStatus
     priority: TaskPriority
     iteration: int

@@ -9,7 +9,6 @@ from typing import Any
 from uuid import UUID
 
 from pydantic import ValidationError
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.builders import ContextBuilder, ContextRecord, InstructionBuilder
@@ -40,13 +39,12 @@ from app.agent_runtime.routing import (
 )
 from app.core.config import Settings, get_settings
 from app.domain.enums import (
-    AcceptanceVerificationStatus,
     AgentRunStatus,
     TaskRunStatus,
     TaskStatus,
 )
 from app.domain.exceptions import AgentRuntimeDomainError, TaskRunStateConflictError
-from app.domain.models import AcceptanceVerification, AgentRun
+from app.domain.models import AgentRun
 from app.repositories.agent import AgentRepository
 from app.repositories.agent_run import AgentRunRepository
 from app.repositories.task import TaskRepository
@@ -164,54 +162,6 @@ class AgentRuntime:
                     f"Task stopped for human intervention: {exc.reason}",
                     409,
                 ) from None
-            deterministic = await self._deterministic_completion(current_task)
-            if deterministic is not None:
-                selection = ModelSelection(
-                    ModelProfile(
-                        alias="deterministic",
-                        provider="deterministic",
-                        model_id="persisted-acceptance-evidence",
-                        tier=EconomicTier.FREE,
-                        capabilities=frozenset(),
-                        paid=False,
-                        max_call_cost=0,
-                    ),
-                    "Persisted acceptance evidence already resolved every criterion; "
-                    "no model call was needed.",
-                )
-                request = ModelRequest(
-                    model=selection.profile.model_id,
-                    system_prompt="Deterministic Forge completion.",
-                    user_prompt="All acceptance criteria already have durable passing evidence.",
-                    metadata={
-                        "task_id": str(current_task.id),
-                        "task_title": current_task.title,
-                        "turn_number": "0",
-                        "model_alias": "deterministic",
-                    },
-                    response_model=AgentTurnResponse,
-                )
-                run = await self._start_turn(
-                    task_id,
-                    selection,
-                    frozenset(),
-                    request,
-                    first_turn=first_turn,
-                )
-                response = ModelResponse(
-                    output=deterministic,
-                    provider="deterministic",
-                    model=selection.profile.model_id,
-                )
-                completed = await self._complete_turn(
-                    run.id,
-                    deterministic.model_dump(mode="json"),
-                    response,
-                    final_result=deterministic,
-                    transition_to_review=not defer_review,
-                )
-                self._log_succeeded(completed, execution_started, "deterministic")
-                return completed
             routed_alias = await self.efficiency.route(
                 current_task,
                 str(context.agent.get("role", "GENERAL")),
@@ -227,6 +177,7 @@ class AgentRuntime:
                 turn_number=tool_steps + 1,
                 budget_warning=budget.warning_active,
                 duplicate_warning=duplicate_signals > 0,
+                force_final=self._developer_ready_for_final(context, observations),
             )
             if conversation_start_prompt is None:
                 conversation_start_prompt = request.user_prompt
@@ -393,38 +344,6 @@ class AgentRuntime:
         if not await self._execution_allowed():
             raise AgentRuntimeDomainError("AGENT_RUNTIME_ERROR", "Durable execution lease was lost")
 
-    async def _deterministic_completion(self, task: Any) -> BaseAgentResult | None:
-        criteria = task.acceptance_criteria or []
-        if not criteria:
-            return None
-        resolved_indices = set(
-            await self.session.scalars(
-                select(AcceptanceVerification.criterion_index).where(
-                    AcceptanceVerification.task_id == task.id,
-                    AcceptanceVerification.iteration == task.iteration,
-                    AcceptanceVerification.status.in_(
-                        (
-                            AcceptanceVerificationStatus.PASSED,
-                            AcceptanceVerificationStatus.NOT_APPLICABLE,
-                        )
-                    ),
-                )
-            )
-        )
-        expected_indices = set(range(len(criteria)))
-        if resolved_indices != expected_indices:
-            return None
-        resolved = len(resolved_indices)
-        return BaseAgentResult(
-            status="completed",
-            summary=(
-                "All acceptance criteria were already verified by durable "
-                "deterministic evidence."
-            ),
-            output={"artifacts": [], "details": [f"{resolved} criteria already verified."]},
-            notes=["Model invocation skipped by the deterministic-first policy."],
-        )
-
     async def _build_request(
         self,
         context: ContextRecord,
@@ -435,6 +354,7 @@ class AgentRuntime:
         turn_number: int,
         budget_warning: bool,
         duplicate_warning: bool,
+        force_final: bool = False,
     ) -> ModelRequest:
         agent_id = UUID(str(context.agent["id"]))
         agent = await self.agents.get_current(agent_id)
@@ -445,6 +365,8 @@ class AgentRuntime:
             definitions=self.tool_registry.list(enabled_only=True),
             has_project_workspace=context.project is not None,
         )
+        if force_final:
+            allowed = []
         instructions = InstructionBuilder().build(
             context,
             tools=[definition.public() for definition in allowed],
@@ -453,6 +375,7 @@ class AgentRuntime:
             recent_observation_limit=self.settings.context_recent_observations,
             budget_warning=budget_warning,
             duplicate_warning=duplicate_warning,
+            completion_required=force_final,
         )
         task_input = context.task.get("input", {})
         mock_scenario = task_input.get("mock_scenario") if isinstance(task_input, dict) else None
@@ -513,6 +436,63 @@ class AgentRuntime:
             baseline_bytes - sent_bytes,
         )
         return request
+
+    @staticmethod
+    def _developer_ready_for_final(
+        context: ContextRecord, observations: list[ToolObservation]
+    ) -> bool:
+        """Require a final-only turn after this Developer run has enough durable evidence."""
+        if str(context.agent.get("role", "")).upper() != "DEVELOPER":
+            return False
+        successful = [
+            item
+            for item in observations
+            if item.status == "success"
+            and (
+                item.tool
+                not in {
+                    "development.execute",
+                    "development.install_dependencies",
+                    "git.init",
+                    "git.status",
+                    "git.diff",
+                    "git.log",
+                    "git.commit",
+                }
+                or str((item.result or {}).get("status", "")).upper() == "SUCCEEDED"
+            )
+        ]
+        tools = {item.tool for item in successful}
+        if not {"git.status", "git.diff"}.issubset(tools):
+            return False
+
+        profile = context.development_profile
+        available_actions: set[str] = (
+            {str(action) for action in profile.get("available_actions", [])}
+            if isinstance(profile, dict)
+            else set()
+        )
+        executed_actions: set[str] = set()
+        for observation in successful:
+            result = observation.result or {}
+            profile = result.get("profile_refresh")
+            if isinstance(profile, dict):
+                available_actions.update(
+                    str(action) for action in profile.get("available_actions", [])
+                )
+            if observation.tool == "development.execute" and result.get("action"):
+                executed_actions.add(str(result["action"]))
+        required_actions = available_actions.intersection(
+            {
+                "NODE_TEST",
+                "NODE_BUILD",
+                "NODE_LINT",
+                "NODE_TYPECHECK",
+                "PYTHON_TEST",
+                "PYTHON_LINT",
+            }
+        )
+        return bool(required_actions) and required_actions.issubset(executed_actions)
 
     async def _route_models(
         self,
@@ -587,17 +567,27 @@ class AgentRuntime:
                 await self._record_model_fallback(run.id, previous, selection, final_error)
             current_request = replace(request, model=selection.profile.model_id)
             for attempt in range(1, max_attempts + 1):
-                call = await self.economics.begin_call(
-                    selection,
-                    capabilities=frozenset(capability.value for capability in capabilities),
-                    agent_role=agent_role,
-                    task=task,
-                    agent_run_id=run.id,
-                    fallback_from=(
-                        (previous.profile.provider, previous.profile.model_id) if previous else None
-                    ),
-                    fallback_reason=final_error.code if previous else None,
-                )
+                try:
+                    call = await self.economics.begin_call(
+                        selection,
+                        capabilities=frozenset(capability.value for capability in capabilities),
+                        agent_role=agent_role,
+                        task=task,
+                        agent_run_id=run.id,
+                        fallback_from=(
+                            (previous.profile.provider, previous.profile.model_id)
+                            if previous
+                            else None
+                        ),
+                        fallback_reason=final_error.code if previous else None,
+                    )
+                except ProviderCallError as reservation_error:
+                    # Economic/accounting refusals happen before a provider request, but an
+                    # AgentRun already exists. Finalize the durable execution boundary here so
+                    # no RUNNING AgentRun/TaskRun is stranded and never call the provider.
+                    final_error = self._normalize_error(reservation_error)
+                    await self._fail(run.id, final_error)
+                    raise self._public_error(final_error) from None
                 try:
                     async with asyncio.timeout(self.settings.model_request_timeout_seconds):
                         response = await provider.generate(current_request)
@@ -1083,5 +1073,12 @@ class AgentRuntime:
             "INVALID_MODEL_OUTPUT": 502,
             "MAX_TOOL_STEPS_EXCEEDED": 409,
             "AGENT_EXECUTION_CANCELLED": 409,
+            "MODEL_BUDGET_UNAVAILABLE": 409,
+            "MODEL_CALL_BUDGET_EXHAUSTED": 409,
+            "MISSION_MODEL_CALL_LIMIT_EXHAUSTED": 409,
+            "FREE_MODEL_CALL_LIMIT_EXHAUSTED": 409,
+            "PAID_MODEL_CALL_LIMIT_EXHAUSTED": 409,
+            "MODEL_ACCOUNTING_STATE_LOST": 409,
+            "MODEL_BUDGET_EXHAUSTED": 409,
         }.get(code, 500)
         return AgentRuntimeDomainError(code, error.message, status_code)

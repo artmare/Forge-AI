@@ -71,6 +71,7 @@ class DevelopmentExecutionService:
             .where(
                 DevelopmentExecution.task_run_id == context.task_run_id,
                 DevelopmentExecution.agent_id == context.agent_id,
+                DevelopmentExecution.execution_origin == "MODEL_REQUESTED",
             )
         )
         if int(count or 0) >= self.settings.development_max_executions:
@@ -83,13 +84,7 @@ class DevelopmentExecutionService:
                 "DEVELOPMENT_PROFILE_MISMATCH",
                 f"{action.value} is unavailable for {profile.project_type.value} projects",
             )
-        configured_actions = {
-            profile.install_action,
-            profile.test_action,
-            profile.build_action,
-            profile.lint_action,
-            profile.typecheck_action,
-        }
+        configured_actions = set(self.profiles.available_actions(profile))
         if (
             action
             in {
@@ -116,6 +111,7 @@ class DevelopmentExecutionService:
             status=DevelopmentExecutionStatus.REQUESTED,
             working_directory=working_directory,
             safe_arguments=arguments,
+            execution_origin=context.execution_origin,
             timeout_seconds=definition.timeout_seconds,
             network_enabled=definition.network_enabled,
             correlation_id=task.id,

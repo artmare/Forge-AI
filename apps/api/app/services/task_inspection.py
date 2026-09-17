@@ -9,6 +9,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.development.profile import DevelopmentProfileService
 from app.domain.enums import (
     AcceptanceVerificationStatus,
     DevelopmentExecutionStatus,
@@ -353,6 +354,7 @@ class TaskInspectionService:
             action=row.action.value,
             status=row.status,
             safe_arguments=_safe_value(row.safe_arguments),
+            execution_origin=row.execution_origin,
             started_at=row.started_at,
             finished_at=row.finished_at,
             duration_ms=float(row.duration_ms) if row.duration_ms is not None else None,
@@ -397,15 +399,7 @@ class TaskInspectionService:
     @staticmethod
     def _profile(row: ProjectDevelopmentProfile) -> InspectionDevelopmentProfile:
         configured = {
-            action.value
-            for action in (
-                row.install_action,
-                row.test_action,
-                row.build_action,
-                row.lint_action,
-                row.typecheck_action,
-            )
-            if action is not None
+            action.value for action in DevelopmentProfileService.available_actions(row)
         }
         node_actions = {"NODE_TEST", "NODE_BUILD", "NODE_LINT", "NODE_TYPECHECK"}
         return InspectionDevelopmentProfile(
@@ -532,6 +526,17 @@ class TaskInspectionService:
             raw_role = durable.get("agent_role")
             agent_role = raw_role if isinstance(raw_role, str) else None
             evidence_source = "execution_job.failure_evidence"
+        elif isinstance(task.terminal_reason, dict) and str(
+            task.terminal_reason.get("code", "")
+        ).startswith("BLOCKED_BY_"):
+            code = str(task.terminal_reason["code"])
+            category = "DEPENDENCY_FAILURE"
+            message = str(
+                task.terminal_reason.get("message")
+                or "Task became terminal because a required dependency cannot complete."
+            )
+            phase = "DEPENDENCY_RESOLUTION"
+            evidence_source = "task.terminal_reason"
         elif qa is not None and qa.failure_classification == "INFRASTRUCTURE_UNVERIFIABLE":
             code = qa.failure_code or "DEVELOPMENT_INFRASTRUCTURE_UNVERIFIABLE"
             category = "INFRASTRUCTURE_UNVERIFIABLE"

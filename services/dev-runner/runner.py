@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import signal
 import time
 from collections import deque
@@ -12,11 +13,14 @@ from typing import Any
 
 QUEUE_ROOT = Path(os.getenv("RUNNER_QUEUE_ROOT", "/runner-queue"))
 WORKSPACE_ROOT = Path(os.getenv("RUNNER_WORKSPACE_ROOT", "/workspaces"))
+SANDBOX_ROOT = Path(os.getenv("RUNNER_SANDBOX_ROOT", "/sandboxes"))
 CHANNEL = os.getenv("RUNNER_CHANNEL", "offline")
 POLL_SECONDS = float(os.getenv("RUNNER_POLL_SECONDS", "0.1"))
 WORKSPACE_PATTERN = re.compile(r"^[0-9a-f-]{36}/[0-9a-f-]{36}$")
 FORBIDDEN = ("..", "|", ">", "<", "&&", "||", "$", "`", "\x00", "\n", "\r")
 INSTALL_ACTIONS = {"NODE_INSTALL", "PYTHON_INSTALL"}
+TRUSTED_GIT_ACTIONS = {"GIT_INIT", "GIT_STATUS", "GIT_DIFF", "GIT_LOG", "GIT_CHECKPOINT"}
+RESERVED_GIT_NAMES = {".git", ".gitattributes", ".gitmodules"}
 SANDBOX_EXECUTABLE = "/usr/local/bin/forge-sandbox-exec"
 
 
@@ -86,6 +90,92 @@ def require_file(workspace: Path, name: str) -> None:
     path = workspace / name
     if not path.is_file() or path.is_symlink():
         raise ValueError(f"required manifest {name} is unavailable")
+
+
+def is_reserved_git_path(relative: Path) -> bool:
+    return any(part.casefold() in RESERVED_GIT_NAMES for part in relative.parts)
+
+
+def _copy_allowed_tree(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for item in source.iterdir():
+        relative = item.relative_to(source)
+        if is_reserved_git_path(relative):
+            continue
+        target = destination / item.name
+        if item.is_symlink():
+            target.symlink_to(os.readlink(item), target_is_directory=item.is_dir())
+        elif item.is_dir():
+            shutil.copytree(
+                item,
+                target,
+                symlinks=True,
+                ignore=lambda _directory, names: [
+                    name for name in names if name.casefold() in RESERVED_GIT_NAMES
+                ],
+            )
+        else:
+            shutil.copy2(item, target, follow_symlinks=False)
+
+
+def prepare_untrusted_workspace(workspace: Path, request_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f-]{36}", request_id):
+        raise ValueError("invalid request identity")
+    root = SANDBOX_ROOT.resolve(strict=True)
+    execution_workspace = root / request_id
+    shutil.rmtree(execution_workspace, ignore_errors=True)
+    _copy_allowed_tree(workspace, execution_workspace)
+    return execution_workspace
+
+
+def reserved_git_mutations(workspace: Path) -> list[str]:
+    mutations: list[str] = []
+    for directory, names, files in os.walk(workspace, followlinks=False):
+        base = Path(directory)
+        for name in [*names, *files]:
+            path = base / name
+            relative = path.relative_to(workspace)
+            if is_reserved_git_path(relative):
+                mutations.append(relative.as_posix())
+                continue
+            if path.is_symlink():
+                target = Path(os.readlink(path))
+                if is_reserved_git_path(target):
+                    mutations.append(relative.as_posix())
+    return sorted(set(mutations))
+
+
+def sync_untrusted_outputs(source: Path, workspace: Path) -> None:
+    """Copy additive/updated normal outputs back without propagating deletions or Git control files."""
+    for directory, names, files in os.walk(source, followlinks=False):
+        base = Path(directory)
+        relative_directory = base.relative_to(source)
+        if is_reserved_git_path(relative_directory):
+            names[:] = []
+            continue
+        target_directory = workspace / relative_directory
+        target_directory.mkdir(parents=True, exist_ok=True)
+        names[:] = [name for name in names if name.casefold() not in RESERVED_GIT_NAMES]
+        for name in files:
+            relative = relative_directory / name
+            if is_reserved_git_path(relative):
+                continue
+            item = base / name
+            target = workspace / relative
+            if item.is_symlink():
+                if target.exists() or target.is_symlink():
+                    if target.is_dir() and not target.is_symlink():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                target.symlink_to(os.readlink(item), target_is_directory=item.is_dir())
+            else:
+                if target.is_symlink() or target.is_dir():
+                    if target.is_dir() and not target.is_symlink():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                shutil.copy2(item, target, follow_symlinks=False)
 
 
 def command_for(request: dict[str, Any], workspace: Path) -> list[list[str]]:
@@ -241,7 +331,13 @@ async def execute(request: dict[str, Any]) -> dict[str, Any]:
         workspace = safe_workspace(str(request["workspace_relative"]))
         timeout = min(max(int(request["timeout_seconds"]), 1), 600)
         output_limit = min(max(int(request["output_limit_bytes"]), 1024), 1_000_000)
-        commands = command_for(request, workspace)
+        action = str(request["action"])
+        execution_workspace = workspace
+        disposable_workspace: Path | None = None
+        if action not in TRUSTED_GIT_ACTIONS:
+            disposable_workspace = prepare_untrusted_workspace(workspace, str(request_id))
+            execution_workspace = disposable_workspace
+        commands = command_for(request, execution_workspace)
         combined_out = BoundedCapture(output_limit)
         combined_err = BoundedCapture(output_limit)
         exit_code = 0
@@ -256,7 +352,7 @@ async def execute(request: dict[str, Any]) -> dict[str, Any]:
                 timed_out = True
                 break
             exit_code, stdout, stderr, command_timeout, command_cancelled = await run_command(
-                command, workspace, remaining, output_limit, cancellation_path
+                command, execution_workspace, remaining, output_limit, cancellation_path
             )
             out_text, _ = stdout.text()
             err_text, _ = stderr.text()
@@ -266,9 +362,24 @@ async def execute(request: dict[str, Any]) -> dict[str, Any]:
             cancelled = cancelled or command_cancelled
             if timed_out or cancelled or exit_code != 0:
                 break
+        git_mutations = (
+            reserved_git_mutations(disposable_workspace)
+            if disposable_workspace is not None
+            else []
+        )
+        metadata_denied = bool(git_mutations)
+        if metadata_denied:
+            exit_code = 126
+            combined_err.add(
+                b"Forge denied project-code mutation of reserved Git metadata.\n"
+            )
+        elif disposable_workspace is not None and not timed_out and not cancelled and exit_code == 0:
+            sync_untrusted_outputs(disposable_workspace, workspace)
+        if disposable_workspace is not None:
+            shutil.rmtree(disposable_workspace, ignore_errors=True)
         stdout_text, stdout_truncated = combined_out.text()
         stderr_text, stderr_truncated = combined_err.text()
-        status = "CANCELLED" if cancelled else "TIMED_OUT" if timed_out else "SUCCEEDED" if exit_code == 0 else "FAILED"
+        status = "DENIED" if metadata_denied else "CANCELLED" if cancelled else "TIMED_OUT" if timed_out else "SUCCEEDED" if exit_code == 0 else "FAILED"
         return {
             "request_id": request_id,
             "status": status,
@@ -279,8 +390,8 @@ async def execute(request: dict[str, Any]) -> dict[str, Any]:
             "stderr_bytes": combined_err.total,
             "truncated": stdout_truncated or stderr_truncated,
             "duration_ms": round((time.perf_counter() - started) * 1000, 2),
-            "error_code": "DEVELOPMENT_EXECUTION_CANCELLED" if cancelled else "DEVELOPMENT_EXECUTION_TIMEOUT" if timed_out else ("DEVELOPMENT_COMMAND_FAILED" if exit_code else None),
-            "error_message": "Development action was cancelled." if cancelled else "Development action timed out." if timed_out else ("Development action exited non-zero." if exit_code else None),
+            "error_code": "DEVELOPMENT_GIT_METADATA_WRITE_DENIED" if metadata_denied else "DEVELOPMENT_EXECUTION_CANCELLED" if cancelled else "DEVELOPMENT_EXECUTION_TIMEOUT" if timed_out else ("DEVELOPMENT_COMMAND_FAILED" if exit_code else None),
+            "error_message": "Project code attempted to modify Forge-controlled Git metadata." if metadata_denied else "Development action was cancelled." if cancelled else "Development action timed out." if timed_out else ("Development action exited non-zero." if exit_code else None),
         }
     except Exception as exc:
         return {
@@ -296,6 +407,9 @@ async def execute(request: dict[str, Any]) -> dict[str, Any]:
             "error_code": "DEVELOPMENT_REQUEST_DENIED",
             "error_message": str(exc)[:500],
         }
+    finally:
+        if "disposable_workspace" in locals() and disposable_workspace is not None:
+            shutil.rmtree(disposable_workspace, ignore_errors=True)
 
 
 async def main() -> None:

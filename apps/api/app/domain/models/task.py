@@ -98,6 +98,7 @@ class Task(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     acceptance_criteria: Mapped[list[Any]] = mapped_column(
         JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
     )
+    terminal_reason: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     status: Mapped[TaskStatus] = mapped_column(
         Enum(TaskStatus, name="task_status"),
         default=TaskStatus.CREATED,

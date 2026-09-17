@@ -7,9 +7,16 @@ function receivedShape(received: { type?: string; length?: number } | undefined)
 
 export function PlannerResponseDiagnostics({ error }: { error: PlannerErrorDetails }) {
   const fields = error.validation_errors ?? [];
-  if (!fields.length && !error.finish_reason && !error.response_shape) return null;
+  const hasOperational = error.provider || error.model || error.failure_category || error.last_failure_at || error.repair_attempted !== undefined;
+  if (!fields.length && !error.finish_reason && !error.response_shape && !hasOperational) return null;
   return <div className="mt-3 rounded-lg border border-white/10 bg-black/15 p-3" aria-label="Planner response diagnostics">
-    <strong className="text-xs text-slate-200">Malformed response evidence</strong>
+    <strong className="text-xs text-slate-200">Planner failure evidence</strong>
+    {hasOperational && <div className="mt-2 grid gap-1 text-xs text-slate-400 sm:grid-cols-2">
+      <span>Provider/model: {[error.provider, error.model].filter(Boolean).join(" · ") || "not recorded"}</span>
+      <span>Category: {error.failure_category ?? error.category ?? "unclassified"}</span>
+      <span>Repair: {error.repair_attempted ? "attempted" : error.repair_eligible ? "eligible" : "not eligible"}</span>
+      <span>Last failure: {error.last_failure_at ? new Date(error.last_failure_at).toLocaleString() : "not recorded"}</span>
+    </div>}
     {(error.finish_reason || error.response_shape) && <small className="mt-1 block">
       {[error.finish_reason && `Gemini finish: ${error.finish_reason}`, error.response_shape?.type && `response: ${error.response_shape.type}`, typeof error.response_shape?.text_length === "number" && `${error.response_shape.text_length} characters`].filter(Boolean).join(" · ")}
     </small>}

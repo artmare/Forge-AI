@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     model_request_timeout_seconds: float = 120.0
     model_transient_max_attempts: int = 3
     model_retry_base_seconds: float = 0.25
+    model_provider_health_cooldown_seconds: int = 300
     store_model_inputs: bool = False
     agent_run_stale_seconds: int = 300
     tools_enabled: bool = True

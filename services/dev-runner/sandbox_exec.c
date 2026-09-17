@@ -61,7 +61,8 @@ int main(int argc, char **argv) {
 
     char workspace[PATH_MAX];
     if (realpath(argv[1], workspace) == NULL ||
-        strncmp(workspace, "/workspaces/", 12) != 0) {
+        (strncmp(workspace, "/workspaces/", 12) != 0 &&
+         strncmp(workspace, "/sandboxes/", 11) != 0)) {
         fputs("sandbox workspace is invalid\n", stderr);
         return 65;
     }

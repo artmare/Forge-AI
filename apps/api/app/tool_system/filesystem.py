@@ -159,6 +159,7 @@ class FilesystemTools:
         content = arguments.content.encode("utf-8")
         if len(content) > self.write_max_bytes:
             raise ToolSystemError("FILE_TOO_LARGE", "File content exceeds the write limit")
+        self.workspace.validate_mutation_path(arguments.path)
         workspace, path = self.workspace.resolve(
             context.company_id, context.project_id, arguments.path, must_exist=False
         )

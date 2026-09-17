@@ -9,6 +9,9 @@ from app.tool_system.errors import ToolSystemError
 
 
 class WorkspaceManager:
+    _RESERVED_MUTATION_COMPONENTS = frozenset({".git"})
+    _RESERVED_MUTATION_FILES = frozenset({".gitattributes", ".gitmodules"})
+
     def __init__(self, root: str | Path) -> None:
         self.configured_root = Path(root)
 
@@ -84,6 +87,20 @@ class WorkspaceManager:
             raise ToolSystemError("FILE_NOT_FOUND", "Requested path does not exist") from exc
         self._require_within(workspace, resolved)
         return workspace, resolved
+
+    @classmethod
+    def validate_mutation_path(cls, requested_path: str) -> None:
+        """Reject model-controlled writes to Forge-owned Git administration state."""
+        cls._validate_relative_path(requested_path)
+        parts = PurePosixPath(requested_path.replace("\\", "/")).parts
+        normalized = tuple(part.rstrip(" .").casefold() for part in parts)
+        if any(part in cls._RESERVED_MUTATION_COMPONENTS for part in normalized) or (
+            normalized and normalized[-1] in cls._RESERVED_MUTATION_FILES
+        ):
+            raise ToolSystemError(
+                "RESERVED_WORKSPACE_PATH",
+                "Model-controlled writes to Git administration paths are not allowed",
+            )
 
     @staticmethod
     def relative(workspace: Path, path: Path) -> str:

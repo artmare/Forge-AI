@@ -160,6 +160,7 @@ class ToolExecutionContext:
     task_run_id: UUID
     agent_id: UUID
     agent_run_id: UUID
+    execution_origin: Literal["MODEL_REQUESTED", "FORGE_QA"] = "MODEL_REQUESTED"
 
 
 ToolHandler = Callable[[BaseModel, ToolExecutionContext], Awaitable[BaseModel]]

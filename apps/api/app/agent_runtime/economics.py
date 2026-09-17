@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
@@ -141,7 +141,24 @@ class ModelEconomicsService:
         self, profiles: tuple[ModelProfile, ...]
     ) -> dict[tuple[str, str], ProviderHealthStatus]:
         rows = list(await self.session.scalars(select(ModelProviderHealth)))
-        health = {(row.provider, row.model_id): ProviderHealthStatus(row.status) for row in rows}
+        now = datetime.now(UTC)
+        cooldown = timedelta(seconds=self.settings.model_provider_health_cooldown_seconds)
+        health: dict[tuple[str, str], ProviderHealthStatus] = {}
+        for row in rows:
+            status = ProviderHealthStatus(row.status)
+            if (
+                status
+                in {
+                    ProviderHealthStatus.QUOTA_EXHAUSTED,
+                    ProviderHealthStatus.DEGRADED,
+                }
+                and row.last_checked_at <= now - cooldown
+            ):
+                # Quota and transient degradation are observations, not permanent disables.
+                # A post-cooldown request rechecks the provider; auth/model errors remain
+                # fail-closed until configuration or health state is explicitly repaired.
+                status = ProviderHealthStatus.HEALTHY
+            health[(row.provider, row.model_id)] = status
         for profile in profiles:
             if not self._provider_enabled(profile.provider) or not self._credential_present(
                 profile.provider

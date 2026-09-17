@@ -13,7 +13,7 @@ async def test_migration_is_at_head() -> None:
     async with get_session_factory()() as session:
         revision = await session.scalar(text("SELECT version_num FROM alembic_version"))
 
-    assert revision == "20260828_0017"
+    assert revision == "20260902_0018"
 
 
 def test_migration_upgrade_downgrade_lifecycle() -> None:

@@ -111,8 +111,16 @@ describe("CreateMission", () => {
         502,
         {
           category: "RESPONSE_VALIDATION",
-          phase: "PROVIDER_REQUEST",
+          phase: "RESPONSE_VALIDATION",
           retryable: false,
+          provider: "gemini",
+          model: "gemini-2.5-flash-lite",
+          failure_category: "SCHEMA_PARSE",
+          repair_attempted: true,
+          repair_eligible: false,
+          last_failure_at: "2026-09-02T10:30:00Z",
+          provider_attempts: 2,
+          max_provider_attempts: 3,
           finish_reason: "STOP",
           response_shape: { type: "object", text_length: 9219 },
           validation_errors: [{
@@ -135,6 +143,10 @@ describe("CreateMission", () => {
     expect(diagnostics.textContent).toContain("expected array");
     expect(diagnostics.textContent).toContain("received string (length 24)");
     expect(diagnostics.textContent).toContain("Gemini finish: STOP");
+    expect(diagnostics.textContent).toContain("gemini · gemini-2.5-flash-lite");
+    expect(diagnostics.textContent).toContain("Category: SCHEMA_PARSE");
+    expect(diagnostics.textContent).toContain("Repair: attempted");
+    expect(diagnostics.textContent).not.toContain("not recorded");
     expect(diagnostics.textContent).not.toContain("a-secret-response-value");
   });
 });

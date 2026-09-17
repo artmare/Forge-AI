@@ -37,6 +37,16 @@ async def handle_orchestration_event(envelope: EventEnvelope) -> None:
             if task is not None and task.project_id is not None:
                 await resolver.reconcile_project(task.project_id, commit=False)
             await session.commit()
+    elif target in {"FAILED", "CANCELLED"}:
+        async with get_session_factory()() as session:
+            resolver = DependencyResolver(session)
+            task = await resolver.tasks.get(envelope.task_id)
+            await resolver.resolve_terminal_dependents(
+                envelope.task_id, causation_id=envelope.event_id, commit=False
+            )
+            if task is not None and task.project_id is not None:
+                await resolver.reconcile_project(task.project_id, commit=False)
+            await session.commit()
 
 
 async def reconciliation_loop() -> None:

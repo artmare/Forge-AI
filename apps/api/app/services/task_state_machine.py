@@ -103,6 +103,16 @@ class TaskStateMachine:
 
             task.status = target
             task.completed_at = now if target in self.TERMINAL_STATES else None
+            if target == TaskStatus.FAILED and task.terminal_reason is None:
+                task.terminal_reason = {
+                    "code": "TASK_EXECUTION_FAILED",
+                    "message": normalized_reason or "Task execution failed.",
+                }
+            elif target == TaskStatus.CANCELLED and task.terminal_reason is None:
+                task.terminal_reason = {
+                    "code": "TASK_CANCELLED",
+                    "message": normalized_reason or "Task was cancelled.",
+                }
             await self._record_transition(task, current, target, normalized_reason)
 
             if target == TaskStatus.CANCELLED:
@@ -143,6 +153,7 @@ class TaskStateMachine:
             current = task.status
             task.status = TaskStatus.FAILED
             task.completed_at = now
+            task.terminal_reason = {"code": "ORPHANED_TASK_RUN", "message": reason}
             await self._record_transition(task, current, TaskStatus.FAILED, reason)
             await self._add_event(
                 task,
@@ -218,6 +229,10 @@ class TaskStateMachine:
         task.status = TaskStatus.FAILED
         task.completed_at = now
         reason = f"Maximum execution iterations reached ({task.iteration}/{task.max_iterations})."
+        task.terminal_reason = {
+            "code": "TASK_MAX_ITERATIONS_EXCEEDED",
+            "message": reason,
+        }
         await self._record_transition(task, current, TaskStatus.FAILED, reason)
         await self._add_event(
             task,

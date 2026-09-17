@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.development.profile import DevelopmentProfileService
 from app.domain.enums import QADecision, ToolCallStatus
 from app.domain.exceptions import EntityNotFoundError, InvalidRelationshipError, TaskUnassignedError
 from app.domain.models import (
@@ -189,6 +190,10 @@ class ContextBuilder:
                     "typecheck_action": profile.typecheck_action.value
                     if profile.typecheck_action
                     else None,
+                    "available_actions": [
+                        action.value
+                        for action in DevelopmentProfileService.available_actions(profile)
+                    ],
                 }
                 if profile is not None
                 else None
@@ -238,7 +243,11 @@ class InstructionBuilder:
             "filesystem.read only for existing regular files; never pass '.' to read or write. "
             "An empty workspace that requires a scaffold is not complete until the required files "
             "have been durably written and then validated. Do not repeat an unchanged inspection "
-            "when the prior observation already established the same workspace state."
+            "when the prior observation already established the same workspace state. Forge owns "
+            "lifecycle checkpoints; do not create a Git commit merely to prove completion. Once "
+            "the required deterministic test/build actions have passed and git status/diff has "
+            "been inspected, return the final structured result immediately. Do not rerun a "
+            "successful command or reread unchanged files only for confirmation."
         ),
         "QA": (
             "Independently verify the acceptance criteria, changed files, and deterministic "
@@ -272,6 +281,7 @@ class InstructionBuilder:
         recent_observation_limit: int = 3,
         budget_warning: bool = False,
         duplicate_warning: bool = False,
+        completion_required: bool = False,
     ) -> BuiltInstructions:
         requested_role = str(context.agent.get("role", "GENERAL")).upper()
         role: Literal["GENERAL", "RESEARCHER", "DEVELOPER", "QA"] = (
@@ -304,6 +314,13 @@ class InstructionBuilder:
             system_layers.append(
                 "Forge detected a repeated unchanged action. Do not repeat the same read or "
                 "command without an intervening write or new evidence."
+            )
+        if completion_required:
+            system_layers.append(
+                "Forge has durable success observations for every discovered deterministic "
+                "validation action plus git status/diff in this Developer turn. No tools are "
+                "available now. Return the required final structured result immediately, using "
+                "only those observations as evidence."
             )
         system_prompt = "\n\n".join(system_layers)
         full_context = context.model_dump(mode="json")
