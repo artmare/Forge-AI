@@ -420,6 +420,319 @@ class OpenAIModelProvider:
         }
 
 
+class OpenRouterModelProvider:
+    """OpenRouter Chat Completions adapter. Forge remains the tool executor."""
+
+    name = "openrouter"
+
+    def __init__(
+        self,
+        api_key: str,
+        timeout_seconds: float,
+        *,
+        base_url: str,
+        paid: bool,
+    ) -> None:
+        from openai import AsyncOpenAI
+
+        self.paid = paid
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            timeout=timeout_seconds,
+            max_retries=0,
+            base_url=base_url,
+        )
+
+    @staticmethod
+    def _native_tool_name(name: str) -> str:
+        return OpenAIModelProvider._native_tool_name(name)
+
+    @staticmethod
+    def _structured_response_format(request: ModelRequest) -> dict[str, Any]:
+        schema_name = re.sub(r"[^a-zA-Z0-9_-]", "_", request.response_model.__name__)[:64]
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name or "forge_response",
+                "strict": True,
+                "schema": request.response_model.model_json_schema(),
+            },
+        }
+
+    def _messages(self, request: ModelRequest) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": request.system_prompt},
+            {
+                "role": "user",
+                "content": request.conversation_start_prompt or request.user_prompt,
+            },
+        ]
+        for exchange in request.tool_exchanges:
+            call_id = exchange.call.call_id
+            native_name = exchange.call.provider_context.get("native_name")
+            if not call_id or not isinstance(native_name, str) or not native_name:
+                raise ProviderCallError(
+                    "PROVIDER_TOOL_PROTOCOL_ERROR",
+                    "OpenRouter tool continuation state is missing or invalid",
+                    category="TOOL_PROTOCOL",
+                )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": native_name,
+                                "arguments": json.dumps(
+                                    exchange.call.arguments,
+                                    separators=(",", ":"),
+                                ),
+                            },
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps(
+                        exchange.response,
+                        separators=(",", ":"),
+                    ),
+                }
+            )
+        return messages
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        native_name_to_forge: dict[str, str] = {}
+        native_tools: list[dict[str, Any]] = []
+        for tool in request.tools:
+            native_name = self._native_tool_name(tool.name)
+            if native_name in native_name_to_forge:
+                raise ProviderCallError(
+                    "MODEL_TOOL_SCHEMA_ERROR",
+                    "Model tool names are not uniquely representable",
+                    category="TOOL_SCHEMA",
+                )
+            native_name_to_forge[native_name] = tool.name
+            native_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": native_name,
+                        "description": tool.description,
+                        "parameters": tool.input_model.model_json_schema(),
+                        "strict": True,
+                    },
+                }
+            )
+
+        options: dict[str, Any] = {
+            "model": request.model,
+            "messages": self._messages(request),
+            "response_format": self._structured_response_format(request),
+        }
+        if native_tools:
+            options.update(
+                tools=native_tools,
+                tool_choice="auto",
+                parallel_tool_calls=False,
+            )
+
+        try:
+            response = await self.client.chat.completions.create(**options)
+        except APITimeoutError as exc:
+            raise ProviderCallError(
+                "MODEL_TIMEOUT",
+                "The model request timed out",
+                retryable=True,
+                category="TIMEOUT",
+                request_id=getattr(exc, "request_id", None),
+                exception_type=type(exc).__name__,
+            ) from exc
+        except AuthenticationError as exc:
+            raise ProviderCallError(
+                "MODEL_AUTH_ERROR",
+                "The model provider rejected authentication",
+                category="AUTHENTICATION",
+                http_status=getattr(exc, "status_code", None),
+                request_id=getattr(exc, "request_id", None),
+                exception_type=type(exc).__name__,
+            ) from exc
+        except RateLimitError as exc:
+            details = OpenAIModelProvider._provider_error_details(exc)
+            quota_exhausted = details["provider_error_type"] == "insufficient_quota" or (
+                details["provider_error_code"]
+                in {"insufficient_quota", "credit_balance_exhausted"}
+            )
+            raise ProviderCallError(
+                "MODEL_QUOTA_EXHAUSTED" if quota_exhausted else "MODEL_RATE_LIMIT",
+                (
+                    "The model provider API credit balance is exhausted"
+                    if quota_exhausted
+                    else "The model provider rate limit was reached"
+                ),
+                retryable=not quota_exhausted,
+                category="QUOTA" if quota_exhausted else "RATE_LIMIT",
+                **details,
+            ) from exc
+        except APIConnectionError as exc:
+            raise ProviderCallError(
+                "MODEL_PROVIDER_TEMPORARY",
+                "The model provider is temporarily unreachable",
+                retryable=True,
+                category="NETWORK",
+                request_id=getattr(exc, "request_id", None),
+                exception_type=type(exc).__name__,
+            ) from exc
+        except APIStatusError as exc:
+            details = OpenAIModelProvider._provider_error_details(exc)
+            status_code = details.get("http_status")
+            temporary = isinstance(status_code, int) and (
+                status_code in {408, 409, 425} or status_code >= 500
+            )
+            unavailable = status_code == 404
+            raise ProviderCallError(
+                (
+                    "MODEL_PROVIDER_TEMPORARY"
+                    if temporary
+                    else "MODEL_UNAVAILABLE"
+                    if unavailable
+                    else "MODEL_CONFIGURATION_ERROR"
+                ),
+                (
+                    "The model provider is temporarily unavailable"
+                    if temporary
+                    else "The configured model is unavailable"
+                    if unavailable
+                    else "The model provider rejected the configured request"
+                ),
+                retryable=temporary,
+                category=(
+                    "TEMPORARY_PROVIDER"
+                    if temporary
+                    else "MODEL_UNAVAILABLE"
+                    if unavailable
+                    else "CONFIGURATION"
+                ),
+                **details,
+            ) from exc
+        except APIError as exc:
+            raise ProviderCallError(
+                "MODEL_PROVIDER_ERROR",
+                "The model provider request failed",
+                category="PROVIDER",
+                request_id=getattr(exc, "request_id", None),
+                exception_type=type(exc).__name__,
+            ) from exc
+
+        choices = getattr(response, "choices", None) or []
+        if len(choices) != 1:
+            raise ProviderCallError(
+                "INVALID_MODEL_OUTPUT",
+                "OpenRouter returned an unexpected number of choices",
+                category="RESPONSE_VALIDATION",
+            )
+        message = choices[0].message
+        tool_calls = getattr(message, "tool_calls", None) or []
+
+        usage_data = getattr(response, "usage", None)
+        prompt_details = getattr(usage_data, "prompt_tokens_details", None)
+        usage = ModelUsage(
+            input_tokens=getattr(usage_data, "prompt_tokens", 0) or 0,
+            output_tokens=getattr(usage_data, "completion_tokens", 0) or 0,
+            total_tokens=getattr(usage_data, "total_tokens", 0) or 0,
+            cached_input_tokens=getattr(prompt_details, "cached_tokens", 0) or 0,
+        )
+
+        if tool_calls:
+            if len(tool_calls) != 1:
+                raise ProviderCallError(
+                    "INVALID_MODEL_OUTPUT",
+                    "The model returned more than one tool request",
+                    category="RESPONSE_VALIDATION",
+                )
+            native_call = tool_calls[0]
+            function = getattr(native_call, "function", None)
+            native_name = getattr(function, "name", None)
+            forge_name = native_name_to_forge.get(native_name)
+            if forge_name is None:
+                raise ProviderCallError(
+                    "INVALID_MODEL_OUTPUT",
+                    "The model requested an unknown tool",
+                    category="RESPONSE_VALIDATION",
+                )
+            try:
+                arguments = json.loads(getattr(function, "arguments", ""))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ProviderCallError(
+                    "INVALID_MODEL_OUTPUT",
+                    "The model returned invalid tool arguments",
+                    category="RESPONSE_VALIDATION",
+                ) from exc
+            if not isinstance(arguments, dict):
+                raise ProviderCallError(
+                    "INVALID_MODEL_OUTPUT",
+                    "The model tool arguments must be an object",
+                    category="RESPONSE_VALIDATION",
+                )
+            call_id = getattr(native_call, "id", None)
+            if not isinstance(call_id, str) or not call_id:
+                raise ProviderCallError(
+                    "PROVIDER_TOOL_PROTOCOL_ERROR",
+                    "OpenRouter returned a tool call without an id",
+                    category="TOOL_PROTOCOL",
+                )
+            tool_call = ModelToolCall(
+                name=forge_name,
+                arguments=arguments,
+                call_id=call_id,
+                provider_context={"native_name": native_name},
+            )
+            output: Any = {
+                "type": "tool_call",
+                "tool_name": forge_name,
+                "arguments": arguments,
+            }
+            return ModelResponse(
+                output=output,
+                usage=usage,
+                provider=self.name,
+                model=getattr(response, "model", None) or request.model,
+                response_id=getattr(response, "id", None),
+                tool_call=tool_call,
+            )
+
+        content = getattr(message, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            raise ProviderCallError(
+                "INVALID_MODEL_OUTPUT",
+                "The model did not return the required structured result",
+                category="RESPONSE_VALIDATION",
+            )
+        try:
+            output = request.response_model.model_validate_json(content)
+        except ValidationError as exc:
+            raise ProviderCallError(
+                "INVALID_MODEL_OUTPUT",
+                "The model returned a malformed structured result",
+                category="RESPONSE_VALIDATION",
+                exception_type=type(exc).__name__,
+            ) from exc
+
+        return ModelResponse(
+            output=output,
+            usage=usage,
+            provider=self.name,
+            model=getattr(response, "model", None) or request.model,
+            response_id=getattr(response, "id", None),
+        )
+
+
 class GeminiModelProvider:
     """Provider-neutral Gemini generateContent adapter with structured/tool output."""
 
@@ -895,12 +1208,11 @@ def provider_from_settings(
     if provider_name == "openrouter":
         key = settings.openrouter_api_key
         api_key = key.get_secret_value() if key is not None else ""
-        return OpenAIModelProvider(
+        return OpenRouterModelProvider(
             api_key,
             settings.model_request_timeout_seconds,
-            name="openrouter",
-            paid=True if paid is None else paid,
             base_url=settings.openrouter_base_url,
+            paid=False if paid is None else paid,
         )
     if provider_name == "gemini":
         key = settings.gemini_api_key
