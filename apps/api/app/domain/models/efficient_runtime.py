@@ -144,6 +144,10 @@ class ProjectKnowledgeIndex(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         PostgreSQLUUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
     )
     architecture_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    project_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    state: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
     modules: Mapped[list[Any]] = mapped_column(
         JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
     )
@@ -157,6 +161,12 @@ class ProjectKnowledgeIndex(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
     )
     recent_changes: Mapped[list[Any]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    lessons: Mapped[list[Any]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    checkpoints: Mapped[list[Any]] = mapped_column(
         JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
     )
 

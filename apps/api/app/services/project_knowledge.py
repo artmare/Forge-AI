@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -78,6 +80,72 @@ class ProjectKnowledgeService:
             + [{"task_id": str(task.id), "decision": "HUMAN_APPROVED", "title": task.title}]
         )[-100:]
         index.recent_changes = (list(index.recent_changes) + [change])[-30:]
+        index.state = {
+            **index.state,
+            "last_completed_task_id": str(task.id),
+            "last_completed_task": task.title,
+            "last_completed_at": datetime.now(UTC).isoformat(),
+            "known_issues": index.state.get("known_issues", []),
+            "next_actions": index.state.get("next_actions", []),
+        }
+        await self.session.flush()
+        return index
+
+    async def checkpoint(
+        self,
+        project_id: UUID,
+        *,
+        task_id: UUID,
+        goal: str,
+        completed: list[str],
+        current_diff: str,
+        decisions: list[str],
+        test_status: list[str],
+        failures: list[str],
+        open_questions: list[str],
+        next_action: str,
+    ) -> ProjectKnowledgeIndex:
+        """Persist a bounded L1 handoff while leaving raw execution history intact."""
+        index = await self.session.scalar(
+            select(ProjectKnowledgeIndex).where(ProjectKnowledgeIndex.project_id == project_id)
+        )
+        if index is None:
+            index = ProjectKnowledgeIndex(project_id=project_id, architecture_summary="")
+            self.session.add(index)
+            await self.session.flush()
+        checkpoint = {
+            "at": datetime.now(UTC).isoformat(),
+            "task_id": str(task_id),
+            "goal": goal[:2000],
+            "completed": completed[-30:],
+            "current_diff": current_diff[:20_000],
+            "decisions": decisions[-20:],
+            "test_status": test_status[-20:],
+            "failures": failures[-20:],
+            "open_questions": open_questions[-20:],
+            "next_action": next_action[:2000],
+        }
+        index.checkpoints = [*index.checkpoints, checkpoint][-10:]
+        await self.session.flush()
+        return index
+
+    async def record_lesson(
+        self, project_id: UUID, *, task_id: UUID, lesson: str, evidence: str
+    ) -> ProjectKnowledgeIndex:
+        index = await self.session.scalar(
+            select(ProjectKnowledgeIndex).where(ProjectKnowledgeIndex.project_id == project_id)
+        )
+        if index is None:
+            index = ProjectKnowledgeIndex(project_id=project_id, architecture_summary="")
+            self.session.add(index)
+            await self.session.flush()
+        item = {
+            "at": datetime.now(UTC).isoformat(),
+            "task_id": str(task_id),
+            "lesson": lesson[:2000],
+            "evidence": evidence[:2000],
+        }
+        index.lessons = [*index.lessons, item][-100:]
         await self.session.flush()
         return index
 

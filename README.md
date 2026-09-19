@@ -1,5 +1,8 @@
 # Forge
 
+Forge Dev Mode architecture and configuration are documented in
+[`docs/forge-dev-mode.md`](docs/forge-dev-mode.md).
+
 Forge is an Autonomous Company OS. This repository contains the Phase 08 Mission planning runtime:
 domain APIs, a concurrency-safe task state machine, provider-neutral multi-turn model execution,
 durable AgentRun and ToolCall history, strict permission enforcement, isolated project workspaces,

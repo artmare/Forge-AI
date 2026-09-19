@@ -44,7 +44,10 @@ class ContextRecord(BaseModel):
 class BuiltInstructions(BaseModel):
     system_prompt: str
     user_prompt: str
-    runtime_role: Literal["GENERAL", "RESEARCHER", "DEVELOPER", "QA"]
+    runtime_role: Literal[
+        "GENERAL", "RESEARCHER", "DEVELOPER", "QA", "ARCHITECT", "CODE_REVIEWER",
+        "PRODUCT_UX", "CREATIVE_DIRECTOR", "MARKETING_STRATEGY"
+    ]
 
 
 class ContextBuilder:
@@ -200,12 +203,16 @@ class ContextBuilder:
             ),
             project_knowledge=(
                 {
+                    "project_summary": knowledge.project_summary,
                     "architecture_summary": knowledge.architecture_summary,
+                    "state": knowledge.state,
                     "modules": knowledge.modules,
                     "contracts": knowledge.contracts,
                     "decisions": knowledge.decisions,
                     "constraints": knowledge.constraints,
                     "recent_changes": knowledge.recent_changes[-10:],
+                    "lessons": knowledge.lessons[-20:],
+                    "checkpoints": knowledge.checkpoints[-3:],
                 }
                 if knowledge is not None
                 else None
@@ -254,6 +261,26 @@ class InstructionBuilder:
             "execution evidence. Do not trust a Developer summary. Do not modify production code. "
             "Distinguish blocking from non-blocking findings and return structured evidence."
         ),
+        "ARCHITECT": (
+            "Review only the scoped architecture question, constraints, relevant files, and diff. "
+            "Return structured recommendations and tradeoffs; the Lead Engineer owns the decision."
+        ),
+        "CODE_REVIEWER": (
+            "Review the supplied diff for correctness, regressions, maintainability, and missing "
+            "tests. Cite concrete files and return prioritized structured findings."
+        ),
+        "PRODUCT_UX": (
+            "Evaluate the scoped product flow, audience needs, accessibility, and interaction "
+            "clarity. Return concrete recommendations; do not expand the product scope."
+        ),
+        "CREATIVE_DIRECTOR": (
+            "Critique composition, typography, interaction, motion, and visual metaphor. Avoid "
+            "generic template patterns and provide substantially distinct directions when asked."
+        ),
+        "MARKETING_STRATEGY": (
+            "Evaluate positioning, audience, message hierarchy, and evidence. Return scoped, "
+            "structured recommendations without making unverifiable market claims."
+        ),
     }
     RESPONSE = (
         "Use exactly one listed tool when an observation or action is needed, or return the "
@@ -283,8 +310,13 @@ class InstructionBuilder:
         duplicate_warning: bool = False,
         completion_required: bool = False,
     ) -> BuiltInstructions:
-        requested_role = str(context.agent.get("role", "GENERAL")).upper()
-        role: Literal["GENERAL", "RESEARCHER", "DEVELOPER", "QA"] = (
+        requested_role = str(context.agent.get("role", "GENERAL")).upper().replace(" ", "_")
+        if requested_role == "LEAD_ENGINEER":
+            requested_role = "DEVELOPER"
+        role: Literal[
+            "GENERAL", "RESEARCHER", "DEVELOPER", "QA", "ARCHITECT", "CODE_REVIEWER",
+            "PRODUCT_UX", "CREATIVE_DIRECTOR", "MARKETING_STRATEGY"
+        ] = (
             requested_role if requested_role in self.ROLE else "GENERAL"
         )  # type: ignore[assignment]
         available_tools = tools or []
