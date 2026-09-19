@@ -36,17 +36,16 @@ class ExecutionTruthDecision:
 class ExecutionTruthValidator:
     """Validate completion against Forge-owned observations, never model prose.
 
-    Developer tasks are execution tasks by default. A deliberately read-only task may
-    opt out with ``task.input.execution_required=false``. Artifact claims are checked
-    structurally against successful mutation results, avoiding prose classification.
+    Execution evidence is required by the claims in a completion, not by the agent's
+    role. Artifact and structured execution claims are checked structurally; a small
+    set of high-confidence prose patterns protects providers that return an execution
+    claim in the summary instead of the structured fields.
     """
 
     _MUTATION_TOOLS = frozenset(
         {
             "filesystem.write",
             "filesystem.patch",
-            "git.commit",
-            "git.checkpoint",
         }
     )
     _COMMAND_TOOLS = frozenset(
@@ -63,7 +62,23 @@ class ExecutionTruthValidator:
         }
     )
     _TEST_SUCCESS_CLAIM = re.compile(
-        r"\b(?:tests?|test suite|lint|typecheck|build)\s+(?:all\s+)?(?:passed|succeeded|green)\b",
+        r"\b(?:(?:all\s+)?(?:tests?|test suite|lint|typecheck|build)(?:\s+\w+){0,3}\s+"
+        r"(?:passed|succeeded|green)|(?:passed|successful)\s+(?:all\s+)?tests?)\b",
+        re.IGNORECASE,
+    )
+    _FILE_MUTATION_CLAIM = re.compile(
+        r"\b(?:wrote|created|modified|edited|patched|deleted|removed|renamed|moved|saved)\b"
+        r"[^\n]{0,120}(?:\b(?:file|directory|folder|artifact)\b|"
+        r"(?:^|[\s'\"`/])[-\w./]+\.[a-zA-Z0-9]{1,12}\b)",
+        re.IGNORECASE,
+    )
+    _GIT_CLAIM = re.compile(
+        r"\b(?:committed|pushed|merged|rebased|cherry-picked)\b(?:[^\n]{0,80}\bgit\b)?",
+        re.IGNORECASE,
+    )
+    _COMMAND_CLAIM = re.compile(
+        r"\b(?:ran|executed)\b[^\n]{0,80}\b(?:command|script|shell|migration)\b|"
+        r"\bdeploy(?:ed|ment succeeded)\b",
         re.IGNORECASE,
     )
 
@@ -75,20 +90,6 @@ class ExecutionTruthValidator:
         observations: list[ToolObservation],
     ) -> ExecutionTruthDecision:
         evidence = cls.collect(observations)
-        role = str(context.agent.get("role", "")).upper()
-        task_input = context.task.get("input")
-        execution_required = not (
-            isinstance(task_input, dict) and task_input.get("execution_required") is False
-        )
-
-        developer_role = role in {"DEVELOPER", "LEAD_ENGINEER", "LEAD ENGINEER"}
-        if developer_role and execution_required and not evidence:
-            return ExecutionTruthDecision(
-                False,
-                "UNVERIFIED_EXECUTION_CLAIM",
-                "Developer completion requires successful Forge execution evidence.",
-            )
-
         artifacts = result.output.get("artifacts", [])
         if not isinstance(artifacts, list):
             return ExecutionTruthDecision(
@@ -127,7 +128,21 @@ class ExecutionTruthValidator:
             )
         evidence_kinds = {item.kind.value for item in evidence}
         for claim in claims:
-            if not isinstance(claim, dict) or claim.get("kind") not in evidence_kinds:
+            if not isinstance(claim, dict):
+                return ExecutionTruthDecision(
+                    False,
+                    "UNVERIFIED_EXECUTION_CLAIM",
+                    "A structured execution claim has no matching Forge evidence.",
+                    evidence,
+                )
+            claim_kind = claim.get("kind")
+            claim_reference = claim.get("reference")
+            matching_evidence = [item for item in evidence if item.kind.value == claim_kind]
+            if isinstance(claim_reference, str):
+                matching_evidence = [
+                    item for item in matching_evidence if item.reference == claim_reference
+                ]
+            if not matching_evidence:
                 return ExecutionTruthDecision(
                     False,
                     "UNVERIFIED_EXECUTION_CLAIM",
@@ -138,6 +153,7 @@ class ExecutionTruthValidator:
         prose = "\n".join(
             [result.summary]
             + [str(item) for item in result.output.get("details", []) if isinstance(item, str)]
+            + result.notes
         )
         if cls._TEST_SUCCESS_CLAIM.search(prose) and EvidenceKind.TEST.value not in evidence_kinds:
             return ExecutionTruthDecision(
@@ -146,6 +162,19 @@ class ExecutionTruthValidator:
                 "The completion claims validation passed without a successful Forge test result.",
                 evidence,
             )
+        prose_requirements = (
+            (cls._FILE_MUTATION_CLAIM, EvidenceKind.FILE_MUTATION, "filesystem mutation"),
+            (cls._GIT_CLAIM, EvidenceKind.GIT, "Git action"),
+            (cls._COMMAND_CLAIM, EvidenceKind.COMMAND, "command execution"),
+        )
+        for pattern, kind, description in prose_requirements:
+            if pattern.search(prose) and kind.value not in evidence_kinds:
+                return ExecutionTruthDecision(
+                    False,
+                    "UNVERIFIED_EXECUTION_CLAIM",
+                    f"The completion claims {description} without matching Forge evidence.",
+                    evidence,
+                )
         return ExecutionTruthDecision(
             True,
             "EXECUTION_EVIDENCE_VERIFIED",
@@ -171,6 +200,9 @@ class ExecutionTruthValidator:
                 )
             elif observation.tool in cls._COMMAND_TOOLS:
                 action = result.get("action")
+                execution_succeeded = str(result.get("status", "SUCCEEDED")).upper() == "SUCCEEDED"
+                if not execution_succeeded:
+                    continue
                 kind = EvidenceKind.TEST if action in cls._TEST_ACTIONS else EvidenceKind.COMMAND
                 collected.append(
                     ExecutionEvidence(

@@ -5,15 +5,19 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from alembic import command
+from alembic.script import ScriptDirectory
 from app.infrastructure.database import get_session_factory
-from tests.conftest import alembic_config, drop_database, recreate_database
+from tests.conftest import TEST_DATABASE_NAME, alembic_config, drop_database, recreate_database
 
 
 async def test_migration_is_at_head() -> None:
+    config = alembic_config(TEST_DATABASE_NAME)
+    heads = ScriptDirectory.from_config(config).get_heads()
     async with get_session_factory()() as session:
         revision = await session.scalar(text("SELECT version_num FROM alembic_version"))
 
-    assert revision == "20260902_0018"
+    assert heads == ["20260919_0019"]
+    assert revision == heads[0]
 
 
 def test_migration_upgrade_downgrade_lifecycle() -> None:
