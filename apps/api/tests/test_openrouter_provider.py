@@ -249,3 +249,45 @@ async def test_openrouter_provider_requires_continuation_identity() -> None:
 
     assert raised.value.code == "PROVIDER_TOOL_PROTOCOL_ERROR"
     assert completions.calls == []
+
+
+async def test_openrouter_provider_omits_unsupported_optional_parameters() -> None:
+    completions = RecordingCompletions([_tool_response()])
+    provider = OpenRouterModelProvider(
+        "test-key", 30, base_url="https://openrouter.ai/api/v1", paid=False
+    )
+    provider.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    await provider.generate(
+        _request(metadata={"provider_supported_parameters": "tools,tool_choice"})
+    )
+
+    call = completions.calls[0]
+    assert "response_format" not in call
+    assert "parallel_tool_calls" not in call
+    assert call["tool_choice"] == "auto"
+
+
+@pytest.mark.parametrize(
+    ("native_name", "arguments", "expected_code"),
+    [
+        ("forge__unknown", "{}", "INVALID_MODEL_OUTPUT"),
+        ("forge__filesystem__write", "{not-json", "INVALID_MODEL_OUTPUT"),
+    ],
+)
+async def test_openrouter_provider_rejects_invalid_native_tool_requests(
+    native_name: str, arguments: str, expected_code: str
+) -> None:
+    response = _tool_response()
+    response.choices[0].message.tool_calls[0].function.name = native_name
+    response.choices[0].message.tool_calls[0].function.arguments = arguments
+    completions = RecordingCompletions([response])
+    provider = OpenRouterModelProvider(
+        "test-key", 30, base_url="https://openrouter.ai/api/v1", paid=False
+    )
+    provider.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    with pytest.raises(ProviderCallError) as raised:
+        await provider.generate(_request())
+
+    assert raised.value.code == expected_code

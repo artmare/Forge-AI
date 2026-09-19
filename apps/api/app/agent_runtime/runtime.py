@@ -25,6 +25,7 @@ from app.agent_runtime.contracts import (
 from app.agent_runtime.cost import CostEstimator
 from app.agent_runtime.economics import ModelEconomicsService
 from app.agent_runtime.efficiency import EfficientRuntimeService, ModelBudgetExceeded
+from app.agent_runtime.execution_truth import ExecutionTruthValidator
 from app.agent_runtime.policy import ModelExecutionPolicy
 from app.agent_runtime.providers import provider_for_profile
 from app.agent_runtime.registry import ModelRegistry
@@ -94,6 +95,7 @@ NORMALIZED_PROVIDER_CODES = frozenset(
         "PROVIDER_RESPONSE_INVALID",
         "PROVIDER_TOOL_SCHEMA_INVALID",
         "PROVIDER_TOOL_PROTOCOL_ERROR",
+        "UNVERIFIED_EXECUTION_CLAIM",
     }
 )
 
@@ -213,6 +215,9 @@ class AgentRuntime:
                 capabilities,
                 current_task,
                 str(context.agent.get("role", "GENERAL")),
+                validate_response=lambda response: self._validate_execution_truth_response(
+                    response, context, observations
+                ),
             )
             if not await self._execution_allowed():
                 error = ProviderCallError("AGENT_RUNTIME_ERROR", "Durable execution lease was lost")
@@ -244,6 +249,15 @@ class AgentRuntime:
                 raise self._public_error(error)
 
             if isinstance(turn, FinalTurn):
+                truth = ExecutionTruthValidator.validate(context, turn.result, observations)
+                if not truth.accepted:
+                    error = ProviderCallError(
+                        truth.code,
+                        truth.message,
+                        category="TOOL_PROTOCOL",
+                    )
+                    await self._fail(run.id, error)
+                    raise self._public_error(error)
                 completed = await self._complete_turn(
                     run.id,
                     turn.result.model_dump(mode="json"),
@@ -256,7 +270,8 @@ class AgentRuntime:
 
             max_tool_steps = (
                 self.settings.developer_max_steps
-                if str(context.agent.get("role", "")).upper() == "DEVELOPER"
+                if str(context.agent.get("role", "")).upper()
+                in {"DEVELOPER", "LEAD_ENGINEER", "LEAD ENGINEER"}
                 else self.settings.agent_max_tool_steps
             )
             if tool_steps >= max_tool_steps:
@@ -442,7 +457,11 @@ class AgentRuntime:
         context: ContextRecord, observations: list[ToolObservation]
     ) -> bool:
         """Require a final-only turn after this Developer run has enough durable evidence."""
-        if str(context.agent.get("role", "")).upper() != "DEVELOPER":
+        if str(context.agent.get("role", "")).upper() not in {
+            "DEVELOPER",
+            "LEAD_ENGINEER",
+            "LEAD ENGINEER",
+        }:
             return False
         successful = [
             item
@@ -537,7 +556,7 @@ class AgentRuntime:
                 provider_health=health,
             )
         )
-        return selections, capabilities
+        return selections[: max(self.settings.model_fallback_max_candidates, 1)], capabilities
 
     async def _generate(
         self,
@@ -547,6 +566,7 @@ class AgentRuntime:
         capabilities: frozenset[ModelCapability],
         task: Any,
         agent_role: str,
+        validate_response: Callable[[ModelResponse], None] | None = None,
     ) -> ModelResponse:
         max_attempts = max(self.settings.model_transient_max_attempts, 1)
         final_error = ProviderCallError("MODEL_PROVIDER_UNAVAILABLE", "No model was available")
@@ -565,7 +585,14 @@ class AgentRuntime:
                 continue
             if selection_index:
                 await self._record_model_fallback(run.id, previous, selection, final_error)
-            current_request = replace(request, model=selection.profile.model_id)
+            metadata = dict(request.metadata)
+            if selection.profile.supported_parameters is not None:
+                metadata["provider_supported_parameters"] = ",".join(
+                    sorted(selection.profile.supported_parameters)
+                )
+            current_request = replace(
+                request, model=selection.profile.model_id, metadata=metadata
+            )
             for attempt in range(1, max_attempts + 1):
                 try:
                     call = await self.economics.begin_call(
@@ -591,6 +618,8 @@ class AgentRuntime:
                 try:
                     async with asyncio.timeout(self.settings.model_request_timeout_seconds):
                         response = await provider.generate(current_request)
+                    if validate_response is not None:
+                        validate_response(response)
                 except TimeoutError:
                     error = ProviderCallError(
                         "MODEL_TIMEOUT",
@@ -632,6 +661,30 @@ class AgentRuntime:
             previous = selection
         await self._fail(run.id, final_error)
         raise self._public_error(final_error) from None
+
+    def _validate_execution_truth_response(
+        self,
+        response: ModelResponse,
+        context: ContextRecord,
+        observations: list[ToolObservation],
+    ) -> None:
+        try:
+            turn = self._parse_turn(response.output)
+        except ValidationError as exc:
+            raise ProviderCallError(
+                "INVALID_MODEL_OUTPUT",
+                "The model returned an invalid structured turn",
+                category="RESPONSE_VALIDATION",
+            ) from exc
+        if not isinstance(turn, FinalTurn):
+            return
+        truth = ExecutionTruthValidator.validate(context, turn.result, observations)
+        if not truth.accepted:
+            raise ProviderCallError(
+                truth.code,
+                truth.message,
+                category="TOOL_PROTOCOL",
+            )
 
     async def _record_model_fallback(
         self,
@@ -1070,6 +1123,7 @@ class AgentRuntime:
             "PROVIDER_RESPONSE_INVALID": 502,
             "PROVIDER_TOOL_SCHEMA_INVALID": 502,
             "PROVIDER_TOOL_PROTOCOL_ERROR": 502,
+            "UNVERIFIED_EXECUTION_CLAIM": 409,
             "INVALID_MODEL_OUTPUT": 502,
             "MAX_TOOL_STEPS_EXCEEDED": 409,
             "AGENT_EXECUTION_CANCELLED": 409,

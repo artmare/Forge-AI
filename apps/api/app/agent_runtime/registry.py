@@ -53,6 +53,11 @@ class ModelRegistry:
                         if raw.get("max_call_cost") is not None
                         else None
                     ),
+                    supported_parameters=(
+                        frozenset(str(value) for value in raw["supported_parameters"])
+                        if isinstance(raw.get("supported_parameters"), list)
+                        else None
+                    ),
                 )
             )
         if not profiles:
@@ -96,3 +101,12 @@ class ModelRegistry:
     @property
     def profiles(self) -> tuple[ModelProfile, ...]:
         return tuple(self._profiles.values())
+
+    def add_discovered_profiles(
+        self, profiles: list[ModelProfile], *, free_only: bool = True
+    ) -> None:
+        """Merge discovery results without overriding operator configuration."""
+        for profile in profiles:
+            if free_only and profile.tier != EconomicTier.FREE:
+                continue
+            self._profiles.setdefault(profile.alias, profile)

@@ -531,17 +531,24 @@ class OpenRouterModelProvider:
                 }
             )
 
+        declared_parameters = request.metadata.get("provider_supported_parameters")
+        supported_parameters = (
+            frozenset(filter(None, declared_parameters.split(",")))
+            if declared_parameters is not None
+            else None
+        )
         options: dict[str, Any] = {
             "model": request.model,
             "messages": self._messages(request),
-            "response_format": self._structured_response_format(request),
         }
+        if supported_parameters is None or "response_format" in supported_parameters:
+            options["response_format"] = self._structured_response_format(request)
         if native_tools:
-            options.update(
-                tools=native_tools,
-                tool_choice="auto",
-                parallel_tool_calls=False,
-            )
+            options["tools"] = native_tools
+            if supported_parameters is None or "tool_choice" in supported_parameters:
+                options["tool_choice"] = "auto"
+            if supported_parameters is None or "parallel_tool_calls" in supported_parameters:
+                options["parallel_tool_calls"] = False
 
         try:
             response = await self.client.chat.completions.create(**options)

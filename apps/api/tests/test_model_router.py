@@ -137,6 +137,20 @@ def test_auth_failed_provider_is_excluded() -> None:
     assert raised.value.code == "MODEL_PROVIDER_UNAVAILABLE"
 
 
+def test_protocol_failure_model_is_skipped_for_healthy_fallback() -> None:
+    unreliable = profile("unreliable", provider="openrouter")
+    fallback = profile("fallback", provider="openrouter")
+    selected = ModelRouter([unreliable, fallback]).candidates(
+        context(
+            provider_health={
+                (unreliable.provider, unreliable.model_id): ProviderHealthStatus.PROTOCOL_FAILURE
+            }
+        )
+    )
+
+    assert [item.profile.alias for item in selected] == ["fallback"]
+
+
 async def test_transient_provider_health_recovers_after_bounded_cooldown() -> None:
     target = profile("free", provider="gemini")
     settings = Settings(

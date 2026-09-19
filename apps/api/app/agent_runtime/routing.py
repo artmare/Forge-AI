@@ -25,6 +25,12 @@ class EconomicTier(StrEnum):
 class ProviderHealthStatus(StrEnum):
     HEALTHY = "HEALTHY"
     DEGRADED = "DEGRADED"
+    RATE_LIMITED = "RATE_LIMITED"
+    TEMPORARILY_UNAVAILABLE = "TEMPORARILY_UNAVAILABLE"
+    PROTOCOL_FAILURE = "PROTOCOL_FAILURE"
+    INVALID_TOOL_CALL = "INVALID_TOOL_CALL"
+    STRUCTURED_OUTPUT_FAILURE = "STRUCTURED_OUTPUT_FAILURE"
+    TIMEOUT = "TIMEOUT"
     QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
     AUTH_FAILED = "AUTH_FAILED"
     MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
@@ -40,6 +46,7 @@ class ModelProfile:
     enabled: bool = True
     paid: bool = False
     max_call_cost: float | None = None
+    supported_parameters: frozenset[str] | None = None
 
     def supports(self, required: frozenset[ModelCapability]) -> bool:
         return required.issubset(self.capabilities)
@@ -94,11 +101,7 @@ class ModelRouter:
                 continue
             saw_capability_match = True
             state = health.get((profile.provider, profile.model_id), ProviderHealthStatus.HEALTHY)
-            if state in {
-                ProviderHealthStatus.QUOTA_EXHAUSTED,
-                ProviderHealthStatus.AUTH_FAILED,
-                ProviderHealthStatus.MODEL_UNAVAILABLE,
-            }:
+            if state != ProviderHealthStatus.HEALTHY:
                 continue
             if profile.paid:
                 saw_paid_candidate = True
@@ -177,9 +180,9 @@ def required_capabilities(
 ) -> frozenset[ModelCapability]:
     values = {ModelCapability.TEXT}
     normalized = role.strip().upper()
-    if normalized in {"DEVELOPER", "QA"}:
+    if normalized in {"DEVELOPER", "LEAD_ENGINEER", "LEAD ENGINEER", "QA", "CODE_REVIEWER"}:
         values.add(ModelCapability.CODING)
-    if normalized in {"PLANNER", "CEO", "ARCHITECT"}:
+    if normalized in {"PLANNER", "CEO", "ARCHITECT", "LEAD_ENGINEER", "LEAD ENGINEER"}:
         values.add(ModelCapability.REASONING)
     if has_tools:
         values.add(ModelCapability.TOOL_CALLING)

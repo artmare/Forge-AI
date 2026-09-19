@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     openai_enabled: bool = True
     gemini_enabled: bool = False
     openrouter_enabled: bool = False
+    openrouter_discovery_enabled: bool = True
+    openrouter_catalog_ttl_seconds: int = 3600
+    openrouter_free_only: bool = True
     openai_base_url: str = "https://api.openai.com/v1"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
@@ -44,6 +47,7 @@ class Settings(BaseSettings):
     model_transient_max_attempts: int = 3
     model_retry_base_seconds: float = 0.25
     model_provider_health_cooldown_seconds: int = 300
+    model_fallback_max_candidates: int = 3
     store_model_inputs: bool = False
     agent_run_stale_seconds: int = 300
     tools_enabled: bool = True
@@ -108,6 +112,10 @@ class Settings(BaseSettings):
     planner_provider_max_attempts: int = 3
     planner_retry_base_seconds: float = 0.5
     development_enabled: bool = True
+    forge_dev_mode_enabled: bool = False
+    forge_self_development_enabled: bool = False
+    forge_dev_context_checkpoint_ratio: float = 0.7
+    forge_dev_specialist_limit: int = 2
     development_runner_mode: str = "queue"
     development_runner_queue_root: str = "/runner-queue"
     development_runner_poll_interval_ms: int = 100

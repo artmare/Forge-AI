@@ -151,6 +151,12 @@ class ModelEconomicsService:
                 in {
                     ProviderHealthStatus.QUOTA_EXHAUSTED,
                     ProviderHealthStatus.DEGRADED,
+                    ProviderHealthStatus.RATE_LIMITED,
+                    ProviderHealthStatus.TEMPORARILY_UNAVAILABLE,
+                    ProviderHealthStatus.PROTOCOL_FAILURE,
+                    ProviderHealthStatus.INVALID_TOOL_CALL,
+                    ProviderHealthStatus.STRUCTURED_OUTPUT_FAILURE,
+                    ProviderHealthStatus.TIMEOUT,
                 }
                 and row.last_checked_at <= now - cooldown
             ):
@@ -355,6 +361,13 @@ class ModelEconomicsService:
                 "MODEL_QUOTA_EXHAUSTED": ProviderHealthStatus.QUOTA_EXHAUSTED.value,
                 "MODEL_AUTH_ERROR": ProviderHealthStatus.AUTH_FAILED.value,
                 "MODEL_UNAVAILABLE": ProviderHealthStatus.MODEL_UNAVAILABLE.value,
+                "MODEL_RATE_LIMIT": ProviderHealthStatus.RATE_LIMITED.value,
+                "MODEL_TIMEOUT": ProviderHealthStatus.TIMEOUT.value,
+                "MODEL_PROVIDER_TEMPORARY": ProviderHealthStatus.TEMPORARILY_UNAVAILABLE.value,
+                "PROVIDER_TOOL_PROTOCOL_ERROR": ProviderHealthStatus.PROTOCOL_FAILURE.value,
+                "UNVERIFIED_EXECUTION_CLAIM": ProviderHealthStatus.PROTOCOL_FAILURE.value,
+                "INVALID_MODEL_TOOL_CALL": ProviderHealthStatus.INVALID_TOOL_CALL.value,
+                "INVALID_MODEL_OUTPUT": ProviderHealthStatus.STRUCTURED_OUTPUT_FAILURE.value,
             }.get(error.code, ProviderHealthStatus.DEGRADED.value)
             health.failure_code = error.code
         health.last_checked_at = datetime.now(UTC)

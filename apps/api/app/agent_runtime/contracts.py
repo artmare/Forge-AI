@@ -11,8 +11,29 @@ AgentResultOutput = Annotated[
             "properties": {
                 "artifacts": {"type": "array", "items": {"type": "string"}},
                 "details": {"type": "array", "items": {"type": "string"}},
+                "execution_claims": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": [
+                                    "FILE_MUTATION",
+                                    "COMMAND",
+                                    "TEST",
+                                    "GIT",
+                                    "BROWSER",
+                                ],
+                            },
+                            "reference": {"type": ["string", "null"]},
+                        },
+                        "required": ["kind", "reference"],
+                        "additionalProperties": False,
+                    },
+                },
             },
-            "required": ["artifacts", "details"],
+            "required": ["artifacts", "details", "execution_claims"],
             "additionalProperties": False,
         }
     ),
