@@ -6,13 +6,17 @@ from uuid import UUID
 import pytest
 from sqlalchemy import select
 
+from app.agent_runtime.contracts import ModelUsage
+from app.agent_runtime.efficiency import EfficientRuntimeService
 from app.agent_runtime.providers import MockModelProvider
 from app.agent_runtime.runtime import AgentRuntime
 from app.core.config import Settings
 from app.development.qa import DevelopmentWorkflowService
+from app.domain.enums import TaskStatus
 from app.domain.exceptions import AgentRuntimeDomainError
 from app.domain.models import Event, ProjectKnowledgeIndex, ToolCall
 from app.infrastructure.database import get_session_factory
+from app.services.task_state_machine import TaskStateMachine
 from tests.helpers import create_agent, create_company, create_project, create_task, transition_task
 
 
@@ -46,7 +50,11 @@ async def test_runtime_rollover_retains_truth_and_blocks_mutation_replay(client,
         responses=[write, write if replay else final(artifacts=["result.txt"])]
     )
     settings = Settings(
-        forge_dev_mode_enabled=True, forge_dev_context_limit=1024, tool_workspace_root=str(tmp_path)
+        forge_dev_mode_enabled=True,
+        forge_dev_context_limit=32768,
+        forge_dev_context_checkpoint_ratio=0.05,
+        forge_dev_context_reserve_tokens=0,
+        tool_workspace_root=str(tmp_path),
     )
     async with get_session_factory()() as session:
         runtime = AgentRuntime(session, settings=settings, provider=provider)
@@ -72,6 +80,124 @@ async def test_runtime_rollover_retains_truth_and_blocks_mutation_replay(client,
         assert events[0].details["tool_steps"] == 1
         assert provider.requests[1].tool_exchanges == ()
         assert "Forge context handoff" in provider.requests[1].user_prompt
+
+
+async def test_development_budget_preflight_persists_recoverable_handoff(
+    client, tmp_path, monkeypatch
+):
+    company = await create_company(client)
+    project = await create_project(client, company["id"])
+    agent = await create_agent(
+        client, company["id"], role="LEAD_ENGINEER", permissions={"filesystem.write": True}
+    )
+    response = await client.post(
+        "/api/v1/tasks",
+        json={
+            "company_id": company["id"],
+            "project_id": project["id"],
+            "assigned_agent_id": agent["id"],
+            "type": "IMPLEMENTATION",
+            "kind": "DEVELOPMENT",
+            "title": "Preserve work before budget stop",
+            "acceptance_criteria": ["result.txt exists"],
+            "max_iterations": 2,
+        },
+    )
+    task = response.json()
+    await transition_task(client, task["id"], "QUEUED")
+
+    async def checkpoint(*args, **kwargs):
+        return {"created": True, "checkpoint": "recovery", "diff_summary": "result.txt"}
+
+    monkeypatch.setattr(
+        "app.development.bootstrap.ProjectBootstrapService.checkpoint_recovery", checkpoint
+    )
+    provider = MockModelProvider(
+        responses=[tool("filesystem.write", path="result.txt", content="preserved")],
+        usage=ModelUsage(input_tokens=14_000, output_tokens=10, total_tokens=14_010),
+    )
+    settings = Settings(
+        max_input_tokens_per_task=15_000,
+        forge_dev_context_reserve_tokens=0,
+        tool_workspace_root=str(tmp_path),
+    )
+    async with get_session_factory()() as session:
+        runtime = AgentRuntime(session, settings=settings, provider=provider)
+        with pytest.raises(AgentRuntimeDomainError) as error:
+            await runtime.execute(UUID(task["id"]))
+        assert error.value.code == "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED"
+        handoff = await session.scalar(
+            select(Event).where(
+                Event.task_id == UUID(task["id"]), Event.type == "DEV_BUDGET_HANDOFF"
+            )
+        )
+        calls = list(
+            await session.scalars(select(ToolCall).where(ToolCall.task_id == UUID(task["id"])))
+        )
+        assert provider.call_count == 1
+        assert len(calls) == 1
+        assert handoff is not None
+        assert handoff.details["checkpoint"]["created"] is True
+        assert handoff.details["files_modified"] == ["result.txt"]
+        assert (tmp_path / company["id"] / project["id"] / "result.txt").read_text() == "preserved"
+
+        await TaskStateMachine(session).transition(
+            UUID(task["id"]), TaskStatus.FAILED, "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED"
+        )
+        await EfficientRuntimeService(session, settings).approve_input_budget_resume(
+            UUID(task["id"]), 100_000
+        )
+        resumed = MockModelProvider(
+            responses=[tool("filesystem.write", path="result.txt", content="preserved")]
+        )
+        with pytest.raises(AgentRuntimeDomainError) as replay_error:
+            await AgentRuntime(session, settings=settings, provider=resumed).execute(
+                UUID(task["id"])
+            )
+        assert replay_error.value.code == "DUPLICATE_TOOL_LOOP"
+        calls = list(
+            await session.scalars(select(ToolCall).where(ToolCall.task_id == UUID(task["id"])))
+        )
+        assert len(calls) == 1
+
+
+async def test_large_tool_result_is_durable_but_bounded_in_model_continuation(
+    client, tmp_path
+):
+    company = await create_company(client)
+    project = await create_project(client, company["id"])
+    agent = await create_agent(
+        client, company["id"], role="LEAD_ENGINEER", permissions={"filesystem.read": True}
+    )
+    task = await create_task(client, company["id"], project["id"], agent["id"])
+    await transition_task(client, task["id"], "QUEUED")
+    workspace = tmp_path / company["id"] / project["id"]
+    workspace.mkdir(parents=True)
+    content = "large-evidence\n" * 2000
+    (workspace / "large.txt").write_text(content)
+    provider = MockModelProvider(
+        responses=[
+            tool("filesystem.read", path="large.txt"),
+            final("Inspected the requested source."),
+        ]
+    )
+    async with get_session_factory()() as session:
+        await AgentRuntime(
+            session,
+            settings=Settings(
+                tool_workspace_root=str(tmp_path), forge_dev_context_reserve_tokens=0
+            ),
+            provider=provider,
+        ).execute(UUID(task["id"]))
+        call = await session.scalar(
+            select(ToolCall).where(ToolCall.task_id == UUID(task["id"]))
+        )
+        assert call is not None
+        assert call.result["content"] == content
+        injected = provider.requests[1].tool_exchanges[0].response
+        assert injected["truncated"] is True
+        assert len(injected["result"]["content"]) < len(content)
+        assert injected["result"]["content_sha256"]
 
 
 async def test_isolated_self_development_test_debug_qa_checkpoint_memory(client, tmp_path: Path):

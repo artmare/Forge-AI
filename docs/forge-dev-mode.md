@@ -108,6 +108,35 @@ does not copy the transcript. Agent/task identity, durable observations, tool-st
 duplicate/fallback/budget state, and permissions remain unchanged. Successful mutation fingerprints
 survive the rollover, so an already-executed write/patch/commit cannot be replayed.
 
+Forge distinguishes model context pressure from the cumulative task input-token budget. Before
+each provider call it estimates the actual transport payload, including the system prompt, native
+tool exchanges, schemas, and a configurable next-turn reserve. Approaching the model context
+threshold causes `DEV_CONTEXT_ROLLOVER`; a projected request that approaches the task budget's
+warning threshold also rolls over early so repeated native continuation history does not consume
+the remaining task allowance. A compacted request that still exceeds the model window fails as
+`MODEL_CONTEXT_LIMIT_EXCEEDED`. A compacted request that cannot fit the remaining cumulative task
+budget stops as `TASK_INPUT_TOKEN_BUDGET_EXHAUSTED`. Rollover never resets token accounting.
+Provider-reported input totals remain authoritative and include cached input where the provider
+reports cached tokens as a subset; Forge exposes the cached subset separately and does not subtract
+or double-count it.
+
+Raw tool evidence remains in `ToolCall`, while model-visible test output, file content, diffs,
+browser output, and other large observations use a bounded head/tail representation with the full
+content hash and original size. Repeated unchanged reads are represented by path and hash after the
+newest copy. Project Brain retrieval bounds every collection and summary independently; it is not
+an ever-growing prompt prefix.
+
+Development bootstrap creates or recognizes a Git baseline before the first mutation. This
+includes an empty initial repository through an allow-empty Forge checkpoint. If the real task
+budget is exhausted after mutations, Forge creates a typed recovery checkpoint and
+`DEV_BUDGET_HANDOFF` containing changed files, bounded diff/status, successful tool references,
+failures, usage, remaining budget, mutation fingerprints, and the next action. An explicit human
+can resume through `POST /api/v1/tasks/{task_id}/resume-input-budget` with
+`additional_input_tokens`; consumed usage is retained, the task receives exactly the approved
+addition, and durable mutation fingerprints prevent replay.
+An unrecoverable compacted model-context request uses the same checkpoint path and records
+`DEV_CONTEXT_FAILURE_HANDOFF`, but it does not masquerade as cumulative task-budget exhaustion.
+
 ## Lead Engineer and specialists
 
 The Lead Engineer uses the existing bounded Developer loop: inspect, edit, deterministic validation,
@@ -193,11 +222,13 @@ design is good. Product QA remains separate from browser and Developer evidence.
 - `FORGE_DEV_FREE_ONLY=true`
 - `FORGE_DEV_CONTEXT_CHECKPOINT_RATIO=0.7`
 - `FORGE_DEV_CONTEXT_LIMIT=32768`
+- `FORGE_DEV_CONTEXT_RESERVE_TOKENS=2048`
 - `FORGE_DEV_MAX_ROLLOVERS=4`
 - `FORGE_DEV_SPECIALIST_LIMIT=2`
 - `FORGE_DEV_SPECIALIST_CONTEXT_CHARS=12000`
 - `FORGE_BROWSER_ENABLED=false`
 - `ALLOW_PAID_MODEL_CALLS=false`
+- `OPENROUTER_LIVE_PROBE_CANDIDATES=12`
 
 Budgets count free calls and tokens even when estimated monetary cost is zero.
 
@@ -223,7 +254,9 @@ docker compose --profile test run --build --rm \
   forge-api-test pytest -q -s -rs tests/test_live_openrouter.py
 ```
 
-It discovers free candidates, runs all three probes, and only after one passes creates
+It discovers and deterministically ranks a bounded pool of up to
+`OPENROUTER_LIVE_PROBE_CANDIDATES` current free candidates, runs all three probes, and only after
+one passes creates
 `forge_probe.txt` in a disposable UUID workspace through the real Forge tool loop. Set
 `FORGE_LIVE_OPENROUTER_CODE_CHANGE=true` to enable Stage 4 after Stage 3 succeeds; Stage 4 creates
 a temporary sample Git repository, repairs its deliberately failing test through the isolated
@@ -242,6 +275,13 @@ rejected, inspect `DEV_CONTEXT_ROLLOVER` and task-wide call/tool limits. If self
 completion, inspect current QA, Developer ToolCalls, unexpected changed files, and the worktree
 status before retrying. Browser capture requires the `browser` Compose profile and remains disabled
 unless `FORGE_BROWSER_ENABLED=true`.
+
+For token failures, inspect the task failure's `budget_diagnostics`: selected model/provider,
+configured or observed model context limit, rollover threshold and count, consumed and cached input
+tokens, cumulative budget, remaining tokens, model calls, last rollover, and rollover disposition.
+The legacy `MODEL_INPUT_TOKEN_BUDGET_EXHAUSTED` code is classified as task budget exhaustion for
+existing records; new executions use the explicit task-budget code. Do not fix this condition by
+resetting counters. Approve a bounded resume only after reviewing the recovery checkpoint.
 
 ## Security and cost boundaries
 

@@ -87,7 +87,17 @@ def _safe_text(value: str | None) -> str | None:
 
 
 def _safe_value(value: Any, *, key: str | None = None) -> Any:
-    if key is not None and _SENSITIVE_KEY.search(key):
+    if key is not None and _SENSITIVE_KEY.search(key) and not (
+        isinstance(value, int | float)
+        and key
+        in {
+            "input_tokens_consumed",
+            "cached_input_tokens",
+            "input_token_budget",
+            "last_request_input_tokens",
+            "remaining_input_tokens",
+        }
+    ):
         return "[REDACTED]"
     if key is not None and key.lower() in _CONTENT_KEYS and isinstance(value, str):
         return f"[content omitted: {len(value)} characters]"
@@ -515,6 +525,10 @@ class TaskInspectionService:
                 or "Forge recorded a failure without a classified error message."
             )
             phase = str(durable.get("phase") or failed_job.phase.value)
+            if code == "MODEL_INPUT_TOKEN_BUDGET_EXHAUSTED" or (
+                code.startswith("TASK_") and "BUDGET" in code
+            ):
+                category = "TASK_BUDGET_EXHAUSTION"
             raw_failed_at = durable.get("failed_at")
             if isinstance(raw_failed_at, str):
                 try:
@@ -583,6 +597,17 @@ class TaskInspectionService:
             if code == "DUPLICATE_TOOL_LOOP":
                 category = "AGENT_RUNTIME_GUARD"
                 phase = "EXECUTING"
+            elif (code.startswith("TASK_") and "BUDGET" in code) or code == (
+                "MODEL_INPUT_TOKEN_BUDGET_EXHAUSTED"
+            ):
+                category = "TASK_BUDGET_EXHAUSTION"
+                phase = "EXECUTING"
+            elif code in {
+                "MODEL_CONTEXT_LIMIT_EXCEEDED",
+                "MODEL_CONTEXT_ROLLOVER_LIMIT_EXHAUSTED",
+            }:
+                category = "MODEL_CONTEXT_EXHAUSTION"
+                phase = "EXECUTING"
             elif code.startswith("MODEL_") or code == "INVALID_MODEL_OUTPUT":
                 category = "PROVIDER_OR_MODEL_FAILURE"
                 phase = "EXECUTING"
@@ -626,4 +651,10 @@ class TaskInspectionService:
             agent_role=agent_role,
             recovery_attempts=_safe_value(recovery_attempts),
             evidence_source=evidence_source,
+            budget_diagnostics=(
+                _safe_value(durable.get("budget_diagnostics"))
+                if isinstance(durable, dict)
+                and isinstance(durable.get("budget_diagnostics"), dict)
+                else None
+            ),
         )

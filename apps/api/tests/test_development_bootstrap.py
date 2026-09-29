@@ -81,6 +81,20 @@ class SimulatedControlledRunner:
         if request.action == DevelopmentAction.GIT_CHECKPOINT:
             self.snapshots[request.workspace_relative] = self._snapshot(workspace)
             return self._response(request, DevelopmentExecutionStatus.SUCCEEDED, 0)
+        if request.action == DevelopmentAction.GIT_LOG:
+            if request.workspace_relative in self.snapshots:
+                return self._response(
+                    request, DevelopmentExecutionStatus.SUCCEEDED, 0, stdout="checkpoint"
+                )
+            return self._response(
+                request,
+                DevelopmentExecutionStatus.FAILED,
+                128,
+                code="DEVELOPMENT_COMMAND_FAILED",
+                message="Repository has no commits.",
+            )
+        if request.action == DevelopmentAction.GIT_DIFF:
+            return self._response(request, DevelopmentExecutionStatus.SUCCEEDED, 0)
         if request.action in {
             DevelopmentAction.NODE_TEST,
             DevelopmentAction.NODE_BUILD,

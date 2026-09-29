@@ -1,11 +1,15 @@
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from httpx import AsyncClient
+from sqlalchemy import select
 
 from app.agent_runtime.builders import ContextRecord, InstructionBuilder
 from app.agent_runtime.efficiency import EfficientRuntimeService
 from app.core.config import Settings
 from app.development.product_qa import ProductQAService
+from app.domain.enums import TaskStatus
+from app.domain.models import Event, Task, TaskRuntimeBudget
 from app.infrastructure.database import get_session_factory
 from app.planning.mission_planner import MissionPlanner
 from app.tool_system.contracts import ToolObservation, ToolRequestTurn
@@ -137,3 +141,50 @@ async def test_duplicate_guard_only_counts_consecutive_unchanged_tool_requests(
         assert await service.record_tool_request(task_id, read) == 1
         assert await service.record_tool_request(task_id, read) == 2
         await session.rollback()
+
+
+async def test_human_budget_resume_preserves_usage_and_adds_only_approved_tokens(
+    client: AsyncClient,
+) -> None:
+    company = await create_company(client, slug=f"budget-resume-{uuid4().hex[:8]}")
+    project = await create_project(client, company["id"])
+    agent = await create_agent(client, company["id"], role="DEVELOPER")
+    task = await create_task(client, company["id"], project["id"], agent["id"])
+    task_id = UUID(task["id"])
+    async with get_session_factory()() as session:
+        model = await session.get(Task, task_id)
+        assert model is not None
+        budget = await EfficientRuntimeService(session, Settings()).enforce_budget(model)
+        model.status = TaskStatus.FAILED
+        model.iteration = 1
+        model.max_iterations = 1
+        model.completed_at = datetime.now(UTC)
+        model.terminal_reason = {
+            "code": "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED",
+            "message": "Task input-token budget exhausted.",
+        }
+        budget.consumed_input_tokens = 240_000
+        budget.stopped_reason = "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED"
+        await session.commit()
+
+    response = await client.post(
+        f"/api/v1/tasks/{task_id}/resume-input-budget",
+        json={"additional_input_tokens": 25_000},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "QUEUED"
+    assert response.json()["max_iterations"] == 2
+    async with get_session_factory()() as session:
+        budget = await session.scalar(
+            select(TaskRuntimeBudget).where(TaskRuntimeBudget.task_id == task_id)
+        )
+        event = await session.scalar(
+            select(Event).where(
+                Event.task_id == task_id, Event.type == "DEV_BUDGET_RESUME_APPROVED"
+            )
+        )
+        assert budget is not None
+        assert budget.max_input_tokens == 265_000
+        assert budget.consumed_input_tokens == 240_000
+        assert budget.stopped_reason is None
+        assert event is not None

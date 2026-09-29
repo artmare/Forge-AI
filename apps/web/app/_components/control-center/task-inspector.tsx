@@ -116,6 +116,7 @@ function IterationCard({ iteration, current }: { iteration: InspectionIteration;
 function FailureSummary({ inspection }: { inspection: TaskInspection }) {
   const failure = inspection.failure;
   if (!failure) return null;
+  const budget = (failure as typeof failure & {budget_diagnostics?: Record<string, unknown> | null}).budget_diagnostics;
   return <section className="failure-summary" aria-labelledby="why-task-failed">
     <div><Icon name="alert"/><span><p>Failure analysis</p><h3 id="why-task-failed">Why this failed</h3></span><StatusBadge status={failure.error_code}/></div>
     <strong>{failure.message}</strong>
@@ -129,6 +130,7 @@ function FailureSummary({ inspection }: { inspection: TaskInspection }) {
       <div><dt>Evidence source</dt><dd>{failure.evidence_source.replaceAll("_", " ")}</dd></div>
     </dl>
     {failure.tool_failure && <p><b>Relevant tool failure:</b> {failure.tool_failure.code} — {failure.tool_failure.message}</p>}
+    {budget && <details open><summary>Token and rollover diagnostics</summary><pre>{json(budget)}</pre></details>}
     {failure.recovery_attempts.length > 0 && <details><summary>Recovery attempts ({failure.recovery_attempts.length})</summary><pre>{json(failure.recovery_attempts)}</pre></details>}
   </section>;
 }

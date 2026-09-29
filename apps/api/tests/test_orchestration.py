@@ -6,6 +6,7 @@ from uuid import UUID
 from httpx import AsyncClient
 from sqlalchemy import func, select
 
+from app.agent_runtime.efficiency import EfficientRuntimeService
 from app.agent_runtime.providers import MockModelProvider
 from app.agent_runtime.runtime import AgentRuntime
 from app.core.config import Settings
@@ -409,6 +410,51 @@ async def test_worker_classifies_model_capability_failure(
         assert failed is not None
         assert failed.failure_evidence["code"] == "MODEL_CAPABILITY_UNAVAILABLE"
         assert failed.failure_evidence["category"] == "PROVIDER_CAPABILITY_MISMATCH"
+
+
+async def test_worker_classifies_task_input_budget_and_records_rollover_diagnostics(
+    client: AsyncClient,
+) -> None:
+    domain = await queued_domain(client, suffix="input-budget-diagnostics")
+    await enable_and_reconcile()
+    worker = await register_worker("worker-input-budget-diagnostics")
+    job = await claim(worker.id, worker.worker_key)
+    assert job is not None
+    async with get_session_factory()() as session:
+        task = await session.get(Task, UUID(domain["task"]["id"]))
+        assert task is not None
+        budget = await EfficientRuntimeService(session, Settings()).enforce_budget(task)
+        budget.consumed_input_tokens = 252_613
+        budget.consumed_cached_tokens = 154_141
+        budget.consumed_model_calls = 13
+        await session.commit()
+    async with get_session_factory()() as session:
+        assert await WorkerExecutionService(session).start(job.id, worker.worker_key)
+    async with get_session_factory()() as session:
+        assert await WorkerExecutionService(session).fail(
+            job.id,
+            worker.worker_key,
+            "MODEL_INPUT_TOKEN_BUDGET_EXHAUSTED",
+            "Task stopped for human intervention: MODEL_INPUT_TOKEN_BUDGET_EXHAUSTED",
+        )
+    async with get_session_factory()() as session:
+        failed = await session.get(ExecutionJob, job.id)
+        assert failed is not None
+        assert failed.failure_evidence["category"] == "TASK_BUDGET_EXHAUSTION"
+        diagnostics = failed.failure_evidence["budget_diagnostics"]
+        assert diagnostics["input_tokens_consumed"] == 252_613
+        assert diagnostics["cached_input_tokens"] == 154_141
+        assert diagnostics["remaining_input_tokens"] == 0
+        assert diagnostics["rollover_count"] == 0
+        assert diagnostics["rollover_disposition"] == "NO_ROLLOVER_RECORDED_BEFORE_STOP"
+    inspection = await client.get(
+        f"/api/v1/tasks/{domain['task']['id']}/inspection"
+    )
+    assert inspection.status_code == 200
+    failure = inspection.json()["failure"]
+    assert failure["category"] == "TASK_BUDGET_EXHAUSTION"
+    assert failure["budget_diagnostics"]["input_tokens_consumed"] == 252_613
+    assert failure["budget_diagnostics"]["last_request_input_tokens"] == 0
 
 
 async def test_recovery_preserves_manual_run_with_active_agent_turn(client: AsyncClient) -> None:

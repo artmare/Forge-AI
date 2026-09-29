@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     openrouter_free_only: bool = True
     openrouter_probe_ttl_seconds: int = Field(default=3600, ge=1)
     openrouter_probe_timeout_seconds: float = Field(default=30, gt=0, le=120)
+    openrouter_live_probe_candidates: int = Field(default=12, ge=1, le=25)
     openai_base_url: str = "https://api.openai.com/v1"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
@@ -119,6 +120,7 @@ class Settings(BaseSettings):
     forge_self_development_enabled: bool = False
     forge_dev_context_checkpoint_ratio: float = Field(default=0.7, gt=0, lt=1)
     forge_dev_context_limit: int = Field(default=32768, ge=1024)
+    forge_dev_context_reserve_tokens: int = Field(default=2048, ge=0, le=32768)
     forge_dev_max_rollovers: int = Field(default=4, ge=0, le=20)
     forge_dev_repository_path: str | None = None
     forge_dev_allowed_repository: str | None = None

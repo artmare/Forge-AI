@@ -1,8 +1,10 @@
+import json
 from uuid import UUID
 
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from app.agent_runtime.builders import ContextBuilder
 from app.domain.models import ProjectKnowledgeIndex
 from app.infrastructure.database import get_session_factory
 from app.services.project_knowledge import ProjectKnowledgeService
@@ -45,3 +47,12 @@ async def test_project_brain_persists_checkpoint_and_lesson(client: AsyncClient)
     assert brain is not None
     assert brain.checkpoints[0]["next_action"] == "Run integration suite"
     assert brain.lessons[0]["lesson"] == "Model prose is not execution evidence"
+
+
+def test_project_brain_prompt_projection_is_deterministically_bounded() -> None:
+    entries = [{"decision": "x" * 500, "index": index} for index in range(100)]
+    bounded = ContextBuilder._bounded_memory(entries, 1200)
+    serialized = json.dumps(bounded, sort_keys=True)
+    assert bounded["truncated"] is True
+    assert "bounded_preview" in bounded
+    assert len(serialized) < 1400

@@ -25,17 +25,28 @@ class ContextRollover:
     handoff: dict[str, Any] = field(default_factory=dict)
     executed_mutations: set[str] = field(default_factory=set)
 
-    def needed(self, request: ModelRequest, limit: int) -> bool:
-        # Conservative byte bound includes native exchange state and tool schemas.
-        size = len((request.system_prompt + request.user_prompt).encode())
-        size += len((request.conversation_start_prompt or "").encode())
+    @staticmethod
+    def estimated_input_tokens(request: ModelRequest, *, reserve_tokens: int = 0) -> int:
+        """Conservative provider-neutral estimate including native continuation state."""
+        prompt = (
+            request.conversation_start_prompt or request.user_prompt
+            if request.tool_exchanges
+            else request.user_prompt
+        )
+        size = len((request.system_prompt + prompt).encode())
         for exchange in request.tool_exchanges:
             size += len(json.dumps(exchange.response).encode())
             size += len(json.dumps(exchange.call.arguments).encode())
         size += sum(
             len(json.dumps(t.input_model.model_json_schema()).encode()) for t in request.tools
         )
-        return size >= limit * self.ratio
+        # UTF-8 bytes / 3 is intentionally conservative for code and JSON.
+        return (size + 2) // 3 + max(reserve_tokens, 0)
+
+    def needed(self, request: ModelRequest, limit: int, *, reserve_tokens: int = 0) -> bool:
+        return self.estimated_input_tokens(
+            request, reserve_tokens=reserve_tokens
+        ) >= limit * self.ratio
 
     def checkpoint(
         self,

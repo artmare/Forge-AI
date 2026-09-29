@@ -1,3 +1,4 @@
+import hashlib
 import json
 from typing import Any, Literal
 from uuid import UUID
@@ -59,6 +60,13 @@ class ContextBuilder:
         self.agents = AgentRepository(session)
         self.reviews = TaskReviewRepository(session)
         self.tool_calls = ToolCallRepository(session)
+
+    @staticmethod
+    def _bounded_memory(value: Any, limit: int) -> Any:
+        serialized = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        if len(serialized) <= limit:
+            return value
+        return {"truncated": True, "bounded_preview": serialized[:limit]}
 
     async def build(self, task_id: UUID) -> ContextRecord:
         task = await self.tasks.get(task_id)
@@ -203,16 +211,16 @@ class ContextBuilder:
             ),
             project_knowledge=(
                 {
-                    "project_summary": knowledge.project_summary,
-                    "architecture_summary": knowledge.architecture_summary,
-                    "state": knowledge.state,
-                    "modules": knowledge.modules,
-                    "contracts": knowledge.contracts,
-                    "decisions": knowledge.decisions,
-                    "constraints": knowledge.constraints,
-                    "recent_changes": knowledge.recent_changes[-10:],
-                    "lessons": knowledge.lessons[-20:],
-                    "checkpoints": knowledge.checkpoints[-3:],
+                    "project_summary": knowledge.project_summary[:2000],
+                    "architecture_summary": knowledge.architecture_summary[:3000],
+                    "state": self._bounded_memory(knowledge.state, 2000),
+                    "modules": self._bounded_memory(knowledge.modules[-20:], 1500),
+                    "contracts": self._bounded_memory(knowledge.contracts[-20:], 1500),
+                    "decisions": self._bounded_memory(knowledge.decisions[-20:], 2000),
+                    "constraints": self._bounded_memory(knowledge.constraints[-20:], 1500),
+                    "recent_changes": self._bounded_memory(knowledge.recent_changes[-10:], 2000),
+                    "lessons": self._bounded_memory(knowledge.lessons[-10:], 2000),
+                    "checkpoints": self._bounded_memory(knowledge.checkpoints[-2:], 2500),
                 }
                 if knowledge is not None
                 else None
@@ -230,6 +238,7 @@ class ContextBuilder:
 
 
 class InstructionBuilder:
+    OBSERVATION_CONTENT_LIMIT = 10_000
     BASE = (
         "You are a controlled Forge execution agent. Work only from the supplied context. "
         "You cannot directly access databases, state machines, Redis, shell, files, browsers, "
@@ -418,7 +427,7 @@ class InstructionBuilder:
                     separators=(",", ":"),
                 )
             user_prompt += "\n\nStructured tool observations (recent):\n" + json.dumps(
-                [observation.model_dump(mode="json") for observation in recent],
+                self._prompt_observations(recent),
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -427,3 +436,69 @@ class InstructionBuilder:
             user_prompt=user_prompt,
             runtime_role=role,
         )
+
+    @classmethod
+    def _prompt_observations(
+        cls, observations: list[ToolObservation]
+    ) -> list[dict[str, Any]]:
+        """Keep the newest unchanged file read and replace earlier copies with references."""
+        seen_reads: set[tuple[str, str]] = set()
+        values: list[dict[str, Any]] = []
+        for observation in reversed(observations):
+            result = observation.result or {}
+            path = result.get("path")
+            content = result.get("content")
+            if (
+                observation.tool == "filesystem.read"
+                and isinstance(path, str)
+                and isinstance(content, str)
+            ):
+                digest = hashlib.sha256(content.encode()).hexdigest()
+                identity = (path, digest)
+                if identity in seen_reads:
+                    values.append(
+                        {
+                            "tool_call_id": str(observation.tool_call_id),
+                            "tool": observation.tool,
+                            "status": observation.status,
+                            "result": {
+                                "path": path,
+                                "unchanged_duplicate": True,
+                                "content_sha256": digest,
+                                "content_original_chars": len(content),
+                            },
+                        }
+                    )
+                    continue
+                seen_reads.add(identity)
+            values.append(cls.prompt_observation(observation))
+        return list(reversed(values))
+
+    @classmethod
+    def prompt_observation(cls, observation: ToolObservation) -> dict[str, Any]:
+        """Bound model context while the durable ToolCall retains complete raw evidence."""
+        value = observation.model_dump(mode="json")
+        result = value.get("result")
+        if not isinstance(result, dict):
+            return value
+        bounded = dict(result)
+        content = bounded.get("content")
+        if isinstance(content, str) and len(content) > cls.OBSERVATION_CONTENT_LIMIT:
+            head = cls.OBSERVATION_CONTENT_LIMIT - 2000
+            bounded["content"] = (
+                content[:head]
+                + "\n[Forge model-context preview omitted middle; raw evidence is durable]\n"
+                + content[-2000:]
+            )
+            bounded["content_sha256"] = hashlib.sha256(content.encode()).hexdigest()
+            bounded["content_original_chars"] = len(content)
+            value["truncated"] = True
+            value["original_chars"] = max(value.get("original_chars") or 0, len(content))
+        for key in ("stdout_excerpt", "stderr_excerpt", "preview"):
+            text = bounded.get(key)
+            if isinstance(text, str) and len(text) > cls.OBSERVATION_CONTENT_LIMIT:
+                bounded[key] = text[: cls.OBSERVATION_CONTENT_LIMIT] + "\n[context bounded]"
+                value["truncated"] = True
+                value["original_chars"] = max(value.get("original_chars") or 0, len(text))
+        value["result"] = bounded
+        return value

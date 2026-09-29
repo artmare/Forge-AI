@@ -196,7 +196,13 @@ async def _task_efficiency(session: AsyncSession, task_id: UUID) -> RuntimeEffic
 @router.get("/tasks/{task_id}/dev-mode")
 async def dev_mode_status(task_id: UUID, session: Session) -> dict:
     """Existing task inspection boundary; contains only Forge-owned durable event data."""
-    from app.domain.models import Event, ModelCallRecord, ToolCall
+    from app.domain.models import (
+        Event,
+        ModelCallRecord,
+        TaskRuntimeBudget,
+        TaskRuntimeMetric,
+        ToolCall,
+    )
 
     task = await session.get(Task, task_id)
     if task is None:
@@ -225,6 +231,13 @@ async def dev_mode_status(task_id: UUID, session: Session) -> dict:
             .limit(100)
         )
     )
+    budget = await session.scalar(
+        select(TaskRuntimeBudget).where(TaskRuntimeBudget.task_id == task_id)
+    )
+    metric = await session.scalar(
+        select(TaskRuntimeMetric).where(TaskRuntimeMetric.task_id == task_id)
+    )
+    latest_rollover = next((e for e in events if e.type == "DEV_CONTEXT_ROLLOVER"), None)
     return {
         "task_id": str(task_id),
         "status": task.status.value,
@@ -238,6 +251,21 @@ async def dev_mode_status(task_id: UUID, session: Session) -> dict:
         "rollover_count": sum(e.type == "DEV_CONTEXT_ROLLOVER" for e in events),
         "specialist_calls": sum(e.type == "DEV_SPECIALIST_RESERVED" for e in events),
         "human_promotion_required": True,
+        "context_budget": (
+            {
+                "input_tokens_consumed": budget.consumed_input_tokens,
+                "cached_input_tokens": budget.consumed_cached_tokens,
+                "input_token_budget": budget.max_input_tokens,
+                "remaining_input_tokens": max(
+                    budget.max_input_tokens - budget.consumed_input_tokens, 0
+                ),
+                "model_calls": budget.consumed_model_calls,
+                "context_bytes_sent": metric.context_bytes_sent if metric else 0,
+                "last_rollover": latest_rollover.details if latest_rollover else None,
+            }
+            if budget
+            else None
+        ),
     }
 
 

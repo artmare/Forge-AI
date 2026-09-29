@@ -52,11 +52,18 @@ async def test_live_probe_and_isolated_forge_write(client, tmp_path: Path):
         )
         and entry.model_id != "openrouter/free"
     ]
-    candidates.sort(key=lambda e: (-(e.context_length or 0), e.model_id))
+    candidates.sort(
+        key=lambda e: (
+            0 if e.model_id.endswith(":free") else 1,
+            -len(e.supported_parameters),
+            -(e.context_length or 0),
+            e.model_id,
+        )
+    )
     prober = CapabilityProber(timeout_seconds=45)
     selected = None
     reports = []
-    for entry in candidates[:3]:
+    for entry in candidates[: settings.openrouter_live_probe_candidates]:
         provider = provider_for_profile(settings, entry.profile())
         successes = []
         for capability in ProbeCapability:

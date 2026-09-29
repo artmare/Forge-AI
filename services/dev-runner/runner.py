@@ -241,7 +241,13 @@ def command_for(request: dict[str, Any], workspace: Path) -> list[list[str]]:
                 ":(exclude)node_modules",
                 ":(exclude).forge-venv",
             ],
-            ["git", "commit", "-m", f"forge(task:{task_id}): development checkpoint"],
+            [
+                "git",
+                "commit",
+                "--allow-empty",
+                "-m",
+                f"forge(task:{task_id}): development checkpoint",
+            ],
         ]
     raise ValueError("unknown development action")
 

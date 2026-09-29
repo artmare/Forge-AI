@@ -4,7 +4,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_runtime.efficiency import EfficientRuntimeService
 from app.agent_runtime.runtime import AgentRuntime
+from app.core.config import get_settings
 from app.development.bootstrap import ProjectBootstrapService
 from app.development.qa import DevelopmentWorkflowService
 from app.domain.enums import TaskKind, TaskStatus
@@ -13,7 +15,13 @@ from app.infrastructure.database import get_session
 from app.orchestration.manual_execution import ManualExecutionGuard
 from app.schemas.agent_run import AgentRunResponse, ExecuteTaskRequest
 from app.schemas.dependency import TaskDependencyResponse
-from app.schemas.task import TaskCreate, TaskResponse, TaskTransitionRequest, TaskUpdate
+from app.schemas.task import (
+    TaskBudgetResumeRequest,
+    TaskCreate,
+    TaskResponse,
+    TaskTransitionRequest,
+    TaskUpdate,
+)
 from app.schemas.task_inspection import TaskInspectionResponse
 from app.schemas.task_review import TaskFixRequest, TaskReviewResponse
 from app.schemas.task_run import TaskRunResponse
@@ -74,6 +82,16 @@ async def transition_task(
 ) -> TaskResponse:
     task = await TaskStateMachine(session).transition(
         task_id, payload.target_status, payload.reason
+    )
+    return TaskResponse.model_validate(task)
+
+
+@router.post("/{task_id}/resume-input-budget", response_model=TaskResponse)
+async def resume_input_budget(
+    task_id: UUID, payload: TaskBudgetResumeRequest, session: Session
+) -> TaskResponse:
+    task = await EfficientRuntimeService(session, get_settings()).approve_input_budget_resume(
+        task_id, payload.additional_input_tokens
     )
     return TaskResponse.model_validate(task)
 

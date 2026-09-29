@@ -180,6 +180,7 @@ class TaskFailureSummary(BaseModel):
     agent_role: str | None = None
     recovery_attempts: list[Any] = []
     evidence_source: str
+    budget_diagnostics: dict[str, Any] | None = None
 
 
 class TaskInspectionResponse(BaseModel):

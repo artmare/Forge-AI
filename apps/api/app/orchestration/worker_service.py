@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import case, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,10 +19,14 @@ from app.domain.models import (
     Agent,
     AgentRun,
     DevelopmentExecution,
+    Event,
     ExecutionJob,
     ProjectDevelopmentLease,
+    ProjectDevelopmentProfile,
     Task,
     TaskRun,
+    TaskRuntimeBudget,
+    TaskRuntimeMetric,
     ToolCall,
     WorkerNode,
 )
@@ -698,6 +702,15 @@ class WorkerExecutionService:
             category = "INFRASTRUCTURE_FAILURE"
         elif upper == "MODEL_CAPABILITY_UNAVAILABLE":
             category = "PROVIDER_CAPABILITY_MISMATCH"
+        elif (upper.startswith("TASK_") and "BUDGET" in upper) or upper == (
+            "MODEL_INPUT_TOKEN_BUDGET_EXHAUSTED"
+        ):
+            category = "TASK_BUDGET_EXHAUSTION"
+        elif upper in {
+            "MODEL_CONTEXT_LIMIT_EXCEEDED",
+            "MODEL_CONTEXT_ROLLOVER_LIMIT_EXHAUSTED",
+        }:
+            category = "MODEL_CONTEXT_EXHAUSTION"
         elif upper in {
             "PROVIDER_REQUEST_INVALID",
             "PROVIDER_RESPONSE_INVALID",
@@ -755,6 +768,89 @@ class WorkerExecutionService:
             .order_by(AgentRun.created_at.desc())
             .limit(1)
         )
+        latest_model_run = await self.session.scalar(
+            select(AgentRun)
+            .where(AgentRun.task_id == job.task_id)
+            .order_by(AgentRun.created_at.desc())
+            .limit(1)
+        )
+        budget = await self.session.scalar(
+            select(TaskRuntimeBudget).where(TaskRuntimeBudget.task_id == job.task_id)
+        )
+        metric = await self.session.scalar(
+            select(TaskRuntimeMetric).where(TaskRuntimeMetric.task_id == job.task_id)
+        )
+        profile = (
+            await self.session.scalar(
+                select(ProjectDevelopmentProfile).where(
+                    ProjectDevelopmentProfile.project_id == task.project_id
+                )
+            )
+            if task is not None and task.project_id is not None
+            else None
+        )
+        rollover = await self.session.scalar(
+            select(Event)
+            .where(Event.task_id == job.task_id, Event.type == "DEV_CONTEXT_ROLLOVER")
+            .order_by(Event.created_at.desc())
+            .limit(1)
+        )
+        working_tree = dict(job.working_tree_state)
+        if profile is not None:
+            prior_count = working_tree.get("changed_files_count", 0)
+            working_tree["changed_files_count"] = max(
+                prior_count if isinstance(prior_count, int) else 0,
+                profile.changed_files_count,
+            )
+            working_tree["initial_checkpoint_created"] = profile.initial_checkpoint_created
+        job.working_tree_state = working_tree
+        diagnostics = (
+            {
+                "input_tokens_consumed": budget.consumed_input_tokens,
+                "cached_input_tokens": budget.consumed_cached_tokens,
+                "input_token_budget": budget.max_input_tokens,
+                "remaining_input_tokens": max(
+                    budget.max_input_tokens - budget.consumed_input_tokens, 0
+                ),
+                "model_calls": budget.consumed_model_calls,
+                "selected_model": latest_model_run.model_id if latest_model_run else None,
+                "selected_provider": latest_model_run.provider if latest_model_run else None,
+                "last_request_input_tokens": (
+                    latest_model_run.input_tokens if latest_model_run else 0
+                ),
+                "model_context_limit": (
+                    rollover.details.get("model_context_limit")
+                    if rollover is not None
+                    else self.settings.forge_dev_context_limit
+                ),
+                "rollover_threshold": (
+                    rollover.details.get("rollover_threshold")
+                    if rollover is not None
+                    else int(
+                        self.settings.forge_dev_context_limit
+                        * self.settings.forge_dev_context_checkpoint_ratio
+                    )
+                ),
+                "context_bytes_sent": metric.context_bytes_sent if metric else 0,
+                "rollover_count": int(
+                    await self.session.scalar(
+                        select(func.count()).select_from(Event).where(
+                            Event.task_id == job.task_id,
+                            Event.type == "DEV_CONTEXT_ROLLOVER",
+                        )
+                    )
+                    or 0
+                ),
+                "last_rollover": rollover.details if rollover is not None else None,
+                "rollover_disposition": (
+                    "ROLLOVER_RECORDED"
+                    if rollover is not None
+                    else "NO_ROLLOVER_RECORDED_BEFORE_STOP"
+                ),
+            }
+            if budget is not None
+            else None
+        )
         return {
             "category": category,
             "code": normalized_code,
@@ -801,5 +897,6 @@ class WorkerExecutionService:
             ),
             "environment": job.environment_state,
             "checkpoint": job.checkpoint_state,
-            "working_tree": job.working_tree_state,
+            "working_tree": working_tree,
+            "budget_diagnostics": diagnostics,
         }

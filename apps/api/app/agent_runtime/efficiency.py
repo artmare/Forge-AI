@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.domain.enums import TaskStatus
+from app.domain.exceptions import AgentRuntimeDomainError
 from app.domain.models import (
     AgentRun,
     FileContextCache,
@@ -20,6 +21,7 @@ from app.domain.models import (
     TaskRuntimeBudget,
     TaskRuntimeMetric,
 )
+from app.services.event_factory import EventFactory
 from app.tool_system.contracts import ToolObservation, ToolRequestTurn
 
 
@@ -34,8 +36,12 @@ class BudgetSnapshot:
 
 
 class ModelBudgetExceeded(RuntimeError):
-    def __init__(self, reason: str) -> None:
+    def __init__(
+        self, reason: str, budget: TaskRuntimeBudget, snapshot: BudgetSnapshot
+    ) -> None:
         self.reason = reason
+        self.budget = budget
+        self.snapshot = snapshot
         super().__init__(reason)
 
 
@@ -59,11 +65,64 @@ class EfficientRuntimeService:
         if reason:
             budget.stopped_reason = reason
             await self.session.flush()
-            raise ModelBudgetExceeded(reason)
+            raise ModelBudgetExceeded(reason, budget, snapshot)
         budget.warning_active = self._near_limit(budget, snapshot)
         budget.stopped_reason = None
         await self.session.flush()
         return budget
+
+    async def approve_input_budget_resume(
+        self, task_id: UUID, additional_input_tokens: int
+    ) -> Task:
+        """Explicit human recovery; preserves consumption and durable task evidence."""
+        task = await self.session.scalar(
+            select(Task).where(Task.id == task_id).with_for_update()
+        )
+        budget = await self.session.scalar(
+            select(TaskRuntimeBudget)
+            .where(TaskRuntimeBudget.task_id == task_id)
+            .with_for_update()
+        )
+        if (
+            task is None
+            or budget is None
+            or task.status != TaskStatus.FAILED
+            or budget.stopped_reason
+            not in {
+                "MODEL_INPUT_TOKEN_BUDGET_EXHAUSTED",
+                "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED",
+            }
+        ):
+            raise AgentRuntimeDomainError(
+                "TASK_BUDGET_RESUME_NOT_ALLOWED",
+                "Task is not eligible for input-token budget resume",
+                409,
+            )
+        previous = budget.max_input_tokens
+        budget.max_input_tokens += additional_input_tokens
+        budget.stopped_reason = None
+        budget.warning_active = False
+        task.status = TaskStatus.QUEUED
+        task.completed_at = None
+        task.terminal_reason = None
+        task.max_iterations = max(task.max_iterations, task.iteration + 1)
+        await EventFactory(self.session).create(
+            company_id=task.company_id,
+            project_id=task.project_id,
+            agent_id=task.assigned_agent_id,
+            task_id=task.id,
+            correlation_id=task.id,
+            event_type="DEV_BUDGET_RESUME_APPROVED",
+            message="Human approved bounded continuation from the recovery handoff.",
+            payload={
+                "previous_input_token_budget": previous,
+                "additional_input_tokens": additional_input_tokens,
+                "new_input_token_budget": budget.max_input_tokens,
+                "consumed_input_tokens": budget.consumed_input_tokens,
+            },
+        )
+        await self.session.commit()
+        return task
 
     async def snapshot(self, task_id: UUID, iteration: int) -> BudgetSnapshot:
         totals = (
@@ -286,7 +345,7 @@ class EfficientRuntimeService:
         if snapshot.iteration_calls >= budget.max_calls_per_iteration:
             return "MODEL_ITERATION_CALL_BUDGET_EXHAUSTED"
         if snapshot.input_tokens >= budget.max_input_tokens:
-            return "MODEL_INPUT_TOKEN_BUDGET_EXHAUSTED"
+            return "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED"
         if snapshot.output_tokens >= budget.max_output_tokens:
             return "MODEL_OUTPUT_TOKEN_BUDGET_EXHAUSTED"
         if (

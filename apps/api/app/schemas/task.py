@@ -60,6 +60,12 @@ class TaskTransitionRequest(ORMResponse):
     reason: str | None = Field(default=None, min_length=1, max_length=1000)
 
 
+class TaskBudgetResumeRequest(ORMResponse):
+    model_config = ConfigDict(extra="forbid")
+
+    additional_input_tokens: int = Field(ge=1024, le=1_000_000)
+
+
 class TaskResponse(ORMResponse):
     id: UUID
     company_id: UUID

@@ -183,7 +183,11 @@ class ProjectBootstrapService:
             )
         changed = self._changed_files(status.stdout_excerpt)
         profile.changed_files_count = changed
-        if changed == 0 or profile.initial_checkpoint_created:
+        if profile.initial_checkpoint_created:
+            return
+        history = await self._run(task, DevelopmentAction.GIT_LOG)
+        if changed == 0 and history.status == DevelopmentExecutionStatus.SUCCEEDED:
+            profile.initial_checkpoint_created = True
             return
         checkpoint = await self._run(task, DevelopmentAction.GIT_CHECKPOINT)
         if checkpoint.status != DevelopmentExecutionStatus.SUCCEEDED:
@@ -206,6 +210,56 @@ class ProjectBootstrapService:
             "DEVELOPMENT_INITIAL_CHECKPOINT_CREATED",
             "Initial local development checkpoint created.",
         )
+
+    async def checkpoint_recovery(self, task_id: UUID, reason: str) -> dict[str, object]:
+        """Forge-owned checkpoint used before a bounded runtime stop."""
+        task = await self.session.get(Task, task_id)
+        if task is None or task.project_id is None:
+            return {"created": False, "reason": "workspace unavailable"}
+        if SelfDevelopmentWorkflow.requested(task):
+            workflow = SelfDevelopmentWorkflow(self.session, self.settings)
+            workspace = await workflow.prepare(task)
+            before = await workflow.manager(task).inspect(workspace)
+            checkpoint = await workflow.manager(task).checkpoint(workspace)
+            result: dict[str, object] = {
+                "created": True,
+                "checkpoint": checkpoint,
+                "changed_files": self._changed_files(before["status"]),
+                "diff_summary": before["diff_summary"][:4000],
+            }
+        else:
+            status = await self._run(task, DevelopmentAction.GIT_STATUS)
+            changed = self._changed_files(status.stdout_excerpt)
+            diff = await self._run(task, DevelopmentAction.GIT_DIFF)
+            checkpoint = None
+            if changed:
+                created = await self._run(task, DevelopmentAction.GIT_CHECKPOINT)
+                if created.status != DevelopmentExecutionStatus.SUCCEEDED:
+                    return {"created": False, "reason": created.error_code or "checkpoint failed"}
+                checkpoint = created.stdout_excerpt[:1000]
+            result = {
+                "created": bool(changed),
+                "checkpoint": checkpoint,
+                "changed_files": changed,
+                "status_summary": status.stdout_excerpt[:4000],
+                "diff_summary": (
+                    diff.stdout_excerpt[:4000]
+                    if diff.status == DevelopmentExecutionStatus.SUCCEEDED
+                    else ""
+                ),
+            }
+        await self.events.create(
+            company_id=task.company_id,
+            project_id=task.project_id,
+            agent_id=task.assigned_agent_id,
+            task_id=task.id,
+            correlation_id=task.id,
+            event_type="DEV_RECOVERY_CHECKPOINT",
+            message="Development work checkpointed before a bounded runtime stop.",
+            payload={**result, "stop_reason": reason},
+        )
+        await self.session.commit()
+        return result
 
     async def _run(self, task: Task, action: DevelopmentAction) -> RunnerResponse:
         definition = self.registry.get(action)

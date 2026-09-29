@@ -11,6 +11,7 @@ from typing import Any
 from uuid import UUID
 
 from pydantic import ValidationError
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.builders import ContextBuilder, ContextRecord, InstructionBuilder
@@ -51,11 +52,12 @@ from app.agent_runtime.routing import (
 from app.core.config import Settings, get_settings
 from app.domain.enums import (
     AgentRunStatus,
+    TaskKind,
     TaskRunStatus,
     TaskStatus,
 )
 from app.domain.exceptions import AgentRuntimeDomainError, TaskRunStateConflictError
-from app.domain.models import AgentRun
+from app.domain.models import AgentRun, Event, TaskRuntimeMetric, ToolCall
 from app.repositories.agent import AgentRepository
 from app.repositories.agent_run import AgentRunRepository
 from app.repositories.task import TaskRepository
@@ -101,6 +103,9 @@ NORMALIZED_PROVIDER_CODES = frozenset(
         "AGENT_EXECUTION_CANCELLED",
         "AGENT_RUNTIME_ERROR",
         "MODEL_BUDGET_EXHAUSTED",
+        "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED",
+        "MODEL_CONTEXT_LIMIT_EXCEEDED",
+        "MODEL_CONTEXT_ROLLOVER_LIMIT_EXHAUSTED",
         "DUPLICATE_TOOL_LOOP",
         "PROVIDER_REQUEST_INVALID",
         "PROVIDER_RESPONSE_INVALID",
@@ -168,6 +173,9 @@ class AgentRuntime:
         rollover = ContextRollover(
             self.settings.forge_dev_context_checkpoint_ratio, self.settings.forge_dev_max_rollovers
         )
+        tool_steps, duplicate_signals = await self._restore_durable_context(
+            task_id, observations, rollover
+        )
 
         while True:
             await self._assert_execution_allowed()
@@ -177,9 +185,24 @@ class AgentRuntime:
             try:
                 budget = await self.efficiency.enforce_budget(current_task)
             except ModelBudgetExceeded as exc:
-                await self.session.commit()
+                if observations and exc.reason == "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED":
+                    await self._persist_recovery_handoff(
+                        current_task,
+                        context,
+                        observations,
+                        rollover,
+                        exc.budget,
+                        estimated_input=0,
+                        model=model_alias,
+                        context_limit=self.settings.forge_dev_context_limit,
+                        tool_steps=tool_steps,
+                        duplicate_signals=duplicate_signals,
+                        stop_reason=exc.reason,
+                    )
+                else:
+                    await self.session.commit()
                 raise AgentRuntimeDomainError(
-                    "MODEL_BUDGET_EXHAUSTED",
+                    exc.reason,
                     f"Task stopped for human intervention: {exc.reason}",
                     409,
                 ) from None
@@ -226,13 +249,32 @@ class AgentRuntime:
                 raise self._public_error(self._normalize_error(error)) from None
             selected = selections[0]
             request = replace(request, model=selected.profile.model_id)
-            if (
-                self.settings.forge_dev_mode_enabled
-                and tool_exchanges
-                and rollover.needed(
-                    request,
-                    selected.profile.context_length or self.settings.forge_dev_context_limit,
-                )
+            context_limit = (
+                selected.profile.context_length or self.settings.forge_dev_context_limit
+            )
+            estimated_input = rollover.estimated_input_tokens(
+                request, reserve_tokens=self.settings.forge_dev_context_reserve_tokens
+            )
+            remaining_input = max(
+                budget.max_input_tokens - budget.consumed_input_tokens, 0
+            )
+            context_pressure = rollover.needed(
+                request,
+                context_limit,
+                reserve_tokens=self.settings.forge_dev_context_reserve_tokens,
+            )
+            budget_pressure = estimated_input >= remaining_input
+            budget_soft_pressure = (
+                budget.consumed_input_tokens + estimated_input
+                >= budget.max_input_tokens * self.settings.model_budget_warning_ratio
+            )
+            development_role = str(context.agent.get("role", "")).upper() in {
+                "DEVELOPER",
+                "LEAD_ENGINEER",
+                "LEAD ENGINEER",
+            }
+            if tool_exchanges and (development_role or self.settings.forge_dev_mode_enabled) and (
+                context_pressure or budget_pressure or budget_soft_pressure
             ):
                 try:
                     handoff = rollover.checkpoint(
@@ -243,8 +285,23 @@ class AgentRuntime:
                         duplicate_signals=duplicate_signals,
                     )
                 except ValueError:
+                    await self._persist_recovery_handoff(
+                        current_task,
+                        context,
+                        observations,
+                        rollover,
+                        budget,
+                        estimated_input=estimated_input,
+                        model=selected.profile.model_id,
+                        context_limit=context_limit,
+                        tool_steps=tool_steps,
+                        duplicate_signals=duplicate_signals,
+                        stop_reason="MODEL_CONTEXT_ROLLOVER_LIMIT_EXHAUSTED",
+                    )
                     raise AgentRuntimeDomainError(
-                        "MODEL_BUDGET_EXHAUSTED", "Context rollover bound reached", 409
+                        "MODEL_CONTEXT_ROLLOVER_LIMIT_EXHAUSTED",
+                        "Context rollover bound reached",
+                        409,
                     ) from None
                 if current_task.project_id:
                     await ProjectKnowledgeService(self.session).checkpoint(
@@ -266,7 +323,26 @@ class AgentRuntime:
                     correlation_id=task_id,
                     event_type="DEV_CONTEXT_ROLLOVER",
                     message="Fresh model context prepared after durable tool observation.",
-                    payload=handoff,
+                    payload={
+                        **handoff,
+                        "reason": (
+                            "MODEL_CONTEXT_THRESHOLD"
+                            if context_pressure
+                            else (
+                                "TASK_BUDGET_PREFLIGHT"
+                                if budget_pressure
+                                else "TASK_BUDGET_SOFT_THRESHOLD"
+                            )
+                        ),
+                        "model": selected.profile.model_id,
+                        "model_context_limit": context_limit,
+                        "rollover_threshold": int(
+                            context_limit * self.settings.forge_dev_context_checkpoint_ratio
+                        ),
+                        "estimated_input_tokens": estimated_input,
+                        "task_input_tokens_consumed": budget.consumed_input_tokens,
+                        "task_input_tokens_remaining": remaining_input,
+                    },
                 )
                 await self.session.commit()
                 # Only transport history is dropped. Evidence, counters, budgets and task remain.
@@ -289,6 +365,53 @@ class AgentRuntime:
                     fresh,
                     user_prompt=conversation_start_prompt,
                     conversation_start_prompt=conversation_start_prompt,
+                )
+
+            estimated_input = rollover.estimated_input_tokens(
+                request, reserve_tokens=self.settings.forge_dev_context_reserve_tokens
+            )
+            remaining_input = max(
+                budget.max_input_tokens - budget.consumed_input_tokens, 0
+            )
+            if estimated_input >= context_limit:
+                await self._persist_recovery_handoff(
+                    current_task,
+                    context,
+                    observations,
+                    rollover,
+                    budget,
+                    estimated_input=estimated_input,
+                    model=selected.profile.model_id,
+                    context_limit=context_limit,
+                    tool_steps=tool_steps,
+                    duplicate_signals=duplicate_signals,
+                    stop_reason="MODEL_CONTEXT_LIMIT_EXCEEDED",
+                )
+                error = ProviderCallError(
+                    "MODEL_CONTEXT_LIMIT_EXCEEDED",
+                    "Compacted request still exceeds the selected model context limit",
+                    category="CONTEXT_LIMIT",
+                )
+                raise self._public_error(error)
+            if estimated_input >= remaining_input:
+                budget.stopped_reason = "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED"
+                await self._persist_recovery_handoff(
+                    current_task,
+                    context,
+                    observations,
+                    rollover,
+                    budget,
+                    estimated_input=estimated_input,
+                    model=selected.profile.model_id,
+                    context_limit=context_limit,
+                    tool_steps=tool_steps,
+                    duplicate_signals=duplicate_signals,
+                    stop_reason="TASK_INPUT_TOKEN_BUDGET_EXHAUSTED",
+                )
+                raise AgentRuntimeDomainError(
+                    "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED",
+                    "Task input-token budget cannot safely reserve the next compacted request",
+                    409,
                 )
 
             run = await self._start_turn(
@@ -362,7 +485,7 @@ class AgentRuntime:
                 return completed
 
             key = mutation_key(turn.tool_name, dict(turn.arguments))
-            if rollover.count and key and key in rollover.executed_mutations:
+            if rollover.handoff and key and key in rollover.executed_mutations:
                 error = ProviderCallError("DUPLICATE_TOOL_LOOP", "Rollover mutation replay blocked")
                 await self._fail(run.id, error)
                 raise self._public_error(error)
@@ -446,12 +569,183 @@ class AgentRuntime:
             tool_exchanges.append(
                 ModelToolExchange(
                     call=tool_call,
-                    response=observation.model_dump(mode="json"),
+                    response=InstructionBuilder.prompt_observation(observation),
                 )
             )
             await self.efficiency.cache_observation(task, turn, observation)
             await self.session.commit()
             tool_steps += 1
+
+    async def _restore_durable_context(
+        self,
+        task_id: UUID,
+        observations: list[ToolObservation],
+        rollover: ContextRollover,
+    ) -> tuple[int, int]:
+        handoff = await self.session.scalar(
+            select(Event)
+            .where(
+                Event.task_id == task_id,
+                Event.type.in_(("DEV_BUDGET_HANDOFF", "DEV_CONTEXT_FAILURE_HANDOFF")),
+            )
+            .order_by(Event.created_at.desc())
+            .limit(1)
+        )
+        if handoff is None:
+            return 0, 0
+        rollover.handoff = dict(handoff.details)
+        rollover.count = int(
+            await self.session.scalar(
+                select(func.count()).select_from(Event).where(
+                    Event.task_id == task_id, Event.type == "DEV_CONTEXT_ROLLOVER"
+                )
+            )
+            or 0
+        )
+        calls = list(
+            await self.session.scalars(
+                select(ToolCall)
+                .where(ToolCall.task_id == task_id)
+                .order_by(ToolCall.created_at, ToolCall.id)
+            )
+        )
+        restored_steps = 0
+        for call in calls:
+            status = call.status.value.lower()
+            if status not in {"succeeded", "failed", "denied", "cancelled"}:
+                continue
+            restored_steps += 1
+            observations.append(
+                ToolObservation(
+                    tool_call_id=call.id,
+                    tool=call.tool_name,
+                    status="success" if status == "succeeded" else "failure",
+                    result=call.result,
+                    error=call.error,
+                )
+            )
+            if status == "succeeded":
+                key = mutation_key(call.tool_name, dict(call.arguments))
+                if key:
+                    rollover.executed_mutations.add(key)
+        metric = await self.session.scalar(
+            select(TaskRuntimeMetric).where(TaskRuntimeMetric.task_id == task_id)
+        )
+        duplicate_signals = (
+            max(int(metric.tool_signature_counts.get("__last_count__", 1)) - 1, 0)
+            if metric is not None
+            else 0
+        )
+        return restored_steps, duplicate_signals
+
+    async def _persist_recovery_handoff(
+        self,
+        task: Any,
+        context: ContextRecord,
+        observations: list[ToolObservation],
+        rollover: ContextRollover,
+        budget: Any,
+        *,
+        estimated_input: int,
+        model: str,
+        context_limit: int,
+        tool_steps: int,
+        duplicate_signals: int,
+        stop_reason: str,
+    ) -> None:
+        failures = [
+            {
+                "tool": item.tool,
+                "status": item.status,
+                "error": item.error.model_dump() if item.error else None,
+            }
+            for item in observations
+            if item.status != "success"
+        ][-20:]
+        handoff = {
+            "task_id": str(task.id),
+            "goal": str(context.task.get("title", ""))[:2000],
+            "phase": (
+                "BUDGET_STOP"
+                if stop_reason == "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED"
+                else "CONTEXT_STOP"
+            ),
+            "stop_reason": stop_reason,
+            "completed": [
+                {
+                    "tool": item.tool,
+                    "status": item.status,
+                    "reference": (item.result or {}).get("path")
+                    or (item.result or {}).get("action"),
+                }
+                for item in observations[-30:]
+            ],
+            "files_modified": sorted(
+                {
+                    str((item.result or {}).get("path"))
+                    for item in observations
+                    if item.tool in {"filesystem.write", "filesystem.patch"}
+                    and item.status == "success"
+                    and (item.result or {}).get("path")
+                }
+            ),
+            "failures": failures,
+            "tool_steps": tool_steps,
+            "rollover_count": rollover.count,
+            "duplicate_signals": duplicate_signals,
+            "mutation_fingerprints": sorted(rollover.executed_mutations),
+            "model": model,
+            "model_context_limit": context_limit,
+            "estimated_next_input_tokens": estimated_input,
+            "input_tokens_consumed": budget.consumed_input_tokens,
+            "cached_input_tokens_consumed": budget.consumed_cached_tokens,
+            "input_token_budget": budget.max_input_tokens,
+            "remaining_input_tokens": max(
+                budget.max_input_tokens - budget.consumed_input_tokens, 0
+            ),
+            "next_action": (
+                "Resume from durable evidence after the stop condition is resolved; "
+                "do not replay mutations."
+            ),
+        }
+        checkpoint: dict[str, object] = {"created": False}
+        if task.kind == TaskKind.DEVELOPMENT:
+            try:
+                from app.development.bootstrap import ProjectBootstrapService
+
+                checkpoint = await ProjectBootstrapService(
+                    self.session, settings=self.settings
+                ).checkpoint_recovery(task.id, stop_reason)
+            except Exception as exc:
+                checkpoint = {"created": False, "reason": type(exc).__name__}
+        handoff["checkpoint"] = checkpoint
+        if task.project_id:
+            await ProjectKnowledgeService(self.session).checkpoint(
+                task.project_id,
+                task_id=task.id,
+                goal=handoff["goal"],
+                completed=[json.dumps(x) for x in handoff["completed"]],
+                current_diff=str(checkpoint.get("diff_summary", ""))[:4000],
+                decisions=[],
+                test_status=[],
+                failures=[json.dumps(x) for x in failures],
+                open_questions=[],
+                next_action=handoff["next_action"],
+            )
+        await self.events.create(
+            company_id=task.company_id,
+            project_id=task.project_id,
+            task_id=task.id,
+            correlation_id=task.id,
+            event_type=(
+                "DEV_BUDGET_HANDOFF"
+                if stop_reason == "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED"
+                else "DEV_CONTEXT_FAILURE_HANDOFF"
+            ),
+            message="Recoverable handoff persisted before bounded runtime stop.",
+            payload=handoff,
+        )
+        await self.session.commit()
 
     async def _execution_allowed(self) -> bool:
         return self.execution_guard is None or await self.execution_guard()
