@@ -134,6 +134,9 @@ failures, usage, remaining budget, mutation fingerprints, and the next action. A
 can resume through `POST /api/v1/tasks/{task_id}/resume-input-budget` with
 `additional_input_tokens`; consumed usage is retained, the task receives exactly the approved
 addition, and durable mutation fingerprints prevent replay.
+For a legacy budget failure created before handoffs existed, explicit resume first checkpoints the
+current development tree and reconstructs mutation fingerprints from durable `ToolCall` records.
+Resume is refused if that recovery checkpoint cannot be created.
 An unrecoverable compacted model-context request uses the same checkpoint path and records
 `DEV_CONTEXT_FAILURE_HANDOFF`, but it does not masquerade as cumulative task-budget exhaustion.
 

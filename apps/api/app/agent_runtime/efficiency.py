@@ -9,17 +9,20 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_runtime.context_rollover import mutation_key
 from app.core.config import Settings
-from app.domain.enums import TaskStatus
+from app.domain.enums import TaskKind, TaskStatus
 from app.domain.exceptions import AgentRuntimeDomainError
 from app.domain.models import (
     AgentRun,
+    Event,
     FileContextCache,
     ModelEscalation,
     Task,
     TaskRun,
     TaskRuntimeBudget,
     TaskRuntimeMetric,
+    ToolCall,
 )
 from app.services.event_factory import EventFactory
 from app.tool_system.contracts import ToolObservation, ToolRequestTurn
@@ -98,6 +101,7 @@ class EfficientRuntimeService:
                 "Task is not eligible for input-token budget resume",
                 409,
             )
+        await self._ensure_resume_handoff(task, budget)
         previous = budget.max_input_tokens
         budget.max_input_tokens += additional_input_tokens
         budget.stopped_reason = None
@@ -123,6 +127,103 @@ class EfficientRuntimeService:
         )
         await self.session.commit()
         return task
+
+    async def _ensure_resume_handoff(
+        self, task: Task, budget: TaskRuntimeBudget
+    ) -> None:
+        existing = await self.session.scalar(
+            select(Event.id)
+            .where(Event.task_id == task.id, Event.type == "DEV_BUDGET_HANDOFF")
+            .limit(1)
+        )
+        if existing is not None:
+            return
+        checkpoint: dict[str, object] = {"created": False, "reason": "not development"}
+        if task.kind == TaskKind.DEVELOPMENT:
+            from app.development.bootstrap import ProjectBootstrapService
+
+            checkpoint = await ProjectBootstrapService(
+                self.session, settings=self.settings
+            ).checkpoint_recovery(task.id, budget.stopped_reason or "INPUT_TOKEN_BUDGET")
+            if checkpoint.get("reason"):
+                raise AgentRuntimeDomainError(
+                    "TASK_BUDGET_RECOVERY_CHECKPOINT_FAILED",
+                    "Development work could not be checkpointed for safe budget resume",
+                    409,
+                )
+            await self.session.refresh(task, with_for_update=True)
+            await self.session.refresh(budget, with_for_update=True)
+            if task.status != TaskStatus.FAILED or budget.stopped_reason not in {
+                "MODEL_INPUT_TOKEN_BUDGET_EXHAUSTED",
+                "TASK_INPUT_TOKEN_BUDGET_EXHAUSTED",
+            }:
+                raise AgentRuntimeDomainError(
+                    "TASK_BUDGET_RESUME_NOT_ALLOWED",
+                    "Task changed while the recovery checkpoint was created",
+                    409,
+                )
+        calls = list(
+            await self.session.scalars(
+                select(ToolCall)
+                .where(ToolCall.task_id == task.id)
+                .order_by(ToolCall.created_at, ToolCall.id)
+            )
+        )
+        successful = [call for call in calls if call.status.value == "SUCCEEDED"]
+        fingerprints = sorted(
+            key
+            for call in successful
+            if (key := mutation_key(call.tool_name, dict(call.arguments))) is not None
+        )
+        files = sorted(
+            {
+                str(call.result["path"])
+                for call in successful
+                if call.tool_name in {"filesystem.write", "filesystem.patch"}
+                and call.result
+                and call.result.get("path")
+            }
+        )
+        await EventFactory(self.session).create(
+            company_id=task.company_id,
+            project_id=task.project_id,
+            agent_id=task.assigned_agent_id,
+            task_id=task.id,
+            correlation_id=task.id,
+            event_type="DEV_BUDGET_HANDOFF",
+            message="Legacy budget stop reconstructed from authoritative Forge evidence.",
+            payload={
+                "task_id": str(task.id),
+                "goal": task.title[:2000],
+                "phase": "BUDGET_STOP",
+                "stop_reason": budget.stopped_reason,
+                "legacy_reconstructed": True,
+                "completed": [
+                    {
+                        "tool": call.tool_name,
+                        "status": call.status.value,
+                        "reference": (call.result or {}).get("path")
+                        or (call.result or {}).get("action"),
+                    }
+                    for call in calls[-30:]
+                ],
+                "files_modified": files,
+                "tool_steps": len(calls),
+                "rollover_count": 0,
+                "duplicate_signals": 0,
+                "mutation_fingerprints": fingerprints,
+                "input_tokens_consumed": budget.consumed_input_tokens,
+                "cached_input_tokens_consumed": budget.consumed_cached_tokens,
+                "input_token_budget": budget.max_input_tokens,
+                "remaining_input_tokens": max(
+                    budget.max_input_tokens - budget.consumed_input_tokens, 0
+                ),
+                "checkpoint": checkpoint,
+                "next_action": (
+                    "Continue from reconstructed durable evidence; do not replay mutations."
+                ),
+            },
+        )
 
     async def snapshot(self, task_id: UUID, iteration: int) -> BudgetSnapshot:
         totals = (

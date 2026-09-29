@@ -183,8 +183,15 @@ async def test_human_budget_resume_preserves_usage_and_adds_only_approved_tokens
                 Event.task_id == task_id, Event.type == "DEV_BUDGET_RESUME_APPROVED"
             )
         )
+        handoff = await session.scalar(
+            select(Event).where(
+                Event.task_id == task_id, Event.type == "DEV_BUDGET_HANDOFF"
+            )
+        )
         assert budget is not None
         assert budget.max_input_tokens == 265_000
         assert budget.consumed_input_tokens == 240_000
         assert budget.stopped_reason is None
         assert event is not None
+        assert handoff is not None
+        assert handoff.details["legacy_reconstructed"] is True
