@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -30,6 +31,7 @@ class OpenRouterCatalogEntry:
             paid=not self.free,
             max_call_cost=0 if self.free else None,
             supported_parameters=self.supported_parameters,
+            context_length=self.context_length,
         )
 
 
@@ -50,8 +52,41 @@ class OpenRouterCatalogClient:
             base_url=f"{base_url.rstrip('/')}/", timeout=timeout_seconds, headers=headers
         )
         self.ttl = timedelta(seconds=max(ttl_seconds, 1))
+        self._lock = asyncio.Lock()
+        self.last_error: str | None = None
+        self.last_attempt: datetime | None = None
         self._cached_at: datetime | None = None
         self._cache: tuple[OpenRouterCatalogEntry, ...] = ()
+
+    @property
+    def status(self) -> dict[str, Any]:
+        return {
+            "cached_at": self._cached_at.isoformat() if self._cached_at else None,
+            "age_seconds": (datetime.now(UTC) - self._cached_at).total_seconds()
+            if self._cached_at
+            else None,
+            "last_error": self.last_error,
+            "entries": len(self._cache),
+        }
+
+    async def refresh(self) -> tuple[OpenRouterCatalogEntry, ...]:
+        """Lazy refresh with single flight, retry backoff and last known good retention."""
+        async with self._lock:
+            now = datetime.now(UTC)
+            if (
+                self.last_error
+                and self.last_attempt
+                and (now - self.last_attempt < timedelta(seconds=60))
+            ):
+                return self._cache
+            self.last_attempt = now
+            try:
+                entries = await self.discover()
+            except ProviderCallError as exc:
+                self.last_error = exc.code
+                return self._cache
+            self.last_error = None
+            return entries
 
     async def discover(self, *, force: bool = False) -> tuple[OpenRouterCatalogEntry, ...]:
         now = datetime.now(UTC)
@@ -61,7 +96,9 @@ class OpenRouterCatalogClient:
             response = await self.client.get("models")
         except httpx.TimeoutException as exc:
             raise ProviderCallError(
-                "MODEL_TIMEOUT", "OpenRouter model discovery timed out", retryable=True,
+                "MODEL_TIMEOUT",
+                "OpenRouter model discovery timed out",
+                retryable=True,
                 category="TIMEOUT",
             ) from exc
         except httpx.NetworkError as exc:
@@ -85,9 +122,13 @@ class OpenRouterCatalogClient:
             )
         try:
             rows = response.json()["data"]
+            if not isinstance(rows, list) or not rows:
+                raise ValueError("empty or malformed catalog")
             entries = tuple(
                 entry for row in rows if isinstance(row, dict) if (entry := self._parse(row))
             )
+            if not entries:
+                raise ValueError("no usable entries")
         except (ValueError, KeyError, TypeError) as exc:
             raise ProviderCallError(
                 "PROVIDER_RESPONSE_INVALID",
@@ -113,9 +154,7 @@ class OpenRouterCatalogClient:
             capabilities.add(ModelCapability.STRUCTURED_OUTPUT)
         architecture = row.get("architecture")
         modalities = (
-            architecture.get("input_modalities", [])
-            if isinstance(architecture, dict)
-            else []
+            architecture.get("input_modalities", []) if isinstance(architecture, dict) else []
         )
         if "image" in modalities:
             capabilities.add(ModelCapability.VISION)
@@ -131,13 +170,15 @@ class OpenRouterCatalogClient:
         free = OpenRouterCatalogClient._zero(
             pricing.get("prompt")
         ) and OpenRouterCatalogClient._zero(pricing.get("completion"))
+        if pricing and any(not OpenRouterCatalogClient._zero(value) for value in pricing.values()):
+            free = False
         context_length = row.get("context_length")
         return OpenRouterCatalogEntry(
             model_id=model_id,
             name=str(row.get("name") or model_id),
             context_length=context_length if isinstance(context_length, int) else None,
             capabilities=frozenset(capabilities),
-            free=free,
+            free=free if pricing else model_id.endswith(":free"),
             supported_parameters=parameters,
         )
 

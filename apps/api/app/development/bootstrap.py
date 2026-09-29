@@ -12,6 +12,7 @@ from app.development.contracts import RunnerRequest, RunnerResponse
 from app.development.profile import DevelopmentProfileService
 from app.development.registry import CommandRegistry
 from app.development.runner_client import RunnerClient, runner_client_from_settings
+from app.development.self_workflow import SelfDevelopmentWorkflow
 from app.domain.enums import DevelopmentAction, DevelopmentExecutionStatus, DevelopmentProjectType
 from app.domain.exceptions import DevelopmentInfrastructureError, EntityNotFoundError
 from app.domain.models import Project, ProjectDevelopmentProfile, Task
@@ -60,6 +61,8 @@ class ProjectBootstrapService:
         )
         if project is None:
             raise EntityNotFoundError("Project")
+        if SelfDevelopmentWorkflow.requested(task):
+            await SelfDevelopmentWorkflow(self.session, self.settings).prepare(task)
         workspace = self.workspace.project_workspace(project.company_id, project.id)
         profile = await self.profiles.detect(project.id, commit=False)
         if not self.settings.development_bootstrap_enabled:
@@ -86,7 +89,7 @@ class ProjectBootstrapService:
             profile.repository_initialized = True
 
         profile = await self.profiles.detect(project.id, commit=False)
-        if checkpoint:
+        if checkpoint and not SelfDevelopmentWorkflow.requested(task):
             await self._checkpoint_initial_skeleton(task, profile)
         profile.bootstrap_error_code = None
         profile.bootstrap_error_message = None
@@ -255,7 +258,7 @@ class ProjectBootstrapService:
     @staticmethod
     def _repository_marker_available(workspace: Path) -> bool:
         git = workspace / ".git"
-        return git.is_dir() and not git.is_symlink()
+        return (git.is_dir() or git.is_file()) and not git.is_symlink()
 
     @staticmethod
     def _changed_files(output: str) -> int:

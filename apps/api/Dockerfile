@@ -22,6 +22,8 @@ COPY . .
 CMD ["pytest", "-q"]
 
 FROM base AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 RUN addgroup --system --gid 10001 forge \
     && adduser --system --uid 10001 --ingroup forge forge
 RUN mkdir -p /workspaces && chown forge:forge /workspaces

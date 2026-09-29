@@ -1,9 +1,11 @@
 import asyncio
 import hashlib
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
+from functools import partial
 from time import perf_counter
 from typing import Any
 from uuid import UUID
@@ -12,6 +14,7 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.builders import ContextBuilder, ContextRecord, InstructionBuilder
+from app.agent_runtime.context_rollover import ContextRollover, mutation_key
 from app.agent_runtime.contracts import (
     BaseAgentResult,
     ModelProvider,
@@ -23,10 +26,17 @@ from app.agent_runtime.contracts import (
     ProviderCallError,
 )
 from app.agent_runtime.cost import CostEstimator
+from app.agent_runtime.dev_models import (
+    AccountedProbeProvider,
+    catalog_for,
+    prober_for,
+    refresh_profiles,
+)
 from app.agent_runtime.economics import ModelEconomicsService
 from app.agent_runtime.efficiency import EfficientRuntimeService, ModelBudgetExceeded
 from app.agent_runtime.execution_truth import ExecutionTruthValidator
 from app.agent_runtime.policy import ModelExecutionPolicy
+from app.agent_runtime.probes import ProbeCapability
 from app.agent_runtime.providers import provider_for_profile
 from app.agent_runtime.registry import ModelRegistry
 from app.agent_runtime.routing import (
@@ -51,6 +61,7 @@ from app.repositories.agent_run import AgentRunRepository
 from app.repositories.task import TaskRepository
 from app.repositories.task_run import TaskRunRepository
 from app.services.event_factory import EventFactory
+from app.services.project_knowledge import ProjectKnowledgeService
 from app.services.task_state_machine import TaskStateMachine
 from app.tool_system.contracts import (
     AgentTurnResponse,
@@ -142,6 +153,11 @@ class AgentRuntime:
         execution_started = perf_counter()
         if self.provider is not None:
             self.policy.authorize(self.provider)
+        from app.development.self_workflow import SelfDevelopmentWorkflow
+
+        initial_task = await self.tasks.get_current(task_id)
+        if initial_task is not None and SelfDevelopmentWorkflow.requested(initial_task):
+            await SelfDevelopmentWorkflow(self.session, self.settings).prepare(initial_task)
         context = await ContextBuilder(self.session).build(task_id)
         observations: list[ToolObservation] = []
         tool_exchanges: list[ModelToolExchange] = []
@@ -149,6 +165,9 @@ class AgentRuntime:
         tool_steps = 0
         first_turn = True
         duplicate_signals = 0
+        rollover = ContextRollover(
+            self.settings.forge_dev_context_checkpoint_ratio, self.settings.forge_dev_max_rollovers
+        )
 
         while True:
             await self._assert_execution_allowed()
@@ -181,6 +200,13 @@ class AgentRuntime:
                 duplicate_warning=duplicate_signals > 0,
                 force_final=self._developer_ready_for_final(context, observations),
             )
+            if rollover.handoff:
+                request = replace(
+                    request,
+                    user_prompt=request.user_prompt
+                    + "\nForge context handoff:\n"
+                    + json.dumps(rollover.handoff),
+                )
             if conversation_start_prompt is None:
                 conversation_start_prompt = request.user_prompt
             request = replace(
@@ -200,6 +226,71 @@ class AgentRuntime:
                 raise self._public_error(self._normalize_error(error)) from None
             selected = selections[0]
             request = replace(request, model=selected.profile.model_id)
+            if (
+                self.settings.forge_dev_mode_enabled
+                and tool_exchanges
+                and rollover.needed(
+                    request,
+                    selected.profile.context_length or self.settings.forge_dev_context_limit,
+                )
+            ):
+                try:
+                    handoff = rollover.checkpoint(
+                        task_id=str(task_id),
+                        goal=str(context.task.get("title", "")),
+                        observations=observations,
+                        tool_steps=tool_steps,
+                        duplicate_signals=duplicate_signals,
+                    )
+                except ValueError:
+                    raise AgentRuntimeDomainError(
+                        "MODEL_BUDGET_EXHAUSTED", "Context rollover bound reached", 409
+                    ) from None
+                if current_task.project_id:
+                    await ProjectKnowledgeService(self.session).checkpoint(
+                        current_task.project_id,
+                        task_id=task_id,
+                        goal=handoff["goal"],
+                        completed=[json.dumps(x) for x in handoff["completed"]],
+                        current_diff=handoff["current_diff"],
+                        decisions=[],
+                        test_status=[json.dumps(x) for x in handoff["test_status"]],
+                        failures=[json.dumps(x) for x in handoff["failures"]],
+                        open_questions=[],
+                        next_action=handoff["next_action"],
+                    )
+                await self.events.create(
+                    company_id=current_task.company_id,
+                    project_id=current_task.project_id,
+                    task_id=task_id,
+                    correlation_id=task_id,
+                    event_type="DEV_CONTEXT_ROLLOVER",
+                    message="Fresh model context prepared after durable tool observation.",
+                    payload=handoff,
+                )
+                await self.session.commit()
+                # Only transport history is dropped. Evidence, counters, budgets and task remain.
+                tool_exchanges.clear()
+                context = await ContextBuilder(self.session).build(task_id)
+                fresh = await self._build_request(
+                    context,
+                    routed_alias,
+                    selected.profile.model_id,
+                    observations,
+                    turn_number=tool_steps + 1,
+                    budget_warning=budget.warning_active,
+                    duplicate_warning=duplicate_signals > 0,
+                    force_final=self._developer_ready_for_final(context, observations),
+                )
+                conversation_start_prompt = (
+                    fresh.user_prompt + "\nForge context handoff:\n" + json.dumps(handoff)
+                )
+                request = replace(
+                    fresh,
+                    user_prompt=conversation_start_prompt,
+                    conversation_start_prompt=conversation_start_prompt,
+                )
+
             run = await self._start_turn(
                 task_id,
                 selected,
@@ -215,8 +306,10 @@ class AgentRuntime:
                 capabilities,
                 current_task,
                 str(context.agent.get("role", "GENERAL")),
-                validate_response=lambda response: self._validate_execution_truth_response(
-                    response, context, observations
+                validate_response=partial(
+                    self._validate_execution_truth_response,
+                    context=context,
+                    observations=observations,
                 ),
             )
             if not await self._execution_allowed():
@@ -267,6 +360,12 @@ class AgentRuntime:
                 )
                 self._log_succeeded(completed, execution_started, "final")
                 return completed
+
+            key = mutation_key(turn.tool_name, dict(turn.arguments))
+            if rollover.count and key and key in rollover.executed_mutations:
+                error = ProviderCallError("DUPLICATE_TOOL_LOOP", "Rollover mutation replay blocked")
+                await self._fail(run.id, error)
+                raise self._public_error(error)
 
             max_tool_steps = (
                 self.settings.developer_max_steps
@@ -337,6 +436,8 @@ class AgentRuntime:
                 error = ProviderCallError("AGENT_RUNTIME_ERROR", "Tool orchestration failed")
                 await self._fail_task(completed, error)
                 raise self._public_error(error) from None
+            if key and observation.status == "success":
+                rollover.executed_mutations.add(key)
             observations.append(observation)
             tool_call = provider_response.tool_call or ModelToolCall(
                 name=turn.tool_name,
@@ -540,6 +641,20 @@ class AgentRuntime:
                 ModelSelection(profile, "Explicit test/development provider override selected.")
             ], capabilities
 
+        profiles = self.registry.profiles
+        if (
+            self.settings.forge_dev_mode_enabled
+            and self.settings.openrouter_enabled
+            and self.settings.openrouter_discovery_enabled
+        ):
+            profiles = await refresh_profiles(
+                profiles,
+                base_url=self.settings.openrouter_base_url,
+                ttl=self.settings.openrouter_catalog_ttl_seconds,
+                free_only=self.settings.forge_dev_free_only or self.settings.openrouter_free_only,
+            )
+        if self.settings.forge_dev_mode_enabled and self.settings.forge_dev_free_only:
+            profiles = tuple(p for p in profiles if not p.paid and p.tier == EconomicTier.FREE)
         snapshot = await self.economics.snapshot(task=task)
         health = await self.economics.provider_health(self.registry.profiles)
         escalation_reason = None
@@ -547,7 +662,7 @@ class AgentRuntime:
             escalation_reason = "REPEATED_DETERMINISTIC_FAILURE"
         elif task.iteration > 1:
             escalation_reason = "BOUNDED_IMPLEMENTATION_FAILURE"
-        selections = self.router.candidates(
+        selections = ModelRouter(profiles).candidates(
             RoutingContext(
                 required_capabilities=capabilities,
                 paid_budget_remaining=float(snapshot.paid_budget_remaining),
@@ -556,7 +671,120 @@ class AgentRuntime:
                 provider_health=health,
             )
         )
-        return selections[: max(self.settings.model_fallback_max_candidates, 1)], capabilities
+        bounded = selections[: max(self.settings.model_fallback_max_candidates, 1)]
+        if self.settings.forge_dev_mode_enabled:
+            accepted = []
+            rejected = []
+            probe_results = []
+            bounded_keys = {
+                (selection.profile.provider, selection.profile.model_id)
+                for selection in bounded
+            }
+            health_states = health
+            for profile in profiles:
+                reason = None
+                if not profile.enabled:
+                    reason = "DISABLED_OR_PRICE_UNVERIFIED"
+                elif not profile.supports(capabilities):
+                    reason = "DECLARED_CAPABILITY_MISSING"
+                elif (
+                    health_states.get((profile.provider, profile.model_id), "HEALTHY") != "HEALTHY"
+                ):
+                    reason = "HEALTH_COOLDOWN"
+                elif (profile.provider, profile.model_id) not in bounded_keys:
+                    reason = "FALLBACK_BOUND"
+                if reason:
+                    rejected.append(
+                        {"provider": profile.provider, "model": profile.model_id, "reason": reason}
+                    )
+            prober = prober_for(
+                self.settings.openrouter_base_url,
+                self.settings.openrouter_probe_ttl_seconds,
+                self.settings.model_provider_health_cooldown_seconds,
+                self.settings.openrouter_probe_timeout_seconds,
+            )
+            for selection in bounded:
+                if selection.profile.provider != "openrouter":
+                    accepted.append(selection)
+                    continue
+                provider = provider_for_profile(self.settings, selection.profile)
+                self.policy.authorize(provider)
+                required = [ProbeCapability.STRUCTURED_OUTPUT]
+                if request.tools:
+                    required += [ProbeCapability.TOOL_CALLING, ProbeCapability.TOOL_CONTINUATION]
+                valid = True
+                for capability in required:
+                    result = await prober.probe(
+                        AccountedProbeProvider(provider, self.economics, selection, task),
+                        selection.profile.model_id,
+                        capability,
+                        metadata={
+                            "provider_supported_parameters": ",".join(
+                                sorted(selection.profile.supported_parameters or ())
+                            )
+                        },
+                    )
+                    probe_results.append(
+                        {
+                            "provider": result.provider,
+                            "model": result.model,
+                            "capability": result.capability.value,
+                            "status": result.status,
+                            "timestamp": result.timestamp.isoformat(),
+                            "retry_at": result.retry_at.isoformat(),
+                            "latency_ms": result.latency_ms,
+                            "failure_category": result.failure_category,
+                            "input_tokens": result.input_tokens,
+                            "output_tokens": result.output_tokens,
+                        }
+                    )
+                    if result.status != "verified":
+                        rejected.append(
+                            {
+                                "provider": selection.profile.provider,
+                                "model": selection.profile.model_id,
+                                "capability": capability.value,
+                                "status": result.status,
+                                "failure": result.failure_category,
+                            }
+                        )
+                        valid = False
+                        break
+                if valid:
+                    accepted.append(selection)
+            await self.events.create(
+                company_id=task.company_id,
+                project_id=task.project_id,
+                task_id=task.id,
+                correlation_id=task.id,
+                event_type="DEV_MODEL_ROUTING",
+                message="Dev Mode capability routing evaluated.",
+                payload={
+                    "required": sorted(c.value for c in capabilities),
+                    "candidates": [s.profile.model_id for s in accepted],
+                    "rejected": rejected,
+                    "probes": probe_results,
+                    "catalog": (
+                        catalog_for(
+                            self.settings.openrouter_base_url,
+                            self.settings.openrouter_catalog_ttl_seconds,
+                        ).status
+                        if self.settings.openrouter_discovery_enabled
+                        and any(p.provider == "openrouter" for p in profiles)
+                        else None
+                    ),
+                    "provider": accepted[0].profile.provider if accepted else None,
+                    "reason": accepted[0].reason if accepted else None,
+                    "selected": accepted[0].profile.model_id if accepted else None,
+                },
+            )
+            await self.session.commit()
+            if not accepted:
+                raise ProviderCallError(
+                    "MODEL_CAPABILITY_UNAVAILABLE", "No bounded candidate passed behavioral probes"
+                )
+            bounded = accepted
+        return bounded, capabilities
 
     async def _generate(
         self,
@@ -590,9 +818,7 @@ class AgentRuntime:
                 metadata["provider_supported_parameters"] = ",".join(
                     sorted(selection.profile.supported_parameters)
                 )
-            current_request = replace(
-                request, model=selection.profile.model_id, metadata=metadata
-            )
+            current_request = replace(request, model=selection.profile.model_id, metadata=metadata)
             for attempt in range(1, max_attempts + 1):
                 try:
                     call = await self.economics.begin_call(

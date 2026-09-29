@@ -114,6 +114,8 @@ class ToolRiskLevel(str, Enum):
 
 
 class ToolPermission(str, Enum):
+    BROWSER_CAPTURE = "browser.capture"
+    SPECIALIST_ADVISE = "specialist.advise"
     FILESYSTEM_LIST = "filesystem.list"
     FILESYSTEM_READ = "filesystem.read"
     FILESYSTEM_WRITE = "filesystem.write"

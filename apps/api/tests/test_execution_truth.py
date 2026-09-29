@@ -54,9 +54,7 @@ def test_artifact_without_matching_mutation_evidence_is_rejected() -> None:
         result={"path": "other.txt"},
     )
 
-    decision = ExecutionTruthValidator.validate(
-        _context(), _result(["hello.txt"]), [observation]
-    )
+    decision = ExecutionTruthValidator.validate(_context(), _result(["hello.txt"]), [observation])
 
     assert not decision.accepted
     assert "hello.txt" in decision.message
@@ -70,9 +68,7 @@ def test_structured_claim_reference_must_match_authoritative_evidence() -> None:
         result={"path": "other.txt"},
     )
     result = _result([])
-    result.output["execution_claims"] = [
-        {"kind": "FILE_MUTATION", "reference": "hello.txt"}
-    ]
+    result.output["execution_claims"] = [{"kind": "FILE_MUTATION", "reference": "hello.txt"}]
 
     decision = ExecutionTruthValidator.validate(_context(), result, [observation])
 
@@ -87,9 +83,7 @@ def test_successful_forge_mutation_is_authoritative_evidence() -> None:
         result={"path": "hello.txt"},
     )
 
-    decision = ExecutionTruthValidator.validate(
-        _context(), _result(["hello.txt"]), [observation]
-    )
+    decision = ExecutionTruthValidator.validate(_context(), _result(["hello.txt"]), [observation])
 
     assert decision.accepted
     assert decision.evidence[0].kind == EvidenceKind.FILE_MUTATION
@@ -171,3 +165,35 @@ def test_informational_developer_task_needs_no_artificial_execution() -> None:
     )
 
     assert decision.accepted
+
+
+def test_later_failed_test_supersedes_old_pass() -> None:
+    observations = [
+        ToolObservation(
+            tool_call_id=uuid4(),
+            tool="development.execute",
+            status="success",
+            result={"action": "NODE_TEST", "status": status},
+        )
+        for status in ("SUCCEEDED", "FAILED")
+    ]
+    decision = ExecutionTruthValidator.validate(
+        _context(), _result([], "Tests passed"), observations
+    )
+    assert not decision.accepted
+
+
+def test_failed_git_action_cannot_back_execution_claim() -> None:
+    result = _result([], "Committed the changes")
+    observations = [
+        ToolObservation(
+            tool_call_id=uuid4(), tool="git.commit", status="success", result={"status": "FAILED"}
+        )
+    ]
+    assert not ExecutionTruthValidator.validate(_context(), result, observations).accepted
+
+
+def test_visual_claim_requires_real_browser_evidence() -> None:
+    assert not ExecutionTruthValidator.validate(
+        _context(), _result([], "The page looks correct"), []
+    ).accepted

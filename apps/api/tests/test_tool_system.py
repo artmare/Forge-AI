@@ -122,6 +122,8 @@ async def test_agent_permissions_are_conservative_and_strict(client: AsyncClient
         "development.install_dependencies": False,
         "git.read": False,
         "git.write": False,
+        "browser.capture": False,
+        "specialist.advise": False,
     }
     invalid = await client.patch(
         f"/api/v1/agents/{agent['id']}",

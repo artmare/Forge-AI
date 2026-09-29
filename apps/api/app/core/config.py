@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     openrouter_discovery_enabled: bool = True
     openrouter_catalog_ttl_seconds: int = 3600
     openrouter_free_only: bool = True
+    openrouter_probe_ttl_seconds: int = Field(default=3600, ge=1)
+    openrouter_probe_timeout_seconds: float = Field(default=30, gt=0, le=120)
     openai_base_url: str = "https://api.openai.com/v1"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
@@ -112,10 +114,18 @@ class Settings(BaseSettings):
     planner_provider_max_attempts: int = 3
     planner_retry_base_seconds: float = 0.5
     development_enabled: bool = True
+    forge_browser_enabled: bool = False
     forge_dev_mode_enabled: bool = False
     forge_self_development_enabled: bool = False
-    forge_dev_context_checkpoint_ratio: float = 0.7
-    forge_dev_specialist_limit: int = 2
+    forge_dev_context_checkpoint_ratio: float = Field(default=0.7, gt=0, lt=1)
+    forge_dev_context_limit: int = Field(default=32768, ge=1024)
+    forge_dev_max_rollovers: int = Field(default=4, ge=0, le=20)
+    forge_dev_repository_path: str | None = None
+    forge_dev_allowed_repository: str | None = None
+    forge_dev_worktree_root: str | None = None
+    forge_dev_free_only: bool = True
+    forge_dev_specialist_limit: int = Field(default=2, ge=0, le=5)
+    forge_dev_specialist_context_chars: int = Field(default=12000, ge=1000, le=32000)
     development_runner_mode: str = "queue"
     development_runner_queue_root: str = "/runner-queue"
     development_runner_poll_interval_ms: int = 100

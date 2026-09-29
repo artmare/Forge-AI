@@ -78,7 +78,13 @@ int main(int argc, char **argv) {
     }
 
     const char *readonly_paths[] = {
-        "/usr", "/bin", "/lib", "/lib64", "/etc", NULL,
+        "/usr", "/bin", "/lib", "/lib64", "/etc",
+#ifdef FORGE_BROWSER_SANDBOX
+        /* Chromium requires process/CPU metadata. This build is used only in the
+           separate browser container: no network, credentials, or host PID namespace. */
+        "/proc",
+#endif
+        NULL,
     };
     for (size_t index = 0; readonly_paths[index] != NULL; index++) {
         if (add_path_rule(ruleset_fd, readonly_paths[index], read_access()) < 0) {

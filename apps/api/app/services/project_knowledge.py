@@ -129,6 +129,29 @@ class ProjectKnowledgeService:
         await self.session.flush()
         return index
 
+    async def record_verified_checkpoint(
+        self, task: Task, *, checkpoint: str, changed_files: list[str]
+    ) -> None:
+        """Record verified state separately from later HUMAN_APPROVED knowledge."""
+        if task.project_id is None:
+            return
+        index = await self.session.scalar(
+            select(ProjectKnowledgeIndex).where(ProjectKnowledgeIndex.project_id == task.project_id)
+        )
+        if index is None:
+            index = ProjectKnowledgeIndex(project_id=task.project_id, architecture_summary="")
+            self.session.add(index)
+            await self.session.flush()
+        change = {
+            "task_id": str(task.id),
+            "checkpoint": checkpoint,
+            "files": changed_files[:200],
+            "status": "VERIFIED_PENDING_HUMAN_REVIEW",
+        }
+        index.recent_changes = [*index.recent_changes, change][-30:]
+        index.state = {**index.state, "pending_review": change}
+        await self.session.flush()
+
     async def record_lesson(
         self, project_id: UUID, *, task_id: UUID, lesson: str, evidence: str
     ) -> ProjectKnowledgeIndex:

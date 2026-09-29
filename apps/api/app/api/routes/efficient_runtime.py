@@ -191,3 +191,84 @@ async def _task_efficiency(session: AsyncSession, task_id: UUID) -> RuntimeEffic
             for item in escalations
         ],
     )
+
+
+@router.get("/tasks/{task_id}/dev-mode")
+async def dev_mode_status(task_id: UUID, session: Session) -> dict:
+    """Existing task inspection boundary; contains only Forge-owned durable event data."""
+    from app.domain.models import Event, ModelCallRecord, ToolCall
+
+    task = await session.get(Task, task_id)
+    if task is None:
+        raise EntityNotFoundError("Task")
+    events = list(
+        await session.scalars(
+            select(Event)
+            .where(Event.task_id == task_id, Event.type.like("DEV_%"))
+            .order_by(Event.created_at.desc())
+            .limit(100)
+        )
+    )
+    calls = list(
+        await session.scalars(
+            select(ModelCallRecord)
+            .where(ModelCallRecord.task_id == task_id)
+            .order_by(ModelCallRecord.created_at.desc())
+            .limit(100)
+        )
+    )
+    tools = list(
+        await session.scalars(
+            select(ToolCall)
+            .where(ToolCall.task_id == task_id)
+            .order_by(ToolCall.created_at.desc())
+            .limit(100)
+        )
+    )
+    return {
+        "task_id": str(task_id),
+        "status": task.status.value,
+        "events": [
+            {"type": e.type, "at": e.created_at.isoformat(), "details": e.details} for e in events
+        ],
+        "models": [
+            {"provider": c.provider, "model": c.model_id, "status": c.status} for c in calls
+        ],
+        "tools": [{"id": str(c.id), "name": c.tool_name, "status": c.status.value} for c in tools],
+        "rollover_count": sum(e.type == "DEV_CONTEXT_ROLLOVER" for e in events),
+        "specialist_calls": sum(e.type == "DEV_SPECIALIST_RESERVED" for e in events),
+        "human_promotion_required": True,
+    }
+
+
+@router.get("/tasks/{task_id}/browser-artifacts/{artifact_id}")
+async def browser_artifact(task_id: UUID, artifact_id: UUID, session: Session):
+    from pathlib import Path
+
+    from fastapi.responses import FileResponse
+
+    from app.core.config import get_settings
+    from app.domain.enums import ToolCallStatus
+    from app.domain.models import ToolCall
+
+    reference = f"browser/{artifact_id}.png"
+    call = await session.scalar(
+        select(ToolCall)
+        .where(
+            ToolCall.task_id == task_id,
+            ToolCall.tool_name == "browser.capture",
+            ToolCall.status == ToolCallStatus.SUCCEEDED,
+            ToolCall.result["artifact"].astext == reference,
+        )
+        .limit(1)
+    )
+    if call is None:
+        raise EntityNotFoundError("Browser artifact")
+    path = (
+        Path(get_settings().development_runner_queue_root)
+        / "browser/artifacts"
+        / f"{artifact_id}.png"
+    )
+    if path.is_symlink() or not path.is_file():
+        raise EntityNotFoundError("Browser artifact")
+    return FileResponse(path, media_type="image/png", filename=f"{artifact_id}.png")

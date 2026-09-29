@@ -76,6 +76,11 @@ class ExecutionTruthValidator:
         r"\b(?:committed|pushed|merged|rebased|cherry-picked)\b(?:[^\n]{0,80}\bgit\b)?",
         re.IGNORECASE,
     )
+    _BROWSER_CLAIM = re.compile(
+        r"\b(?:page|interface|UI) (?:looks|renders|rendered) (?:correct|good|properly)|"
+        r"\b(?:captured|took) (?:a )?screenshot\b",
+        re.IGNORECASE,
+    )
     _COMMAND_CLAIM = re.compile(
         r"\b(?:ran|executed)\b[^\n]{0,80}\b(?:command|script|shell|migration)\b|"
         r"\bdeploy(?:ed|ment succeeded)\b",
@@ -166,6 +171,7 @@ class ExecutionTruthValidator:
             (cls._FILE_MUTATION_CLAIM, EvidenceKind.FILE_MUTATION, "filesystem mutation"),
             (cls._GIT_CLAIM, EvidenceKind.GIT, "Git action"),
             (cls._COMMAND_CLAIM, EvidenceKind.COMMAND, "command execution"),
+            (cls._BROWSER_CLAIM, EvidenceKind.BROWSER, "browser verification"),
         )
         for pattern, kind, description in prose_requirements:
             if pattern.search(prose) and kind.value not in evidence_kinds:
@@ -201,6 +207,12 @@ class ExecutionTruthValidator:
             elif observation.tool in cls._COMMAND_TOOLS:
                 action = result.get("action")
                 execution_succeeded = str(result.get("status", "SUCCEEDED")).upper() == "SUCCEEDED"
+                # A later failed run supersedes an earlier pass of the same action.
+                collected = [
+                    item
+                    for item in collected
+                    if not (item.tool == observation.tool and item.reference == str(action))
+                ]
                 if not execution_succeeded:
                     continue
                 kind = EvidenceKind.TEST if action in cls._TEST_ACTIONS else EvidenceKind.COMMAND
@@ -212,7 +224,14 @@ class ExecutionTruthValidator:
                     )
                 )
             elif observation.tool.startswith("git."):
-                collected.append(ExecutionEvidence(EvidenceKind.GIT, observation.tool))
-            elif observation.tool.startswith("browser."):
-                collected.append(ExecutionEvidence(EvidenceKind.BROWSER, observation.tool))
+                if str(result.get("status", "SUCCEEDED")).upper() == "SUCCEEDED":
+                    collected.append(ExecutionEvidence(EvidenceKind.GIT, observation.tool))
+            elif observation.tool == "browser.capture" and (
+                result.get("rendered") is True and result.get("artifact") and result.get("sha256")
+            ):
+                collected.append(
+                    ExecutionEvidence(
+                        EvidenceKind.BROWSER, observation.tool, str(result["artifact"])
+                    )
+                )
         return tuple(collected)

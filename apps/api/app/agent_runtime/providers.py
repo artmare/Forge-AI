@@ -284,7 +284,8 @@ class OpenAIModelProvider:
         except RateLimitError as exc:
             details = self._provider_error_details(exc)
             quota_exhausted = details["provider_error_type"] == "insufficient_quota" or (
-                details["provider_error_code"] in {"insufficient_quota", "credit_balance_exhausted"}
+                details["provider_error_code"]
+                in {"insufficient_quota", "credit_balance_exhausted"}
             )
             raise ProviderCallError(
                 "MODEL_QUOTA_EXHAUSTED" if quota_exhausted else "MODEL_RATE_LIMIT",
@@ -432,10 +433,12 @@ class OpenRouterModelProvider:
         *,
         base_url: str,
         paid: bool,
+        free_only: bool = False,
     ) -> None:
         from openai import AsyncOpenAI
 
         self.paid = paid
+        self.free_only = free_only
         self.client = AsyncOpenAI(
             api_key=api_key,
             timeout=timeout_seconds,
@@ -541,6 +544,8 @@ class OpenRouterModelProvider:
             "model": request.model,
             "messages": self._messages(request),
         }
+        if self.free_only:
+            options["extra_body"] = {"provider": {"max_price": {"prompt": 0, "completion": 0}}}
         if supported_parameters is None or "response_format" in supported_parameters:
             options["response_format"] = self._structured_response_format(request)
         if native_tools:
@@ -573,8 +578,7 @@ class OpenRouterModelProvider:
         except RateLimitError as exc:
             details = OpenAIModelProvider._provider_error_details(exc)
             quota_exhausted = details["provider_error_type"] == "insufficient_quota" or (
-                details["provider_error_code"]
-                in {"insufficient_quota", "credit_balance_exhausted"}
+                details["provider_error_code"] in {"insufficient_quota", "credit_balance_exhausted"}
             )
             raise ProviderCallError(
                 "MODEL_QUOTA_EXHAUSTED" if quota_exhausted else "MODEL_RATE_LIMIT",
@@ -1220,6 +1224,8 @@ def provider_from_settings(
             settings.model_request_timeout_seconds,
             base_url=settings.openrouter_base_url,
             paid=False if paid is None else paid,
+            free_only=settings.openrouter_free_only
+            or (settings.forge_dev_mode_enabled and settings.forge_dev_free_only),
         )
     if provider_name == "gemini":
         key = settings.gemini_api_key

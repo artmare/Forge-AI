@@ -640,6 +640,11 @@ class DevelopmentWorkflowService:
             self.session, settings=self.settings, runner=self.runner
         ).evaluate(task_id, task_run_id)
         if result.decision == QADecision.PASS:
+            from app.development.self_workflow import SelfDevelopmentWorkflow
+
+            task = await self.session.get(Task, task_id)
+            if task is not None and SelfDevelopmentWorkflow.requested(task):
+                await SelfDevelopmentWorkflow(self.session, self.settings).complete(task)
             await TaskStateMachine(self.session).transition(
                 task_id, TaskStatus.REVIEW, "Deterministic QA passed.", commit=True
             )

@@ -151,6 +151,24 @@ async def test_openrouter_provider_returns_native_tool_call_without_executing_it
     assert call["response_format"]["type"] == "json_schema"
 
 
+async def test_openrouter_free_only_adds_zero_price_provider_ceiling() -> None:
+    completions = RecordingCompletions([_tool_response()])
+    provider = OpenRouterModelProvider(
+        "test-key",
+        30,
+        base_url="https://openrouter.ai/api/v1",
+        paid=False,
+        free_only=True,
+    )
+    provider.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    await provider.generate(_request())
+
+    assert completions.calls[0]["extra_body"] == {
+        "provider": {"max_price": {"prompt": 0, "completion": 0}}
+    }
+
+
 async def test_openrouter_provider_replays_tool_exchange_for_continuation() -> None:
     completions = RecordingCompletions([_final_response()])
     provider = OpenRouterModelProvider(

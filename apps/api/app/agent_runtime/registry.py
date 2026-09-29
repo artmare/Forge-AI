@@ -53,6 +53,7 @@ class ModelRegistry:
                         if raw.get("max_call_cost") is not None
                         else None
                     ),
+                    context_length=raw.get("context_length"),
                     supported_parameters=(
                         frozenset(str(value) for value in raw["supported_parameters"])
                         if isinstance(raw.get("supported_parameters"), list)

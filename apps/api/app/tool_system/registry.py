@@ -42,6 +42,10 @@ class ToolRegistry:
             read_max_bytes=resolved.tool_file_read_max_bytes,
             write_max_bytes=resolved.tool_file_write_max_bytes,
         )
+        if resolved.forge_browser_enabled and resolved.tools_enabled:
+            from app.tool_system.browser import browser_definition
+
+            registry.register(browser_definition(resolved))
         globally_enabled = resolved.tools_enabled
         for definition in filesystem_definitions(
             tools,
@@ -52,6 +56,10 @@ class ToolRegistry:
         ):
             registry.register(definition)
         if session is not None:
+            if resolved.forge_dev_mode_enabled:
+                from app.agent_runtime.specialists import specialist_definition
+
+                registry.register(specialist_definition(session, resolved))
             for definition in development_definitions(session, resolved):
                 registry.register(definition)
         return registry

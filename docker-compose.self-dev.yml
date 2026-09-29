@@ -1,0 +1,20 @@
+services:
+  forge-api:
+    environment:
+      FORGE_DEV_MODE_ENABLED: "true"
+      FORGE_SELF_DEVELOPMENT_ENABLED: "true"
+      FORGE_DEV_REPOSITORY_PATH: /forge-source
+      FORGE_DEV_ALLOWED_REPOSITORY: /forge-source
+      FORGE_DEV_WORKTREE_ROOT: /workspaces
+    volumes:
+      - ${FORGE_DEV_REPOSITORY_HOST_PATH:?set an absolute Forge source path}:/forge-source
+
+  forge-agent-worker:
+    environment:
+      FORGE_DEV_MODE_ENABLED: "true"
+      FORGE_SELF_DEVELOPMENT_ENABLED: "true"
+      FORGE_DEV_REPOSITORY_PATH: /forge-source
+      FORGE_DEV_ALLOWED_REPOSITORY: /forge-source
+      FORGE_DEV_WORKTREE_ROOT: /workspaces
+    volumes:
+      - ${FORGE_DEV_REPOSITORY_HOST_PATH:?set an absolute Forge source path}:/forge-source

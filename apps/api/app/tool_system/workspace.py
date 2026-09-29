@@ -20,6 +20,8 @@ class WorkspaceManager:
         root = self.configured_root.resolve(strict=False)
         root.mkdir(parents=True, exist_ok=True)
         workspace = root / str(company_id) / str(project_id)
+        self._reject_symlink(workspace.parent)
+        self._reject_symlink(workspace)
         workspace.mkdir(parents=True, exist_ok=True)
         resolved = workspace.resolve(strict=True)
         self._require_within(root, resolved)
@@ -60,6 +62,10 @@ class WorkspaceManager:
         if resolved_workspace != resolved_company / str(project_id):
             raise ToolSystemError(
                 "PATH_OUTSIDE_WORKSPACE", "Project workspace target is not the expected UUID path"
+            )
+        if (resolved_workspace / ".git").is_file():
+            raise ToolSystemError(
+                "WORKTREE_CLEANUP_REQUIRED", "Use checkpoint-aware self-development cleanup"
             )
         shutil.rmtree(resolved_workspace)
         try:

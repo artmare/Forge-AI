@@ -1,0 +1,277 @@
+import json
+import subprocess
+from pathlib import Path
+from uuid import UUID
+
+import pytest
+from sqlalchemy import select
+
+from app.agent_runtime.providers import MockModelProvider
+from app.agent_runtime.runtime import AgentRuntime
+from app.core.config import Settings
+from app.development.qa import DevelopmentWorkflowService
+from app.domain.exceptions import AgentRuntimeDomainError
+from app.domain.models import Event, ProjectKnowledgeIndex, ToolCall
+from app.infrastructure.database import get_session_factory
+from tests.helpers import create_agent, create_company, create_project, create_task, transition_task
+
+
+def final(summary="Completed", artifacts=None):
+    return {
+        "type": "final",
+        "result": {
+            "status": "completed",
+            "summary": summary,
+            "output": {"artifacts": artifacts or [], "details": []},
+            "notes": [],
+        },
+    }
+
+
+def tool(name, **arguments):
+    return {"type": "tool_call", "tool_name": name, "arguments": arguments}
+
+
+@pytest.mark.parametrize("replay", [False, True])
+async def test_runtime_rollover_retains_truth_and_blocks_mutation_replay(client, tmp_path, replay):
+    company = await create_company(client)
+    project = await create_project(client, company["id"])
+    agent = await create_agent(
+        client, company["id"], role="LEAD_ENGINEER", permissions={"filesystem.write": True}
+    )
+    task = await create_task(client, company["id"], project["id"], agent["id"])
+    await transition_task(client, task["id"], "QUEUED")
+    write = tool("filesystem.write", path="result.txt", content="ok")
+    provider = MockModelProvider(
+        responses=[write, write if replay else final(artifacts=["result.txt"])]
+    )
+    settings = Settings(
+        forge_dev_mode_enabled=True, forge_dev_context_limit=1024, tool_workspace_root=str(tmp_path)
+    )
+    async with get_session_factory()() as session:
+        runtime = AgentRuntime(session, settings=settings, provider=provider)
+        if replay:
+            with pytest.raises(AgentRuntimeDomainError) as error:
+                await runtime.execute(UUID(task["id"]))
+            assert error.value.code == "DUPLICATE_TOOL_LOOP"
+        else:
+            run = await runtime.execute(UUID(task["id"]))
+            assert run.status.value == "SUCCEEDED"
+        calls = list(
+            await session.scalars(select(ToolCall).where(ToolCall.task_id == UUID(task["id"])))
+        )
+        events = list(
+            await session.scalars(
+                select(Event).where(
+                    Event.task_id == UUID(task["id"]), Event.type == "DEV_CONTEXT_ROLLOVER"
+                )
+            )
+        )
+        assert len(calls) == 1
+        assert len(events) == 1
+        assert events[0].details["tool_steps"] == 1
+        assert provider.requests[1].tool_exchanges == ()
+        assert "Forge context handoff" in provider.requests[1].user_prompt
+
+
+async def test_isolated_self_development_test_debug_qa_checkpoint_memory(client, tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(source), *args], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    git("init", "--initial-branch=main")
+    git("config", "user.email", "forge@example.invalid")
+    git("config", "user.name", "Forge")
+    (source / "package.json").write_text(
+        json.dumps({"name": "fixture", "scripts": {"test": "node test.mjs"}})
+    )
+    (source / "add.mjs").write_text("export const add = (a, b) => 0;\n")
+    (source / "test.mjs").write_text(
+        "import {add} from './add.mjs'; import assert from 'node:assert/strict'; "
+        "assert.equal(add(1, 2), 3);\n"
+    )
+    git("add", ".")
+    git("commit", "-m", "fixture")
+    baseline = git("rev-parse", "HEAD")
+    company = await create_company(client)
+    project = await create_project(client, company["id"])
+    agent = await create_agent(
+        client,
+        company["id"],
+        role="LEAD_ENGINEER",
+        permissions={"filesystem.write": True, "development.execute": True, "git.read": True},
+    )
+    await create_agent(
+        client,
+        company["id"],
+        role="QA",
+        permissions={"development.execute": True, "git.read": True},
+    )
+    response = await client.post(
+        "/api/v1/tasks",
+        json={
+            "company_id": company["id"],
+            "project_id": project["id"],
+            "assigned_agent_id": agent["id"],
+            "type": "IMPLEMENTATION",
+            "kind": "DEVELOPMENT",
+            "title": "Repair add",
+            "input": {"self_development": True},
+            "acceptance_criteria": ["`add.mjs` exists"],
+            "max_iterations": 2,
+        },
+    )
+    assert response.status_code == 201
+    task = response.json()
+    await transition_task(client, task["id"], "QUEUED")
+    settings = Settings(
+        forge_dev_mode_enabled=True,
+        forge_self_development_enabled=True,
+        forge_dev_repository_path=str(source),
+        forge_dev_allowed_repository=str(source),
+        forge_dev_worktree_root="/workspaces",
+        tool_workspace_root="/workspaces",
+        product_qa_enabled=False,
+    )
+    provider = MockModelProvider(
+        responses=[
+            tool("development.execute", action="NODE_TEST"),
+            tool(
+                "filesystem.write", path="add.mjs", content="export const add = (a, b) => a + b;\n"
+            ),
+            tool("development.execute", action="NODE_TEST"),
+            tool("git.diff"),
+            tool("git.status"),
+            final("Repaired add.mjs; tests passed.", ["add.mjs"]),
+        ]
+    )
+    async with get_session_factory()() as session:
+        run = await AgentRuntime(session, settings=settings, provider=provider).execute(
+            UUID(task["id"]), defer_review=True
+        )
+        qa = await DevelopmentWorkflowService(session, settings=settings).finalize(
+            UUID(task["id"]), run.task_run_id
+        )
+        assert qa.decision.value == "PASS"
+        event = await session.scalar(
+            select(Event).where(
+                Event.task_id == UUID(task["id"]), Event.type == "DEV_WORKTREE_REVIEW_READY"
+            )
+        )
+        assert event.details["checkpoint_commit"] != baseline
+        brain = await session.scalar(
+            select(ProjectKnowledgeIndex).where(
+                ProjectKnowledgeIndex.project_id == UUID(project["id"])
+            )
+        )
+        assert brain.state["pending_review"]["status"] == "VERIFIED_PENDING_HUMAN_REVIEW"
+        assert git("rev-parse", "main") == baseline
+        assert (source / "add.mjs").read_text().endswith("=> 0;\n")
+    status = await client.get(f"/api/v1/tasks/{task['id']}/dev-mode")
+    assert status.status_code == 200
+    assert status.json()["human_promotion_required"]
+
+
+async def test_verified_routing_rejects_fake_tools_and_accounts_probes(
+    client, tmp_path, monkeypatch
+):
+    from dataclasses import replace
+
+    from pydantic import SecretStr
+
+    from app.agent_runtime.contracts import ModelResponse, ModelToolCall
+    from app.agent_runtime.dev_models import prober_for
+    from app.agent_runtime.probes import CapabilityProber
+    from app.domain.models import ModelCallRecord
+    from tests.test_dev_probes import FINAL
+
+    prober_for.cache_clear()
+
+    async def profiles(profiles, **kwargs):
+        return tuple(
+            replace(p, supported_parameters=frozenset({"tools", "response_format"}))
+            for p in profiles
+        )
+
+    monkeypatch.setattr("app.agent_runtime.runtime.refresh_profiles", profiles)
+    prober = CapabilityProber()
+    monkeypatch.setattr("app.agent_runtime.runtime.prober_for", lambda *args: prober)
+
+    class BehavioralProvider:
+        name, paid = "openrouter", False
+
+        async def generate(self, request):
+            if request.system_prompt == "Follow the probe protocol exactly.":
+                if not request.tools or request.tool_exchanges:
+                    return ModelResponse(output=FINAL)
+                if request.model == "fake:free":
+                    return ModelResponse(output="I called the tool")
+                return ModelResponse(
+                    output={},
+                    tool_call=ModelToolCall(
+                        "forge_probe.echo", {"value": "FORGE_PROBE_OK"}, "echo-1"
+                    ),
+                )
+            if not request.tool_exchanges:
+                return ModelResponse(
+                    output=tool("filesystem.write", path="ok.txt", content="ok"),
+                    tool_call=ModelToolCall(
+                        "filesystem.write", {"path": "ok.txt", "content": "ok"}, "write-1"
+                    ),
+                )
+            return ModelResponse(output=final(artifacts=["ok.txt"]))
+
+    monkeypatch.setattr(
+        "app.agent_runtime.runtime.provider_for_profile", lambda *args: BehavioralProvider()
+    )
+    company = await create_company(client)
+    project = await create_project(client, company["id"])
+    agent = await create_agent(
+        client, company["id"], role="LEAD_ENGINEER", permissions={"filesystem.write": True}
+    )
+    task = await create_task(client, company["id"], project["id"], agent["id"])
+    await transition_task(client, task["id"], "QUEUED")
+    settings = Settings(
+        forge_dev_mode_enabled=True,
+        openrouter_enabled=True,
+        openrouter_api_key=SecretStr("test-only"),
+        tool_workspace_root=str(tmp_path),
+        model_catalog=[
+            {
+                "alias": alias,
+                "model": model,
+                "provider": "openrouter",
+                "tier": "FREE",
+                "paid": False,
+                "capabilities": [
+                    "TEXT",
+                    "CODING",
+                    "REASONING",
+                    "STRUCTURED_OUTPUT",
+                    "TOOL_CALLING",
+                ],
+            }
+            for alias, model in [("a", "fake:free"), ("b", "healthy:free")]
+        ],
+    )
+    async with get_session_factory()() as session:
+        run = await AgentRuntime(session, settings=settings).execute(UUID(task["id"]))
+        assert run.model_id == "healthy:free"
+        events = list(
+            await session.scalars(
+                select(Event).where(
+                    Event.task_id == UUID(task["id"]), Event.type == "DEV_MODEL_ROUTING"
+                )
+            )
+        )
+        assert any(p["status"] == "protocol_failure" for e in events for p in e.details["probes"])
+        calls = list(
+            await session.scalars(
+                select(ModelCallRecord).where(ModelCallRecord.task_id == UUID(task["id"]))
+            )
+        )
+        assert len([c for c in calls if c.agent_role == "CAPABILITY_PROBE"]) == 6

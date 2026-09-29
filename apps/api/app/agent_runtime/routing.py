@@ -47,6 +47,7 @@ class ModelProfile:
     paid: bool = False
     max_call_cost: float | None = None
     supported_parameters: frozenset[str] | None = None
+    context_length: int | None = None
 
     def supports(self, required: frozenset[ModelCapability]) -> bool:
         return required.issubset(self.capabilities)

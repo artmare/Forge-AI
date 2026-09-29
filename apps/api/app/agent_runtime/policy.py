@@ -8,7 +8,10 @@ class ModelExecutionPolicy:
         self.settings = settings
 
     def authorize(self, provider: ModelProvider) -> None:
-        if provider.paid and not self.settings.allow_paid_model_calls:
+        if provider.paid and (
+            not self.settings.allow_paid_model_calls
+            or (self.settings.forge_dev_mode_enabled and self.settings.forge_dev_free_only)
+        ):
             raise PaidModelCallDisabledError()
         enabled = {
             "mock": True,

@@ -129,7 +129,24 @@ class DevelopmentExecutionService:
         await self._event(execution, "DEVELOPMENT_EXECUTION_STARTED", "Development action started.")
         await self.session.commit()
         try:
-            response = await self.runner.execute(
+            from app.development.self_workflow import SelfDevelopmentWorkflow
+
+            self_workflow = SelfDevelopmentWorkflow(self.session, self.settings)
+
+            async def execute_request(request: RunnerRequest) -> RunnerResponse:
+                if self_workflow.requested(task) and action.value.startswith("GIT_"):
+                    try:
+                        return await self_workflow.git_action(task, request)
+                    except ToolSystemError as exc:
+                        return RunnerResponse(
+                            request_id=request.request_id,
+                            status=DevelopmentExecutionStatus.FAILED,
+                            error_code=exc.code,
+                            error_message=exc.message,
+                        )
+                return await self.runner.execute(request)
+
+            response = await execute_request(
                 RunnerRequest(
                     request_id=execution.id,
                     action=action,
