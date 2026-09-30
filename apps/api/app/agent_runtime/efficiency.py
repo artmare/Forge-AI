@@ -176,6 +176,112 @@ class EfficientRuntimeService:
         await self.session.commit()
         return task
 
+    async def approve_execution_truth_resume(self, task_id: UUID) -> Task:
+        """Approve one recovery for one truth-failed AgentRun without changing any limit."""
+        task = await self.session.scalar(select(Task).where(Task.id == task_id).with_for_update())
+        failed_run = await self.session.scalar(
+            select(AgentRun)
+            .where(AgentRun.task_id == task_id)
+            .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+            .limit(1)
+        )
+        recovery_approval = await self.session.scalar(
+            select(Event)
+            .where(
+                Event.task_id == task_id,
+                Event.type.in_(
+                    (
+                        "DEV_CONTEXT_RESUME_APPROVED",
+                        "DEV_BUDGET_RESUME_APPROVED",
+                        "DEV_EXECUTION_TRUTH_RESUME_APPROVED",
+                    )
+                ),
+            )
+            .order_by(Event.created_at.desc())
+            .limit(1)
+        )
+        prior = list(
+            await self.session.scalars(
+                select(Event).where(
+                    Event.task_id == task_id,
+                    Event.type == "DEV_EXECUTION_TRUTH_RESUME_APPROVED",
+                )
+            )
+        )
+        already_approved = failed_run is not None and any(
+            item.details.get("failed_agent_run_id") == str(failed_run.id) for item in prior
+        )
+        eligible_codes = {
+            "UNVERIFIED_EXECUTION_CLAIM",
+            "EXECUTION_TRUTH_REPAIR_LIMIT_EXHAUSTED",
+        }
+        eligible = (
+            task is not None
+            and task.status == TaskStatus.FAILED
+            and task.iteration < task.max_iterations
+            and failed_run is not None
+            and failed_run.error_code in eligible_codes
+            and recovery_approval is not None
+            and failed_run.created_at > recovery_approval.created_at
+            and not already_approved
+        )
+        if not eligible or task is None or failed_run is None or recovery_approval is None:
+            raise AgentRuntimeDomainError(
+                "TASK_EXECUTION_TRUTH_RESUME_NOT_ALLOWED",
+                "Task is not eligible for bounded execution-evidence recovery",
+                409,
+            )
+        handoff_event_id = recovery_approval.details.get("handoff_event_id")
+        if not isinstance(handoff_event_id, str):
+            handoff = await self.session.scalar(
+                select(Event)
+                .where(
+                    Event.task_id == task_id,
+                    Event.type.in_(("DEV_CONTEXT_FAILURE_HANDOFF", "DEV_BUDGET_HANDOFF")),
+                    Event.created_at < recovery_approval.created_at,
+                )
+                .order_by(Event.created_at.desc())
+                .limit(1)
+            )
+            handoff_event_id = str(handoff.id) if handoff is not None else None
+        if handoff_event_id is None:
+            raise AgentRuntimeDomainError(
+                "TASK_EXECUTION_TRUTH_RESUME_NOT_ALLOWED",
+                "Recovery approval has no durable handoff",
+                409,
+            )
+        try:
+            budget = await self.enforce_budget(task)
+        except ModelBudgetExceeded as exc:
+            raise AgentRuntimeDomainError(
+                "TASK_EXECUTION_TRUTH_RESUME_BUDGET_EXHAUSTED",
+                "Cumulative model budget cannot fund another evidence-recovery attempt",
+                409,
+            ) from exc
+        task.status = TaskStatus.QUEUED
+        task.completed_at = None
+        task.terminal_reason = None
+        await EventFactory(self.session).create(
+            company_id=task.company_id,
+            project_id=task.project_id,
+            agent_id=task.assigned_agent_id,
+            task_id=task.id,
+            correlation_id=task.id,
+            event_type="DEV_EXECUTION_TRUTH_RESUME_APPROVED",
+            message="Human approved one evidence-aware continuation of the failed recovery run.",
+            payload={
+                "failed_agent_run_id": str(failed_run.id),
+                "failed_error_code": failed_run.error_code,
+                "prior_approval_event_id": str(recovery_approval.id),
+                "handoff_event_id": handoff_event_id,
+                "input_tokens_consumed": budget.consumed_input_tokens,
+                "model_calls_consumed": budget.consumed_model_calls,
+                "limits_unchanged": True,
+            },
+        )
+        await self.session.commit()
+        return task
+
     async def _ensure_resume_handoff(self, task: Task, budget: TaskRuntimeBudget) -> None:
         existing = await self.session.scalar(
             select(Event.id)

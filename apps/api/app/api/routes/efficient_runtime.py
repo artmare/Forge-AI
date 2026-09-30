@@ -245,6 +245,18 @@ async def dev_mode_status(task_id: UUID, session: Session) -> dict:
         select(TaskRuntimeMetric).where(TaskRuntimeMetric.task_id == task_id)
     )
     latest_rollover = next((e for e in events if e.type == "DEV_CONTEXT_ROLLOVER"), None)
+    latest_recovery_evidence = next(
+        (e for e in events if e.type == "DEV_RECOVERY_EVIDENCE_VERIFIED"), None
+    )
+    latest_truth_rejection = next(
+        (
+            e
+            for e in events
+            if e.type
+            in {"DEV_EXECUTION_TRUTH_REJECTED", "DEV_EXECUTION_TRUTH_REPAIR_REQUIRED"}
+        ),
+        None,
+    )
     return {
         "task_id": str(task_id),
         "status": task.status.value,
@@ -269,6 +281,23 @@ async def dev_mode_status(task_id: UUID, session: Session) -> dict:
         ],
         "specialist_calls": sum(e.type == "DEV_SPECIALIST_RESERVED" for e in events),
         "human_promotion_required": True,
+        "recovery_evidence": (
+            {
+                "checkpoint": latest_recovery_evidence.details.get("checkpoint"),
+                "verified": latest_recovery_evidence.details.get("verified", []),
+                "invalidated": latest_recovery_evidence.details.get("invalidated", []),
+                "truth_repair_attempts": sum(
+                    event.type == "DEV_EXECUTION_TRUTH_REPAIR_REQUIRED" for event in events
+                ),
+                "last_rejected_claim": (
+                    latest_truth_rejection.details.get("failed_claim")
+                    if latest_truth_rejection
+                    else None
+                ),
+            }
+            if latest_recovery_evidence
+            else None
+        ),
         "context_budget": (
             {
                 "input_tokens_consumed": budget.consumed_input_tokens,

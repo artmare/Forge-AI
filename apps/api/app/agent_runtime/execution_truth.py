@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
+from uuid import UUID
 
 from app.agent_runtime.builders import ContextRecord
 from app.agent_runtime.contracts import BaseAgentResult
@@ -18,11 +20,25 @@ class EvidenceKind(StrEnum):
     BROWSER = "BROWSER"
 
 
+class EvidenceProvenance(StrEnum):
+    CURRENT_RUN = "CURRENT_RUN"
+    RECOVERY_HISTORY = "RECOVERY_HISTORY"
+
+
 @dataclass(frozen=True)
 class ExecutionEvidence:
     kind: EvidenceKind
     tool: str
     reference: str | None = None
+    provenance: EvidenceProvenance = EvidenceProvenance.CURRENT_RUN
+    task_id: UUID | None = None
+    project_id: UUID | None = None
+    agent_run_id: UUID | None = None
+    tool_call_id: UUID | None = None
+    artifact_sha256: str | None = None
+    checkpoint: str | None = None
+    executed_at: datetime | None = None
+    verified_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -31,6 +47,7 @@ class ExecutionTruthDecision:
     code: str
     message: str
     evidence: tuple[ExecutionEvidence, ...] = ()
+    failed_claim: dict[str, Any] | None = None
 
 
 class ExecutionTruthValidator:
@@ -93,8 +110,25 @@ class ExecutionTruthValidator:
         context: ContextRecord,
         result: BaseAgentResult,
         observations: list[ToolObservation],
+        *,
+        historical_evidence: tuple[ExecutionEvidence, ...] = (),
+        current_task_id: UUID | None = None,
+        current_project_id: UUID | None = None,
+        current_agent_run_id: UUID | None = None,
     ) -> ExecutionTruthDecision:
-        evidence = cls.collect(observations)
+        current_evidence = cls.collect(
+            observations,
+            task_id=current_task_id,
+            project_id=current_project_id,
+            agent_run_id=current_agent_run_id,
+        )
+        trusted_history = tuple(
+            item
+            for item in historical_evidence
+            if (current_task_id is None or item.task_id == current_task_id)
+            and (current_project_id is None or item.project_id == current_project_id)
+        )
+        evidence = (*current_evidence, *trusted_history)
         artifacts = result.output.get("artifacts", [])
         if not isinstance(artifacts, list):
             return ExecutionTruthDecision(
@@ -142,10 +176,26 @@ class ExecutionTruthValidator:
                 )
             claim_kind = claim.get("kind")
             claim_reference = claim.get("reference")
+            claim_scope = str(claim.get("scope") or "CURRENT_RUN").upper()
+            claim_tool_call_id = claim.get("tool_call_id")
             matching_evidence = [item for item in evidence if item.kind.value == claim_kind]
+            expected_provenance = (
+                EvidenceProvenance.RECOVERY_HISTORY
+                if claim_scope == "HISTORICAL"
+                else EvidenceProvenance.CURRENT_RUN
+            )
+            matching_evidence = [
+                item for item in matching_evidence if item.provenance == expected_provenance
+            ]
             if isinstance(claim_reference, str):
                 matching_evidence = [
                     item for item in matching_evidence if item.reference == claim_reference
+                ]
+            if isinstance(claim_tool_call_id, str):
+                matching_evidence = [
+                    item
+                    for item in matching_evidence
+                    if str(item.tool_call_id) == claim_tool_call_id
                 ]
             if not matching_evidence:
                 return ExecutionTruthDecision(
@@ -153,6 +203,12 @@ class ExecutionTruthValidator:
                     "UNVERIFIED_EXECUTION_CLAIM",
                     "A structured execution claim has no matching Forge evidence.",
                     evidence,
+                    {
+                        "kind": claim_kind,
+                        "reference": claim_reference,
+                        "scope": claim_scope,
+                        "tool_call_id": claim_tool_call_id,
+                    },
                 )
 
         prose = "\n".join(
@@ -160,7 +216,13 @@ class ExecutionTruthValidator:
             + [str(item) for item in result.output.get("details", []) if isinstance(item, str)]
             + result.notes
         )
-        if cls._TEST_SUCCESS_CLAIM.search(prose) and EvidenceKind.TEST.value not in evidence_kinds:
+        current_kinds = {item.kind.value for item in current_evidence}
+        historical_qualifier = re.search(
+            r"\b(?:previous|earlier|historical|recovery checkpoint|prior execution)\b",
+            prose,
+            re.IGNORECASE,
+        )
+        if cls._TEST_SUCCESS_CLAIM.search(prose) and EvidenceKind.TEST.value not in current_kinds:
             return ExecutionTruthDecision(
                 False,
                 "UNVERIFIED_EXECUTION_CLAIM",
@@ -174,7 +236,10 @@ class ExecutionTruthValidator:
             (cls._BROWSER_CLAIM, EvidenceKind.BROWSER, "browser verification"),
         )
         for pattern, kind, description in prose_requirements:
-            if pattern.search(prose) and kind.value not in evidence_kinds:
+            if not pattern.search(prose):
+                continue
+            allowed_kinds = evidence_kinds if historical_qualifier else current_kinds
+            if kind.value not in allowed_kinds:
                 return ExecutionTruthDecision(
                     False,
                     "UNVERIFIED_EXECUTION_CLAIM",
@@ -189,7 +254,14 @@ class ExecutionTruthValidator:
         )
 
     @classmethod
-    def collect(cls, observations: list[ToolObservation]) -> tuple[ExecutionEvidence, ...]:
+    def collect(
+        cls,
+        observations: list[ToolObservation],
+        *,
+        task_id: UUID | None = None,
+        project_id: UUID | None = None,
+        agent_run_id: UUID | None = None,
+    ) -> tuple[ExecutionEvidence, ...]:
         collected: list[ExecutionEvidence] = []
         for observation in observations:
             if observation.status != "success":
@@ -202,6 +274,10 @@ class ExecutionTruthValidator:
                         EvidenceKind.FILE_MUTATION,
                         observation.tool,
                         str(path) if isinstance(path, str) else None,
+                        task_id=task_id,
+                        project_id=project_id,
+                        agent_run_id=agent_run_id,
+                        tool_call_id=observation.tool_call_id,
                     )
                 )
             elif observation.tool in cls._COMMAND_TOOLS:
@@ -221,17 +297,36 @@ class ExecutionTruthValidator:
                         kind,
                         observation.tool,
                         str(action) if action is not None else None,
+                        task_id=task_id,
+                        project_id=project_id,
+                        agent_run_id=agent_run_id,
+                        tool_call_id=observation.tool_call_id,
                     )
                 )
             elif observation.tool.startswith("git."):
                 if str(result.get("status", "SUCCEEDED")).upper() == "SUCCEEDED":
-                    collected.append(ExecutionEvidence(EvidenceKind.GIT, observation.tool))
+                    collected.append(
+                        ExecutionEvidence(
+                            EvidenceKind.GIT,
+                            observation.tool,
+                            task_id=task_id,
+                            project_id=project_id,
+                            agent_run_id=agent_run_id,
+                            tool_call_id=observation.tool_call_id,
+                        )
+                    )
             elif observation.tool == "browser.capture" and (
                 result.get("rendered") is True and result.get("artifact") and result.get("sha256")
             ):
                 collected.append(
                     ExecutionEvidence(
-                        EvidenceKind.BROWSER, observation.tool, str(result["artifact"])
+                        EvidenceKind.BROWSER,
+                        observation.tool,
+                        str(result["artifact"]),
+                        task_id=task_id,
+                        project_id=project_id,
+                        agent_run_id=agent_run_id,
+                        tool_call_id=observation.tool_call_id,
                     )
                 )
         return tuple(collected)

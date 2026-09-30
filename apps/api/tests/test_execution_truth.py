@@ -2,7 +2,12 @@ from uuid import uuid4
 
 from app.agent_runtime.builders import ContextRecord
 from app.agent_runtime.contracts import BaseAgentResult
-from app.agent_runtime.execution_truth import EvidenceKind, ExecutionTruthValidator
+from app.agent_runtime.execution_truth import (
+    EvidenceKind,
+    EvidenceProvenance,
+    ExecutionEvidence,
+    ExecutionTruthValidator,
+)
 from app.tool_system.contracts import ToolObservation
 
 
@@ -87,6 +92,95 @@ def test_successful_forge_mutation_is_authoritative_evidence() -> None:
 
     assert decision.accepted
     assert decision.evidence[0].kind == EvidenceKind.FILE_MUTATION
+
+
+def test_revalidated_historical_evidence_preserves_provenance_and_supports_history() -> None:
+    original_run = uuid4()
+    original_call = uuid4()
+    task_id = uuid4()
+    project_id = uuid4()
+    historical = ExecutionEvidence(
+        kind=EvidenceKind.FILE_MUTATION,
+        tool="filesystem.write",
+        reference="hello.txt",
+        provenance=EvidenceProvenance.RECOVERY_HISTORY,
+        task_id=task_id,
+        project_id=project_id,
+        agent_run_id=original_run,
+        tool_call_id=original_call,
+        artifact_sha256="a" * 64,
+        checkpoint="deadbee",
+    )
+    result = _result(["hello.txt"], "The previous execution created hello.txt.")
+    result.output["execution_claims"] = [
+        {
+            "kind": "FILE_MUTATION",
+            "reference": "hello.txt",
+            "scope": "HISTORICAL",
+            "tool_call_id": str(original_call),
+        }
+    ]
+
+    decision = ExecutionTruthValidator.validate(
+        _context(), result, [], historical_evidence=(historical,)
+    )
+
+    assert decision.accepted
+    assert decision.evidence[0].agent_run_id == original_run
+    assert decision.evidence[0].tool_call_id == original_call
+
+
+def test_historical_evidence_cannot_prove_current_run_performed_mutation() -> None:
+    historical = ExecutionEvidence(
+        kind=EvidenceKind.FILE_MUTATION,
+        tool="filesystem.write",
+        reference="hello.txt",
+        provenance=EvidenceProvenance.RECOVERY_HISTORY,
+        tool_call_id=uuid4(),
+    )
+    result = _result(["hello.txt"], "Created hello.txt in this run.")
+    result.output["execution_claims"] = [
+        {"kind": "FILE_MUTATION", "reference": "hello.txt", "scope": "CURRENT_RUN"}
+    ]
+
+    decision = ExecutionTruthValidator.validate(
+        _context(), result, [], historical_evidence=(historical,)
+    )
+
+    assert not decision.accepted
+    assert decision.failed_claim == {
+        "kind": "FILE_MUTATION",
+        "reference": "hello.txt",
+        "scope": "CURRENT_RUN",
+        "tool_call_id": None,
+    }
+
+
+def test_historical_evidence_from_another_task_or_workspace_is_rejected() -> None:
+    task_id = uuid4()
+    project_id = uuid4()
+    historical = ExecutionEvidence(
+        kind=EvidenceKind.FILE_MUTATION,
+        tool="filesystem.write",
+        reference="hello.txt",
+        provenance=EvidenceProvenance.RECOVERY_HISTORY,
+        task_id=uuid4(),
+        project_id=uuid4(),
+        tool_call_id=uuid4(),
+    )
+    result = _result(["hello.txt"], "The previous execution created hello.txt.")
+
+    decision = ExecutionTruthValidator.validate(
+        _context(),
+        result,
+        [],
+        historical_evidence=(historical,),
+        current_task_id=task_id,
+        current_project_id=project_id,
+    )
+
+    assert not decision.accepted
+    assert decision.evidence == ()
 
 
 def test_failed_forge_mutation_does_not_verify_a_write_claim() -> None:

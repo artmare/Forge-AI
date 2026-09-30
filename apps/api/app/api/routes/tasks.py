@@ -102,6 +102,14 @@ async def resume_context(task_id: UUID, session: Session) -> TaskResponse:
     return TaskResponse.model_validate(task)
 
 
+@router.post("/{task_id}/resume-recovery", response_model=TaskResponse)
+async def resume_recovery(task_id: UUID, session: Session) -> TaskResponse:
+    task = await EfficientRuntimeService(
+        session, get_settings()
+    ).approve_execution_truth_resume(task_id)
+    return TaskResponse.model_validate(task)
+
+
 @router.post("/{task_id}/execute", response_model=AgentRunResponse)
 async def execute_task(
     task_id: UUID, payload: ExecuteTaskRequest, session: Session

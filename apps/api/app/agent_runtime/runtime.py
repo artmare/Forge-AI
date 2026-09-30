@@ -5,7 +5,6 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
-from functools import partial
 from time import perf_counter
 from typing import Any
 from uuid import UUID
@@ -35,11 +34,16 @@ from app.agent_runtime.dev_models import (
 )
 from app.agent_runtime.economics import ModelEconomicsService
 from app.agent_runtime.efficiency import EfficientRuntimeService, ModelBudgetExceeded
-from app.agent_runtime.execution_truth import ExecutionTruthValidator
+from app.agent_runtime.execution_truth import (
+    ExecutionEvidence,
+    ExecutionTruthDecision,
+    ExecutionTruthValidator,
+)
 from app.agent_runtime.policy import ModelExecutionPolicy
 from app.agent_runtime.probes import ProbeCapability
 from app.agent_runtime.progress import DevelopmentProgress
 from app.agent_runtime.providers import provider_for_profile
+from app.agent_runtime.recovery_evidence import RecoveryEvidenceService, RecoveryEvidenceSnapshot
 from app.agent_runtime.registry import ModelRegistry
 from app.agent_runtime.routing import (
     EconomicTier,
@@ -115,6 +119,12 @@ NORMALIZED_PROVIDER_CODES = frozenset(
         "PROVIDER_TOOL_SCHEMA_INVALID",
         "PROVIDER_TOOL_PROTOCOL_ERROR",
         "UNVERIFIED_EXECUTION_CLAIM",
+        "EXECUTION_TRUTH_REPAIR_LIMIT_EXHAUSTED",
+        "RECOVERY_EVIDENCE_HANDOFF_MISSING",
+        "RECOVERY_EVIDENCE_CHECKPOINT_INVALID",
+        "RECOVERY_EVIDENCE_CHECKPOINT_MISMATCH",
+        "RECOVERY_EVIDENCE_WORKSPACE_UNAVAILABLE",
+        "RECOVERY_EVIDENCE_WORKSPACE_UNSAFE",
     }
 )
 
@@ -167,6 +177,11 @@ class AgentRuntime:
         if initial_task is not None and SelfDevelopmentWorkflow.requested(initial_task):
             await SelfDevelopmentWorkflow(self.session, self.settings).prepare(initial_task)
         context = await ContextBuilder(self.session).build(task_id)
+        recovery = (
+            await RecoveryEvidenceService(self.session, self.settings).revalidate(initial_task)
+            if initial_task is not None
+            else RecoveryEvidenceSnapshot()
+        )
         observations: list[ToolObservation] = []
         tool_exchanges: list[ModelToolExchange] = []
         conversation_start_prompt: str | None = None
@@ -181,6 +196,20 @@ class AgentRuntime:
         tool_steps, duplicate_signals = await self._restore_durable_context(
             task_id, observations, rollover, progress
         )
+        if recovery.active:
+            rollover.handoff["recovery_evidence"] = recovery.prompt_summary()
+            if recovery.evidence:
+                rollover.handoff["next_action"] = (
+                    "Return a precise final result using HISTORICAL scope for the verified "
+                    "earlier writes. Do not claim this AgentRun recreated them. Deterministic "
+                    "QA will run after the Developer result."
+                )
+            else:
+                rollover.handoff["next_action"] = (
+                    "Historical artifact evidence is stale or missing. Inspect only the listed "
+                    "invalidated artifacts and repair the current workspace if required."
+                )
+        truth_repair_attempts = recovery.truth_repair_attempts
 
         while True:
             await self._assert_execution_allowed()
@@ -226,7 +255,9 @@ class AgentRuntime:
                 turn_number=tool_steps + 1,
                 budget_warning=budget.warning_active,
                 duplicate_warning=duplicate_signals > 0 or progress.stagnation_signals > 0,
-                force_final=self._developer_ready_for_final(context, observations),
+                force_final=self._developer_ready_for_final(
+                    context, observations, recovery.evidence
+                ),
             )
             if rollover.handoff:
                 handoff_json = json.dumps(rollover.handoff, separators=(",", ":"))
@@ -412,7 +443,9 @@ class AgentRuntime:
                     turn_number=tool_steps + 1,
                     budget_warning=budget.warning_active,
                     duplicate_warning=duplicate_signals > 0 or progress.stagnation_signals > 0,
-                    force_final=self._developer_ready_for_final(context, observations),
+                    force_final=self._developer_ready_for_final(
+                        context, observations, recovery.evidence
+                    ),
                 )
                 handoff_json = json.dumps(handoff, separators=(",", ":"))
                 conversation_start_prompt = (
@@ -510,11 +543,6 @@ class AgentRuntime:
                 capabilities,
                 current_task,
                 str(context.agent.get("role", "GENERAL")),
-                validate_response=partial(
-                    self._validate_execution_truth_response,
-                    context=context,
-                    observations=observations,
-                ),
             )
             if not await self._execution_allowed():
                 error = ProviderCallError("AGENT_RUNTIME_ERROR", "Durable execution lease was lost")
@@ -546,14 +574,58 @@ class AgentRuntime:
                 raise self._public_error(error)
 
             if isinstance(turn, FinalTurn):
-                truth = ExecutionTruthValidator.validate(context, turn.result, observations)
+                truth = ExecutionTruthValidator.validate(
+                    context,
+                    turn.result,
+                    observations,
+                    historical_evidence=recovery.evidence,
+                    current_task_id=task.id,
+                    current_project_id=task.project_id,
+                    current_agent_run_id=run.id,
+                )
                 if not truth.accepted:
                     error = ProviderCallError(
                         truth.code,
                         truth.message,
                         category="TOOL_PROTOCOL",
                     )
-                    await self._fail(run.id, error)
+                    if recovery.active:
+                        truth_repair_attempts += 1
+                        rejected = await self._reject_final_for_repair(
+                            run.id,
+                            turn,
+                            provider_response,
+                            error,
+                            truth,
+                            truth_repair_attempts,
+                        )
+                        if truth_repair_attempts < self.settings.forge_dev_tool_repair_limit:
+                            rollover.handoff["execution_truth_correction"] = (
+                                self._truth_correction(truth, recovery)
+                            )
+                            rollover.handoff["next_action"] = (
+                                "Correct only the unsupported completion claim described in "
+                                "execution_truth_correction. Do not repeat repository mutations."
+                            )
+                            continue
+                        terminal = ProviderCallError(
+                            "EXECUTION_TRUTH_REPAIR_LIMIT_EXHAUSTED",
+                            "The recovery model repeated unsupported execution claims",
+                            category="TOOL_PROTOCOL",
+                        )
+                        await self._fail_task(
+                            rejected,
+                            terminal,
+                            details={
+                                "phase": "EXECUTING",
+                                "repair_attempts": truth_repair_attempts,
+                                "failed_claim": truth.failed_claim,
+                            },
+                        )
+                        raise self._public_error(terminal)
+                    await self._fail_final_with_evidence(
+                        run.id, turn, provider_response, error, truth
+                    )
                     raise self._public_error(error)
                 completed = await self._complete_turn(
                     run.id,
@@ -839,7 +911,9 @@ class AgentRuntime:
                 result=call.result,
                 error=call.error,
             )
-            observations.append(observation)
+            # Historical calls rebuild counters, caches, and mutation fingerprints. They are
+            # intentionally not appended to the new run's observations: cross-run evidence has
+            # separate provenance and must pass current workspace revalidation.
             progress.record(
                 ToolRequestTurn(
                     type="tool_call",
@@ -1156,7 +1230,9 @@ class AgentRuntime:
 
     @staticmethod
     def _developer_ready_for_final(
-        context: ContextRecord, observations: list[ToolObservation]
+        context: ContextRecord,
+        observations: list[ToolObservation],
+        historical_evidence: tuple[ExecutionEvidence, ...] = (),
     ) -> bool:
         """Require a final-only turn after this Developer run has enough durable evidence."""
         if str(context.agent.get("role", "")).upper() not in {
@@ -1213,6 +1289,19 @@ class AgentRuntime:
                 "PYTHON_LINT",
             }
         )
+        if historical_evidence and not required_actions:
+            verified_paths = {
+                item.reference for item in historical_evidence if item.reference is not None
+            }
+            task_input = context.task.get("input", {})
+            deliverables = (
+                {str(item) for item in task_input.get("deliverables", [])}
+                if isinstance(task_input, dict)
+                and isinstance(task_input.get("deliverables"), list)
+                else set()
+            )
+            if verified_paths and (not deliverables or deliverables.issubset(verified_paths)):
+                return True
         has_mutation = bool({"filesystem.write", "filesystem.patch"}.intersection(tools))
         if required_actions:
             return required_actions.issubset(executed_actions)
@@ -1288,7 +1377,15 @@ class AgentRuntime:
                 provider_health=health,
             )
         )
-        bounded = selections[: max(self.settings.model_fallback_max_candidates, 1)]
+        unique_selections: list[ModelSelection] = []
+        seen_selection_keys: set[tuple[str, str]] = set()
+        for selection in selections:
+            key = (selection.profile.provider, selection.profile.model_id)
+            if key in seen_selection_keys:
+                continue
+            seen_selection_keys.add(key)
+            unique_selections.append(selection)
+        bounded = unique_selections[: max(self.settings.model_fallback_max_candidates, 1)]
         if self.settings.forge_dev_mode_enabled:
             accepted = []
             rejected = []
@@ -1297,21 +1394,26 @@ class AgentRuntime:
                 (selection.profile.provider, selection.profile.model_id) for selection in bounded
             }
             health_states = health
+            profile_groups: dict[tuple[str, str], list[ModelProfile]] = {}
             for profile in profiles:
+                profile_groups.setdefault((profile.provider, profile.model_id), []).append(profile)
+            for identity, variants in profile_groups.items():
                 reason = None
-                if not profile.enabled:
+                enabled = [profile for profile in variants if profile.enabled]
+                capable = [profile for profile in enabled if profile.supports(capabilities)]
+                if not enabled:
                     reason = "DISABLED_OR_PRICE_UNVERIFIED"
-                elif not profile.supports(capabilities):
+                elif not capable:
                     reason = "DECLARED_CAPABILITY_MISSING"
                 elif (
-                    health_states.get((profile.provider, profile.model_id), "HEALTHY") != "HEALTHY"
+                    health_states.get(identity, "HEALTHY") != "HEALTHY"
                 ):
                     reason = "HEALTH_COOLDOWN"
-                elif (profile.provider, profile.model_id) not in bounded_keys:
+                elif identity not in bounded_keys:
                     reason = "FALLBACK_BOUND"
                 if reason:
                     rejected.append(
-                        {"provider": profile.provider, "model": profile.model_id, "reason": reason}
+                        {"provider": identity[0], "model": identity[1], "reason": reason}
                     )
             prober = prober_for(
                 self.settings.openrouter_base_url,
@@ -1805,6 +1907,141 @@ class AgentRuntime:
         except Exception:
             await self.session.rollback()
             raise
+
+    async def _reject_final_for_repair(
+        self,
+        run_id: UUID,
+        turn: FinalTurn,
+        response: ModelResponse,
+        error: ProviderCallError,
+        truth: ExecutionTruthDecision,
+        repair_attempt: int,
+    ) -> AgentRun:
+        """Persist a truth-invalid recovery turn without ending its TaskRun."""
+        run = await self.agent_runs.get_for_update(run_id)
+        if run is None or run.status != AgentRunStatus.RUNNING:
+            raise AgentRuntimeDomainError("AGENT_RUNTIME_ERROR", "Agent run is not running")
+        task = await self.tasks.get_current(run.task_id)
+        if task is None:
+            raise AgentRuntimeDomainError("AGENT_RUNTIME_ERROR", "Task was not found")
+        usage = response.usage
+        run.status = AgentRunStatus.FAILED
+        run.response = turn.model_dump(mode="json")
+        run.provider_response_id = response.response_id
+        run.error_code = error.code
+        run.error_message = error.message
+        run.input_tokens = usage.input_tokens
+        run.output_tokens = usage.output_tokens
+        run.cached_tokens = usage.cached_input_tokens
+        run.total_tokens = usage.total_tokens
+        run.estimated_cost = self.costs.estimate(run.provider, run.model_id, usage)
+        run.completed_at = datetime.now(UTC)
+        await self._failed_event(run, task, error)
+        await self.events.create(
+            company_id=task.company_id,
+            project_id=task.project_id,
+            agent_id=task.assigned_agent_id,
+            task_id=task.id,
+            correlation_id=task.id,
+            event_type="DEV_EXECUTION_TRUTH_REPAIR_REQUIRED",
+            message="Recovery completion was rejected and one bounded correction was requested.",
+            payload={
+                "agent_run_id": str(run.id),
+                "repair_attempt": repair_attempt,
+                "repair_limit": self.settings.forge_dev_tool_repair_limit,
+                "failed_claim": truth.failed_claim,
+                "available_evidence": [
+                    {
+                        "kind": item.kind.value,
+                        "reference": item.reference,
+                        "provenance": item.provenance.value,
+                        "agent_run_id": str(item.agent_run_id) if item.agent_run_id else None,
+                        "tool_call_id": str(item.tool_call_id) if item.tool_call_id else None,
+                    }
+                    for item in truth.evidence[:30]
+                ],
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cached_tokens": usage.cached_input_tokens,
+            },
+        )
+        await self.session.commit()
+        return run
+
+    async def _fail_final_with_evidence(
+        self,
+        run_id: UUID,
+        turn: FinalTurn,
+        response: ModelResponse,
+        error: ProviderCallError,
+        truth: ExecutionTruthDecision,
+    ) -> AgentRun:
+        """Persist rejected structured output and real usage before terminal failure."""
+        run = await self.agent_runs.get_for_update(run_id)
+        if run is None or run.status != AgentRunStatus.RUNNING:
+            raise AgentRuntimeDomainError("AGENT_RUNTIME_ERROR", "Agent run is not running")
+        task = await self.tasks.get_current(run.task_id)
+        if task is None:
+            raise AgentRuntimeDomainError("AGENT_RUNTIME_ERROR", "Task was not found")
+        usage = response.usage
+        run.response = turn.model_dump(mode="json")
+        run.provider_response_id = response.response_id
+        run.input_tokens = usage.input_tokens
+        run.output_tokens = usage.output_tokens
+        run.cached_tokens = usage.cached_input_tokens
+        run.total_tokens = usage.total_tokens
+        run.estimated_cost = self.costs.estimate(run.provider, run.model_id, usage)
+        await self.events.create(
+            company_id=task.company_id,
+            project_id=task.project_id,
+            agent_id=task.assigned_agent_id,
+            task_id=task.id,
+            correlation_id=task.id,
+            event_type="DEV_EXECUTION_TRUTH_REJECTED",
+            message="Structured completion was rejected against Forge execution evidence.",
+            payload={
+                "agent_run_id": str(run.id),
+                "failed_claim": truth.failed_claim,
+                "evidence_count": len(truth.evidence),
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cached_tokens": usage.cached_input_tokens,
+            },
+        )
+        await self.session.flush()
+        return await self._fail(run.id, error)
+
+    @staticmethod
+    def _truth_correction(
+        truth: ExecutionTruthDecision, recovery: RecoveryEvidenceSnapshot
+    ) -> dict[str, Any]:
+        claim = truth.failed_claim or {}
+        reference = claim.get("reference")
+        matching = next(
+            (item for item in recovery.evidence if item.reference == reference),
+            None,
+        )
+        correction: dict[str, Any] = {
+            "error": truth.code,
+            "message": truth.message,
+            "unsupported_claim": claim,
+            "instruction": (
+                "Remove the unsupported claim. Claim only actions backed by the listed Forge "
+                "evidence; do not request or imply mutation replay."
+            ),
+        }
+        if matching is not None:
+            correction["supported_historical_claim"] = {
+                "kind": matching.kind.value,
+                "reference": matching.reference,
+                "scope": "HISTORICAL",
+                "tool_call_id": str(matching.tool_call_id),
+            }
+            correction["instruction"] = (
+                "This artifact is supported only as historical work that remains present. Use "
+                "the exact supported_historical_claim fields and do not say this AgentRun wrote it."
+            )
+        return correction
 
     async def _fail_task(
         self,

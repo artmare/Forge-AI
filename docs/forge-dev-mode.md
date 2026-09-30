@@ -21,8 +21,8 @@ for permissions, execution, task state, durable history, budgets, routing, and v
 6. The provider continuation receives the native call identity and the structured Forge
    observation.
 7. `ExecutionTruthValidator` checks the final result against successful Forge observations before
-   task completion. A false execution claim becomes a protocol failure and triggers bounded model
-   fallback when another compatible candidate exists.
+   task completion. A false execution claim becomes a protocol failure. During an approved
+   recovery, Forge may request one bounded correction; it never treats model fallback as proof.
 
 Model prose is never execution evidence. Durable `ToolCall`, development execution, Git,
 filesystem, QA, and test state are authoritative.
@@ -167,6 +167,23 @@ If that stop was specifically `MODEL_CONTEXT_ROLLOVER_LIMIT_EXHAUSTED` and the r
 exists, a human may approve one continuation with `POST /api/v1/tasks/{task_id}/resume-context`.
 The approval does not add rollovers, calls, tool steps, or tokens, and it does not reset mutation
 fingerprints or failure history. A second approval for the same failure is rejected.
+
+Recovery keeps historical execution separate from current execution. Forge does not copy an old
+`ToolCall` into the new `AgentRun`. Instead, `RecoveryEvidenceService` loads successful writes from
+the same task and approved handoff, preserves their original AgentRun/ToolCall IDs, and revalidates
+each current file against both the original write content hash and the task-tagged Git checkpoint.
+Missing, changed, unsafe, cross-task, and cross-workspace artifacts are excluded. The compact
+handoff labels accepted evidence as `HISTORICAL`; a structured historical claim must include that
+scope and the original ToolCall ID. Current-run claims still require current-run observations, and
+historical tests never prove tests after later source changes.
+
+If a recovery model returns a premature unsupported final result, Forge stores the exact structured
+response, real provider usage, failed claim, and evidence summary, then issues only a bounded claim
+correction. Repetition stops as `EXECUTION_TRUTH_REPAIR_LIMIT_EXHAUSTED`. A human may approve one
+new attempt for that specific failed AgentRun through
+`POST /api/v1/tasks/{task_id}/resume-recovery`; the endpoint requires an earlier approved recovery
+chain, refuses reuse for the same failed run, preserves the original iteration/model/token/tool
+limits, and never changes the free-only policy.
 
 ## Lead Engineer and specialists
 
@@ -322,6 +339,12 @@ blocker. A tiny task that repeatedly crosses only the task-budget warning thresh
 runtime regression: that soft threshold is a one-time checkpoint, while model-window pressure may
 still cause later rollovers. Use the context-resume endpoint only after confirming the checkpoint;
 it is a single bounded continuation, not a retry-limit reset.
+
+For recovery truth failures, inspect `DEV_RECOVERY_EVIDENCE_VERIFIED`,
+`DEV_EXECUTION_TRUTH_REJECTED`, and `DEV_EXECUTION_TRUTH_REPAIR_REQUIRED`. The events expose only
+bounded claims, provenance IDs, artifact hashes, usage, and invalidation reasons. They do not store
+prompts or secrets. Use `resume-recovery` only for the exact failed AgentRun after reviewing those
+events and the checkpoint.
 
 ## Security and cost boundaries
 

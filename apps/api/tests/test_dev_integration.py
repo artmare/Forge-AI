@@ -380,6 +380,16 @@ async def test_verified_routing_rejects_fake_tools_and_accounts_probes(
                 ],
             }
             for alias, model in [("a", "fake:free"), ("b", "healthy:free")]
+        ]
+        + [
+            {
+                "alias": "healthy-metadata-duplicate",
+                "model": "healthy:free",
+                "provider": "openrouter",
+                "tier": "FREE",
+                "paid": False,
+                "capabilities": ["TEXT"],
+            }
         ],
     )
     async with get_session_factory()() as session:
@@ -393,6 +403,12 @@ async def test_verified_routing_rejects_fake_tools_and_accounts_probes(
             )
         )
         assert any(p["status"] == "protocol_failure" for e in events for p in e.details["probes"])
+        assert not any(
+            rejected.get("model") == "healthy:free"
+            and rejected.get("reason") == "DECLARED_CAPABILITY_MISSING"
+            for event in events
+            for rejected in event.details["rejected"]
+        )
         calls = list(
             await session.scalars(
                 select(ModelCallRecord).where(ModelCallRecord.task_id == UUID(task["id"]))

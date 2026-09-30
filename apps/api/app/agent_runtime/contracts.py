@@ -27,6 +27,11 @@ AgentResultOutput = Annotated[
                                 ],
                             },
                             "reference": {"type": ["string", "null"]},
+                            "scope": {
+                                "type": ["string", "null"],
+                                "enum": ["CURRENT_RUN", "HISTORICAL", None],
+                            },
+                            "tool_call_id": {"type": ["string", "null"]},
                         },
                         "required": ["kind", "reference"],
                         "additionalProperties": False,
