@@ -102,18 +102,20 @@ contain bounded goal, completed work, diff, decisions, tests, failures, question
 
 At the configured fraction of the selected model's context limit (or the conservative configured
 fallback), Forge writes a compact checkpoint and creates a fresh transport context for the same
-task. The handoff contains task/goal/phase, completed authoritative tool results, inspected and
-modified files, diff summary, test state, failures, open questions, counters, and next action. It
-does not copy the transcript. Agent/task identity, durable observations, tool-step count,
+task. The continuation snapshot contains task/goal/phase, unique successful tool summaries,
+modified-file hashes and bounded summaries, authoritative Git status/diff hashes and previews,
+test state, unresolved failures, mutation fingerprints, remaining validation, remaining budgets,
+progress since the prior rollover, and one concrete next action. It does not copy the transcript or
+full file bodies. Agent/task identity, durable observations, tool-step count,
 duplicate/fallback/budget state, and permissions remain unchanged. Successful mutation fingerprints
 survive the rollover, so an already-executed write/patch/commit cannot be replayed.
 
 Forge distinguishes model context pressure from the cumulative task input-token budget. Before
 each provider call it estimates the actual transport payload, including the system prompt, native
 tool exchanges, schemas, and a configurable next-turn reserve. Approaching the model context
-threshold causes `DEV_CONTEXT_ROLLOVER`; a projected request that approaches the task budget's
-warning threshold also rolls over early so repeated native continuation history does not consume
-the remaining task allowance. A compacted request that still exceeds the model window fails as
+threshold causes `DEV_CONTEXT_ROLLOVER`; crossing the task budget warning threshold creates one
+early checkpoint per task execution so repeated native continuation history cannot consume the
+rollover allowance on every subsequent turn. A compacted request that still exceeds the model window fails as
 `MODEL_CONTEXT_LIMIT_EXCEEDED`. A compacted request that cannot fit the remaining cumulative task
 budget stops as `TASK_INPUT_TOKEN_BUDGET_EXHAUSTED`. Rollover never resets token accounting.
 Provider-reported input totals remain authoritative and include cached input where the provider
@@ -122,9 +124,31 @@ or double-count it.
 
 Raw tool evidence remains in `ToolCall`, while model-visible test output, file content, diffs,
 browser output, and other large observations use a bounded head/tail representation with the full
-content hash and original size. Repeated unchanged reads are represented by path and hash after the
-newest copy. Project Brain retrieval bounds every collection and summary independently; it is not
-an ever-growing prompt prefix.
+content hash and original size. Forge conservatively caches successful `filesystem.read`,
+`filesystem.list`, `git.status`, `git.diff`, and `git.log` observations within a workspace
+generation. An identical read can reuse a compact path/hash/size observation without creating a
+fake `ToolCall`; the reuse is recorded as `DEV_OBSERVATION_REUSED`. Any successful or attempted
+Forge operation that may change filesystem or Git state advances the generation and invalidates
+the read cache. Permission checks still run before reuse. Project Brain retrieval bounds every
+collection and excludes the current task's checkpoint when the explicit rollover handoff already
+contains that state.
+
+The runtime measures context bytes by system/runtime instructions, conversation prompt, native
+tool schemas, structured-output schema, tool-call arguments, observations, handoff, source context,
+and Project Brain components. These are diagnostics rather than a second token ledger; provider
+usage remains authoritative for cumulative budgets. Reused observations, stale invalidations,
+malformed-call repairs, stagnation signals, last useful action, rollover reasons, and progress
+between rollovers are exposed by the Dev Mode task endpoint.
+
+Malformed native arguments never execute. `TOOL_ARGUMENT_VALIDATION_FAILED` returns the tool name,
+required/provided/missing/invalid fields, bounded validation issues, the relevant compact schema,
+an invalid-call fingerprint, and a one-call repair instruction. When a model asks
+`development.execute` for a Git inspection, Forge points it to the declared dedicated Git tool.
+Repair attempts for the same invalid fingerprint are durable and bounded; repeated failure ends as
+`TOOL_ARGUMENT_REPAIR_LIMIT_EXHAUSTED`. Alternating unchanged reads also contribute to semantic
+stagnation. Forge first serves compact authoritative reuse; if no mutation, validation result,
+resolved failure, or phase progress follows within the bound, execution stops as
+`DEVELOPMENT_STAGNATION`.
 
 Development bootstrap creates or recognizes a Git baseline before the first mutation. This
 includes an empty initial repository through an allow-empty Forge checkpoint. If the real task
@@ -139,6 +163,10 @@ current development tree and reconstructs mutation fingerprints from durable `To
 Resume is refused if that recovery checkpoint cannot be created.
 An unrecoverable compacted model-context request uses the same checkpoint path and records
 `DEV_CONTEXT_FAILURE_HANDOFF`, but it does not masquerade as cumulative task-budget exhaustion.
+If that stop was specifically `MODEL_CONTEXT_ROLLOVER_LIMIT_EXHAUSTED` and the recovery checkpoint
+exists, a human may approve one continuation with `POST /api/v1/tasks/{task_id}/resume-context`.
+The approval does not add rollovers, calls, tool steps, or tokens, and it does not reset mutation
+fingerprints or failure history. A second approval for the same failure is rejected.
 
 ## Lead Engineer and specialists
 
@@ -227,6 +255,8 @@ design is good. Product QA remains separate from browser and Developer evidence.
 - `FORGE_DEV_CONTEXT_LIMIT=32768`
 - `FORGE_DEV_CONTEXT_RESERVE_TOKENS=2048`
 - `FORGE_DEV_MAX_ROLLOVERS=4`
+- `FORGE_DEV_TOOL_REPAIR_LIMIT=2`
+- `FORGE_DEV_STAGNATION_LIMIT=4`
 - `FORGE_DEV_SPECIALIST_LIMIT=2`
 - `FORGE_DEV_SPECIALIST_CONTEXT_CHARS=12000`
 - `FORGE_BROWSER_ENABLED=false`
@@ -285,6 +315,13 @@ tokens, cumulative budget, remaining tokens, model calls, last rollover, and rol
 The legacy `MODEL_INPUT_TOKEN_BUDGET_EXHAUSTED` code is classified as task budget exhaustion for
 existing records; new executions use the explicit task-budget code. Do not fix this condition by
 resetting counters. Approve a bounded resume only after reviewing the recovery checkpoint.
+
+For rollover exhaustion, inspect the per-rollover reason, preflight estimate, progress interval,
+reused observations, invalidations, malformed repair attempts, last useful action, and unresolved
+blocker. A tiny task that repeatedly crosses only the task-budget warning threshold indicates a
+runtime regression: that soft threshold is a one-time checkpoint, while model-window pressure may
+still cause later rollovers. Use the context-resume endpoint only after confirming the checkpoint;
+it is a single bounded continuation, not a retry-limit reset.
 
 ## Security and cost boundaries
 

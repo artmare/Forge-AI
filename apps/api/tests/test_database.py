@@ -16,7 +16,7 @@ async def test_migration_is_at_head() -> None:
     async with get_session_factory()() as session:
         revision = await session.scalar(text("SELECT version_num FROM alembic_version"))
 
-    assert heads == ["20260919_0019"]
+    assert heads == ["20260929_0020"]
     assert revision == heads[0]
 
 

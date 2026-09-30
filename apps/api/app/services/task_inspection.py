@@ -87,16 +87,20 @@ def _safe_text(value: str | None) -> str | None:
 
 
 def _safe_value(value: Any, *, key: str | None = None) -> Any:
-    if key is not None and _SENSITIVE_KEY.search(key) and not (
-        isinstance(value, int | float)
-        and key
-        in {
-            "input_tokens_consumed",
-            "cached_input_tokens",
-            "input_token_budget",
-            "last_request_input_tokens",
-            "remaining_input_tokens",
-        }
+    if (
+        key is not None
+        and _SENSITIVE_KEY.search(key)
+        and not (
+            isinstance(value, int | float)
+            and key
+            in {
+                "input_tokens_consumed",
+                "cached_input_tokens",
+                "input_token_budget",
+                "last_request_input_tokens",
+                "remaining_input_tokens",
+            }
+        )
     ):
         return "[REDACTED]"
     if key is not None and key.lower() in _CONTENT_KEYS and isinstance(value, str):
@@ -408,9 +412,7 @@ class TaskInspectionService:
 
     @staticmethod
     def _profile(row: ProjectDevelopmentProfile) -> InspectionDevelopmentProfile:
-        configured = {
-            action.value for action in DevelopmentProfileService.available_actions(row)
-        }
+        configured = {action.value for action in DevelopmentProfileService.available_actions(row)}
         node_actions = {"NODE_TEST", "NODE_BUILD", "NODE_LINT", "NODE_TYPECHECK"}
         return InspectionDevelopmentProfile(
             project_type=row.project_type.value,
@@ -594,7 +596,11 @@ class TaskInspectionService:
                 or job_message
                 or "Forge recorded a failure without a classified error message."
             )
-            if code == "DUPLICATE_TOOL_LOOP":
+            if code in {
+                "DUPLICATE_TOOL_LOOP",
+                "DEVELOPMENT_STAGNATION",
+                "TOOL_ARGUMENT_REPAIR_LIMIT_EXHAUSTED",
+            }:
                 category = "AGENT_RUNTIME_GUARD"
                 phase = "EXECUTING"
             elif (code.startswith("TASK_") and "BUDGET" in code) or code == (
@@ -653,8 +659,7 @@ class TaskInspectionService:
             evidence_source=evidence_source,
             budget_diagnostics=(
                 _safe_value(durable.get("budget_diagnostics"))
-                if isinstance(durable, dict)
-                and isinstance(durable.get("budget_diagnostics"), dict)
+                if isinstance(durable, dict) and isinstance(durable.get("budget_diagnostics"), dict)
                 else None
             ),
         )

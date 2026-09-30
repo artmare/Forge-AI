@@ -6,15 +6,17 @@ from uuid import UUID
 import pytest
 from sqlalchemy import select
 
+from app.agent_runtime.context_rollover import ContextRollover
 from app.agent_runtime.contracts import ModelUsage
 from app.agent_runtime.efficiency import EfficientRuntimeService
 from app.agent_runtime.providers import MockModelProvider
 from app.agent_runtime.runtime import AgentRuntime
 from app.core.config import Settings
+from app.development.bootstrap import ProjectBootstrapService
 from app.development.qa import DevelopmentWorkflowService
 from app.domain.enums import TaskStatus
 from app.domain.exceptions import AgentRuntimeDomainError
-from app.domain.models import Event, ProjectKnowledgeIndex, ToolCall
+from app.domain.models import Event, ProjectKnowledgeIndex, TaskRuntimeMetric, ToolCall
 from app.infrastructure.database import get_session_factory
 from app.services.task_state_machine import TaskStateMachine
 from tests.helpers import create_agent, create_company, create_project, create_task, transition_task
@@ -161,9 +163,7 @@ async def test_development_budget_preflight_persists_recoverable_handoff(
         assert len(calls) == 1
 
 
-async def test_large_tool_result_is_durable_but_bounded_in_model_continuation(
-    client, tmp_path
-):
+async def test_large_tool_result_is_durable_but_bounded_in_model_continuation(client, tmp_path):
     company = await create_company(client)
     project = await create_project(client, company["id"])
     agent = await create_agent(
@@ -189,9 +189,7 @@ async def test_large_tool_result_is_durable_but_bounded_in_model_continuation(
             ),
             provider=provider,
         ).execute(UUID(task["id"]))
-        call = await session.scalar(
-            select(ToolCall).where(ToolCall.task_id == UUID(task["id"]))
-        )
+        call = await session.scalar(select(ToolCall).where(ToolCall.task_id == UUID(task["id"])))
         assert call is not None
         assert call.result["content"] == content
         injected = provider.requests[1].tool_exchanges[0].response
@@ -401,3 +399,223 @@ async def test_verified_routing_rejects_fake_tools_and_accounts_probes(
             )
         )
         assert len([c for c in calls if c.agent_role == "CAPABILITY_PROBE"]) == 6
+
+
+async def test_malformed_tool_call_is_repaired_by_declared_dedicated_tool(client):
+    company = await create_company(client)
+    project = await create_project(client, company["id"])
+    agent = await create_agent(
+        client,
+        company["id"],
+        role="LEAD_ENGINEER",
+        permissions={"development.execute": True, "git.read": True},
+    )
+    task = await create_task(client, company["id"], project["id"], agent["id"])
+    await transition_task(client, task["id"], "QUEUED")
+    settings = Settings()
+    provider = MockModelProvider(
+        responses=[
+            tool("development.execute", action="GIT_STATUS"),
+            tool("git.status"),
+            final("Corrected the malformed request using the dedicated Git tool."),
+        ]
+    )
+    async with get_session_factory()() as session:
+        await ProjectBootstrapService(session, settings=settings).ensure_task(
+            UUID(task["id"]), checkpoint=True
+        )
+        await AgentRuntime(
+            session,
+            settings=settings,
+            provider=provider,
+        ).execute(UUID(task["id"]))
+        calls = list(
+            await session.scalars(
+                select(ToolCall)
+                .where(ToolCall.task_id == UUID(task["id"]))
+                .order_by(ToolCall.created_at)
+            )
+        )
+        events = list(await session.scalars(select(Event).where(Event.task_id == UUID(task["id"]))))
+        assert calls[0].error["details"]["suggested_tool"] == "git.status"
+        assert calls[0].error["details"]["repair_attempt"] == 1
+        assert calls[1].tool_name == "git.status"
+        assert calls[1].status.value == "SUCCEEDED"
+        assert any(item.type == "DEV_TOOL_ARGUMENT_REPAIR_SUCCEEDED" for item in events)
+
+
+async def test_repeated_malformed_tool_call_hits_repair_bound(client, tmp_path):
+    company = await create_company(client)
+    project = await create_project(client, company["id"])
+    agent = await create_agent(
+        client,
+        company["id"],
+        role="LEAD_ENGINEER",
+        permissions={"development.execute": True},
+    )
+    task = await create_task(client, company["id"], project["id"], agent["id"])
+    await transition_task(client, task["id"], "QUEUED")
+    malformed = tool("development.execute", action="GIT_STATUS")
+    provider = MockModelProvider(responses=[malformed, malformed])
+    async with get_session_factory()() as session:
+        with pytest.raises(AgentRuntimeDomainError) as raised:
+            await AgentRuntime(
+                session,
+                settings=Settings(tool_workspace_root=str(tmp_path)),
+                provider=provider,
+            ).execute(UUID(task["id"]))
+        assert raised.value.code == "TOOL_ARGUMENT_REPAIR_LIMIT_EXHAUSTED"
+        calls = list(
+            await session.scalars(
+                select(ToolCall)
+                .where(ToolCall.task_id == UUID(task["id"]))
+                .order_by(ToolCall.created_at)
+            )
+        )
+        assert len(calls) == 2
+        assert calls[-1].error["details"]["repair_attempt"] == 2
+
+
+async def test_observation_reuse_is_invalidated_by_write(client, tmp_path):
+    company = await create_company(client)
+    project = await create_project(client, company["id"])
+    agent = await create_agent(
+        client,
+        company["id"],
+        role="LEAD_ENGINEER",
+        permissions={"filesystem.read": True, "filesystem.write": True},
+    )
+    task = await create_task(client, company["id"], project["id"], agent["id"])
+    await transition_task(client, task["id"], "QUEUED")
+    workspace = tmp_path / company["id"] / project["id"]
+    workspace.mkdir(parents=True)
+    (workspace / "note.txt").write_text("old")
+    provider = MockModelProvider(
+        responses=[
+            tool("filesystem.read", path="note.txt"),
+            tool("filesystem.read", path="note.txt"),
+            tool("filesystem.write", path="note.txt", content="new"),
+            tool("filesystem.read", path="note.txt"),
+            final("Updated and re-read note.txt.", ["note.txt"]),
+        ]
+    )
+    async with get_session_factory()() as session:
+        await AgentRuntime(
+            session,
+            settings=Settings(tool_workspace_root=str(tmp_path)),
+            provider=provider,
+        ).execute(UUID(task["id"]))
+        calls = list(
+            await session.scalars(select(ToolCall).where(ToolCall.task_id == UUID(task["id"])))
+        )
+        metric = await session.scalar(
+            select(TaskRuntimeMetric).where(TaskRuntimeMetric.task_id == UUID(task["id"]))
+        )
+        assert [item.tool_name for item in calls].count("filesystem.read") == 2
+        assert metric.reused_observations == 1
+        assert metric.stale_observation_invalidations >= 1
+        assert (workspace / "note.txt").read_text() == "new"
+
+
+async def test_alternating_unchanged_reads_stop_as_development_stagnation(client, tmp_path):
+    company = await create_company(client)
+    project = await create_project(client, company["id"])
+    agent = await create_agent(
+        client,
+        company["id"],
+        role="LEAD_ENGINEER",
+        permissions={"filesystem.list": True, "filesystem.read": True},
+    )
+    task = await create_task(client, company["id"], project["id"], agent["id"])
+    await transition_task(client, task["id"], "QUEUED")
+    workspace = tmp_path / company["id"] / project["id"]
+    workspace.mkdir(parents=True)
+    (workspace / "note.txt").write_text("unchanged")
+    provider = MockModelProvider(
+        responses=[
+            tool("filesystem.list", path="."),
+            tool("filesystem.read", path="note.txt"),
+            tool("filesystem.list", path="."),
+            tool("filesystem.read", path="note.txt"),
+            tool("filesystem.list", path="."),
+        ]
+    )
+    async with get_session_factory()() as session:
+        with pytest.raises(AgentRuntimeDomainError) as raised:
+            await AgentRuntime(
+                session,
+                settings=Settings(tool_workspace_root=str(tmp_path), forge_dev_stagnation_limit=3),
+                provider=provider,
+            ).execute(UUID(task["id"]))
+        assert raised.value.code == "DEVELOPMENT_STAGNATION"
+        calls = list(
+            await session.scalars(select(ToolCall).where(ToolCall.task_id == UUID(task["id"])))
+        )
+        assert len(calls) == 2
+
+
+async def test_novanote_like_static_task_rolls_repairs_and_reaches_review_boundary(client):
+    company = await create_company(client)
+    project = await create_project(client, company["id"])
+    agent = await create_agent(
+        client,
+        company["id"],
+        role="LEAD_ENGINEER",
+        permissions={
+            "filesystem.write": True,
+            "development.execute": True,
+            "git.read": True,
+        },
+    )
+    task = await create_task(client, company["id"], project["id"], agent["id"])
+    await transition_task(client, task["id"], "QUEUED")
+    body = "x" * 6000
+    provider = MockModelProvider(
+        responses=[
+            tool("filesystem.write", path="index.html", content=f"<main>{body}</main>"),
+            tool("filesystem.write", path="styles.css", content=body),
+            tool("filesystem.write", path="app.js", content=body),
+            tool("development.execute", action="GIT_STATUS"),
+            tool("git.status"),
+            tool("git.diff"),
+            final("Created and verified the three-file static landing page.", ["index.html"]),
+        ]
+    )
+    settings = Settings(
+        forge_dev_context_checkpoint_ratio=0.3,
+        forge_dev_context_reserve_tokens=0,
+    )
+    async with get_session_factory()() as session:
+        await ProjectBootstrapService(session, settings=settings).ensure_task(
+            UUID(task["id"]), checkpoint=True
+        )
+        run = await AgentRuntime(session, settings=settings, provider=provider).execute(
+            UUID(task["id"]), defer_review=True
+        )
+        calls = list(
+            await session.scalars(
+                select(ToolCall)
+                .where(ToolCall.task_id == UUID(task["id"]))
+                .order_by(ToolCall.created_at)
+            )
+        )
+        rollovers = list(
+            await session.scalars(
+                select(Event).where(
+                    Event.task_id == UUID(task["id"]),
+                    Event.type == "DEV_CONTEXT_ROLLOVER",
+                )
+            )
+        )
+        assert run.status.value == "SUCCEEDED"
+        assert [item.tool_name for item in calls].count("filesystem.write") == 3
+        assert len(rollovers) <= 2
+        assert provider.call_count == 7
+        assert provider.requests[-1].tools == ()
+        estimated_fixture_input = sum(
+            ContextRollover.estimated_input_tokens(request, reserve_tokens=0)
+            for request in provider.requests
+        )
+        assert estimated_fixture_input <= 60_000
+        if rollovers:
+            assert "reread or rewrite unchanged files" in rollovers[-1].details["next_action"]

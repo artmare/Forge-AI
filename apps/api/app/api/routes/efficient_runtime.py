@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.domain.exceptions import EntityNotFoundError
 from app.domain.models import (
     AgentRun,
@@ -185,6 +186,12 @@ async def _task_efficiency(session: AsyncSession, task_id: UUID) -> RuntimeEffic
         context_reduction_ratio=round(avoided / baseline, 4) if baseline else 0.0,
         repeated_reads_avoided=metric.repeated_reads_avoided if metric else 0,
         duplicate_turns_detected=metric.duplicate_turns_detected if metric else 0,
+        reused_observations=metric.reused_observations if metric else 0,
+        stale_observation_invalidations=(metric.stale_observation_invalidations if metric else 0),
+        malformed_tool_repairs=metric.malformed_tool_repairs if metric else 0,
+        stagnation_signals=metric.stagnation_signals if metric else 0,
+        context_component_bytes=metric.context_component_bytes if metric else {},
+        last_useful_action=metric.last_useful_action if metric else {},
         deterministic_executions=deterministic,
         escalations=[
             ModelEscalationResponse.model_validate(item, from_attributes=True)
@@ -249,6 +256,17 @@ async def dev_mode_status(task_id: UUID, session: Session) -> dict:
         ],
         "tools": [{"id": str(c.id), "name": c.tool_name, "status": c.status.value} for c in tools],
         "rollover_count": sum(e.type == "DEV_CONTEXT_ROLLOVER" for e in events),
+        "rollover_limit": get_settings().forge_dev_max_rollovers,
+        "rollover_reasons": [
+            {
+                "count": event.details.get("rollover_count"),
+                "reason": event.details.get("reason"),
+                "estimated_input_tokens": event.details.get("estimated_input_tokens"),
+                "progress": event.details.get("progress_since_last_rollover", []),
+            }
+            for event in reversed(events)
+            if event.type == "DEV_CONTEXT_ROLLOVER"
+        ],
         "specialist_calls": sum(e.type == "DEV_SPECIALIST_RESERVED" for e in events),
         "human_promotion_required": True,
         "context_budget": (
@@ -261,6 +279,14 @@ async def dev_mode_status(task_id: UUID, session: Session) -> dict:
                 ),
                 "model_calls": budget.consumed_model_calls,
                 "context_bytes_sent": metric.context_bytes_sent if metric else 0,
+                "context_component_bytes": (metric.context_component_bytes if metric else {}),
+                "cached_observations_reused": (metric.reused_observations if metric else 0),
+                "stale_cache_invalidations": (
+                    metric.stale_observation_invalidations if metric else 0
+                ),
+                "malformed_tool_repair_attempts": (metric.malformed_tool_repairs if metric else 0),
+                "stagnation_signals": metric.stagnation_signals if metric else 0,
+                "last_useful_action": metric.last_useful_action if metric else {},
                 "last_rollover": latest_rollover.details if latest_rollover else None,
             }
             if budget

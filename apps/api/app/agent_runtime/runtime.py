@@ -38,6 +38,7 @@ from app.agent_runtime.efficiency import EfficientRuntimeService, ModelBudgetExc
 from app.agent_runtime.execution_truth import ExecutionTruthValidator
 from app.agent_runtime.policy import ModelExecutionPolicy
 from app.agent_runtime.probes import ProbeCapability
+from app.agent_runtime.progress import DevelopmentProgress
 from app.agent_runtime.providers import provider_for_profile
 from app.agent_runtime.registry import ModelRegistry
 from app.agent_runtime.routing import (
@@ -107,6 +108,8 @@ NORMALIZED_PROVIDER_CODES = frozenset(
         "MODEL_CONTEXT_LIMIT_EXCEEDED",
         "MODEL_CONTEXT_ROLLOVER_LIMIT_EXHAUSTED",
         "DUPLICATE_TOOL_LOOP",
+        "DEVELOPMENT_STAGNATION",
+        "TOOL_ARGUMENT_REPAIR_LIMIT_EXHAUSTED",
         "PROVIDER_REQUEST_INVALID",
         "PROVIDER_RESPONSE_INVALID",
         "PROVIDER_TOOL_SCHEMA_INVALID",
@@ -167,14 +170,16 @@ class AgentRuntime:
         observations: list[ToolObservation] = []
         tool_exchanges: list[ModelToolExchange] = []
         conversation_start_prompt: str | None = None
+        conversation_components: dict[str, int] = {}
         tool_steps = 0
         first_turn = True
         duplicate_signals = 0
         rollover = ContextRollover(
             self.settings.forge_dev_context_checkpoint_ratio, self.settings.forge_dev_max_rollovers
         )
+        progress = DevelopmentProgress()
         tool_steps, duplicate_signals = await self._restore_durable_context(
-            task_id, observations, rollover
+            task_id, observations, rollover, progress
         )
 
         while True:
@@ -220,22 +225,30 @@ class AgentRuntime:
                 observations,
                 turn_number=tool_steps + 1,
                 budget_warning=budget.warning_active,
-                duplicate_warning=duplicate_signals > 0,
+                duplicate_warning=duplicate_signals > 0 or progress.stagnation_signals > 0,
                 force_final=self._developer_ready_for_final(context, observations),
             )
             if rollover.handoff:
+                handoff_json = json.dumps(rollover.handoff, separators=(",", ":"))
                 request = replace(
                     request,
-                    user_prompt=request.user_prompt
-                    + "\nForge context handoff:\n"
-                    + json.dumps(rollover.handoff),
+                    user_prompt=request.user_prompt + "\nForge context handoff:\n" + handoff_json,
+                    metadata={
+                        **request.metadata,
+                        "handoff_bytes": str(len(handoff_json.encode())),
+                    },
                 )
             if conversation_start_prompt is None:
                 conversation_start_prompt = request.user_prompt
+                conversation_components = self._request_context_components(request)
             request = replace(
                 request,
                 conversation_start_prompt=conversation_start_prompt,
                 tool_exchanges=tuple(tool_exchanges),
+                metadata={
+                    **request.metadata,
+                    "context_component_bytes": json.dumps(conversation_components),
+                },
             )
             try:
                 selections, capabilities = await self._route_models(
@@ -248,16 +261,21 @@ class AgentRuntime:
             except ProviderCallError as error:
                 raise self._public_error(self._normalize_error(error)) from None
             selected = selections[0]
-            request = replace(request, model=selected.profile.model_id)
-            context_limit = (
-                selected.profile.context_length or self.settings.forge_dev_context_limit
+            request = replace(
+                request,
+                model=selected.profile.model_id,
+                metadata={
+                    **request.metadata,
+                    "structured_output_schema_sent": str(
+                        self._provider_sends_structured_schema(selected.profile, request)
+                    ).lower(),
+                },
             )
+            context_limit = selected.profile.context_length or self.settings.forge_dev_context_limit
             estimated_input = rollover.estimated_input_tokens(
                 request, reserve_tokens=self.settings.forge_dev_context_reserve_tokens
             )
-            remaining_input = max(
-                budget.max_input_tokens - budget.consumed_input_tokens, 0
-            )
+            remaining_input = max(budget.max_input_tokens - budget.consumed_input_tokens, 0)
             context_pressure = rollover.needed(
                 request,
                 context_limit,
@@ -268,14 +286,30 @@ class AgentRuntime:
                 budget.consumed_input_tokens + estimated_input
                 >= budget.max_input_tokens * self.settings.model_budget_warning_ratio
             )
+            budget_soft_rollover = budget_soft_pressure and not rollover.budget_soft_checkpointed
             development_role = str(context.agent.get("role", "")).upper() in {
                 "DEVELOPER",
                 "LEAD_ENGINEER",
                 "LEAD ENGINEER",
             }
-            if tool_exchanges and (development_role or self.settings.forge_dev_mode_enabled) and (
-                context_pressure or budget_pressure or budget_soft_pressure
+            if (
+                tool_exchanges
+                and (development_role or self.settings.forge_dev_mode_enabled)
+                and (context_pressure or budget_pressure or budget_soft_rollover)
             ):
+                # Refresh bounded file hashes and summaries after successful mutations. Ordinary
+                # turns retain stable source context, while a rollover must describe the current
+                # authoritative workspace generation.
+                context = await ContextBuilder(self.session).build(task_id)
+                rollover_reason = (
+                    "MODEL_CONTEXT_THRESHOLD"
+                    if context_pressure
+                    else (
+                        "TASK_BUDGET_PREFLIGHT" if budget_pressure else "TASK_BUDGET_SOFT_THRESHOLD"
+                    )
+                )
+                required_actions = self._required_validation_actions(context)
+                progress_interval = list(progress.progress_since_rollover)
                 try:
                     handoff = rollover.checkpoint(
                         task_id=str(task_id),
@@ -283,6 +317,25 @@ class AgentRuntime:
                         observations=observations,
                         tool_steps=tool_steps,
                         duplicate_signals=duplicate_signals,
+                        reason=rollover_reason,
+                        file_states=context.relevant_files,
+                        required_actions=required_actions,
+                        remaining_budget={
+                            "input_tokens": remaining_input,
+                            "model_calls": max(
+                                budget.max_model_calls - budget.consumed_model_calls, 0
+                            ),
+                            "tool_steps": max(
+                                (
+                                    self.settings.developer_max_steps
+                                    if development_role
+                                    else self.settings.agent_max_tool_steps
+                                )
+                                - tool_steps,
+                                0,
+                            ),
+                        },
+                        progress=progress_interval,
                     )
                 except ValueError:
                     await self._persist_recovery_handoff(
@@ -309,7 +362,7 @@ class AgentRuntime:
                         task_id=task_id,
                         goal=handoff["goal"],
                         completed=[json.dumps(x) for x in handoff["completed"]],
-                        current_diff=handoff["current_diff"],
+                        current_diff=json.dumps(handoff["git_state"]),
                         decisions=[],
                         test_status=[json.dumps(x) for x in handoff["test_status"]],
                         failures=[json.dumps(x) for x in handoff["failures"]],
@@ -325,15 +378,7 @@ class AgentRuntime:
                     message="Fresh model context prepared after durable tool observation.",
                     payload={
                         **handoff,
-                        "reason": (
-                            "MODEL_CONTEXT_THRESHOLD"
-                            if context_pressure
-                            else (
-                                "TASK_BUDGET_PREFLIGHT"
-                                if budget_pressure
-                                else "TASK_BUDGET_SOFT_THRESHOLD"
-                            )
-                        ),
+                        "reason": rollover_reason,
                         "model": selected.profile.model_id,
                         "model_context_limit": context_limit,
                         "rollover_threshold": int(
@@ -342,9 +387,20 @@ class AgentRuntime:
                         "estimated_input_tokens": estimated_input,
                         "task_input_tokens_consumed": budget.consumed_input_tokens,
                         "task_input_tokens_remaining": remaining_input,
+                        "input_components": ContextRollover.input_breakdown(request),
                     },
                 )
                 await self.session.commit()
+                rollover.causes.append(
+                    {
+                        "count": rollover.count,
+                        "reason": rollover_reason,
+                        "estimated_input_tokens": estimated_input,
+                        "tool_steps": tool_steps,
+                        "progress": progress_interval,
+                    }
+                )
+                progress.rollover_recorded()
                 # Only transport history is dropped. Evidence, counters, budgets and task remain.
                 tool_exchanges.clear()
                 context = await ContextBuilder(self.session).build(task_id)
@@ -352,27 +408,34 @@ class AgentRuntime:
                     context,
                     routed_alias,
                     selected.profile.model_id,
-                    observations,
+                    [],
                     turn_number=tool_steps + 1,
                     budget_warning=budget.warning_active,
-                    duplicate_warning=duplicate_signals > 0,
+                    duplicate_warning=duplicate_signals > 0 or progress.stagnation_signals > 0,
                     force_final=self._developer_ready_for_final(context, observations),
                 )
+                handoff_json = json.dumps(handoff, separators=(",", ":"))
                 conversation_start_prompt = (
-                    fresh.user_prompt + "\nForge context handoff:\n" + json.dumps(handoff)
+                    fresh.user_prompt
+                    + "\nForge context handoff (continuation snapshot):\n"
+                    + handoff_json
                 )
+                conversation_components = self._request_context_components(fresh)
+                conversation_components["handoff"] = len(handoff_json.encode())
                 request = replace(
                     fresh,
                     user_prompt=conversation_start_prompt,
                     conversation_start_prompt=conversation_start_prompt,
+                    metadata={
+                        **fresh.metadata,
+                        "context_component_bytes": json.dumps(conversation_components),
+                    },
                 )
 
             estimated_input = rollover.estimated_input_tokens(
                 request, reserve_tokens=self.settings.forge_dev_context_reserve_tokens
             )
-            remaining_input = max(
-                budget.max_input_tokens - budget.consumed_input_tokens, 0
-            )
+            remaining_input = max(budget.max_input_tokens - budget.consumed_input_tokens, 0)
             if estimated_input >= context_limit:
                 await self._persist_recovery_handoff(
                     current_task,
@@ -414,6 +477,24 @@ class AgentRuntime:
                     409,
                 )
 
+            input_components = ContextRollover.input_breakdown(request)
+            provider_visible_bytes = sum(
+                input_components.get(name, 0)
+                for name in (
+                    "system_runtime",
+                    "conversation_prompt",
+                    "tool_schemas",
+                    "structured_output_schema",
+                    "tool_call_arguments",
+                    "tool_observations",
+                )
+            )
+            await self.efficiency.record_context(
+                task_id,
+                provider_visible_bytes,
+                int(request.metadata.get("estimated_unchanged_bytes_avoided", "0") or 0),
+                input_components,
+            )
             run = await self._start_turn(
                 task_id,
                 selected,
@@ -530,6 +611,63 @@ class AgentRuntime:
                     },
                 )
                 raise self._public_error(error)
+            definition = self.tool_registry.get(turn.tool_name)
+            reuse_authorized = False
+            if definition is not None:
+                decision = await self.permission_engine.check(
+                    agent_id=completed.agent_id,
+                    company_id=task.company_id,
+                    definition=definition,
+                    has_project_workspace=task.project_id is not None,
+                )
+                reuse_authorized = decision.allowed
+            reused = progress.reusable(turn) if reuse_authorized else None
+            if reused is not None:
+                reuse_details = progress.record_reuse(reused)
+                await self.events.create(
+                    company_id=task.company_id,
+                    project_id=task.project_id,
+                    agent_id=completed.agent_id,
+                    task_id=task.id,
+                    correlation_id=task.id,
+                    event_type="DEV_OBSERVATION_REUSED",
+                    message="An unchanged authoritative read observation was reused.",
+                    payload=reuse_details,
+                )
+                await self.efficiency.record_observation_reuse(
+                    task.id, stagnation_signals=progress.stagnation_signals
+                )
+                observations.append(reused)
+                tool_call = provider_response.tool_call or ModelToolCall(
+                    name=turn.tool_name,
+                    arguments=dict(turn.arguments),
+                )
+                tool_exchanges.append(
+                    ModelToolExchange(
+                        call=tool_call,
+                        response=InstructionBuilder.prompt_observation(reused),
+                    )
+                )
+                tool_steps += 1
+                await self.session.commit()
+                if progress.stagnation_signals >= self.settings.forge_dev_stagnation_limit:
+                    error = ProviderCallError(
+                        "DEVELOPMENT_STAGNATION",
+                        "Development stopped after repeated unchanged inspection without progress",
+                        category="TOOL_PROTOCOL",
+                    )
+                    await self._fail_task(
+                        completed,
+                        error,
+                        details={
+                            "phase": "EXECUTING",
+                            "stagnation_signals": progress.stagnation_signals,
+                            "last_useful_action": progress.last_useful_action,
+                            "last_reused_observation": reuse_details,
+                        },
+                    )
+                    raise self._public_error(error)
+                continue
             execution_context = ToolExecutionContext(
                 company_id=task.company_id,
                 project_id=task.project_id,
@@ -549,6 +687,7 @@ class AgentRuntime:
             except Exception as exc:
                 logger.error(
                     "Unexpected tool orchestration error",
+                    exc_info=True,
                     extra={
                         "event": "tool_orchestration_error",
                         "agent_run_id": str(completed.id),
@@ -561,6 +700,29 @@ class AgentRuntime:
                 raise self._public_error(error) from None
             if key and observation.status == "success":
                 rollover.executed_mutations.add(key)
+            invalidated = progress.record(turn, observation)
+            await self.efficiency.record_cache_invalidation(task.id, invalidated)
+            if progress.last_useful_action:
+                await self.efficiency.record_useful_action(task.id, progress.last_useful_action)
+            repaired_failure = self._pending_argument_repair(observations, turn.tool_name)
+            if observation.status == "success" and repaired_failure is not None:
+                repair_details = repaired_failure.error.details or {}
+                await self.events.create(
+                    company_id=task.company_id,
+                    project_id=task.project_id,
+                    agent_id=completed.agent_id,
+                    task_id=task.id,
+                    correlation_id=task.id,
+                    event_type="DEV_TOOL_ARGUMENT_REPAIR_SUCCEEDED",
+                    message="A corrected tool call passed schema validation and executed.",
+                    payload={
+                        "tool_name": turn.tool_name,
+                        "original_invalid_call_fingerprint": repair_details.get(
+                            "invalid_call_fingerprint"
+                        ),
+                        "repair_attempt": repair_details.get("repair_attempt", 1),
+                    },
+                )
             observations.append(observation)
             tool_call = provider_response.tool_call or ModelToolCall(
                 name=turn.tool_name,
@@ -573,6 +735,50 @@ class AgentRuntime:
                 )
             )
             await self.efficiency.cache_observation(task, turn, observation)
+            if (
+                observation.status == "error"
+                and observation.error is not None
+                and observation.error.code == "TOOL_ARGUMENT_VALIDATION_FAILED"
+            ):
+                details = observation.error.details or {}
+                repair_attempt = int(details.get("repair_attempt", 1))
+                await self.efficiency.record_tool_repair(task.id)
+                await self.events.create(
+                    company_id=task.company_id,
+                    project_id=task.project_id,
+                    agent_id=completed.agent_id,
+                    task_id=task.id,
+                    correlation_id=task.id,
+                    event_type="DEV_TOOL_ARGUMENT_REPAIR_REQUIRED",
+                    message="Forge rejected malformed tool arguments and requested bounded repair.",
+                    payload={
+                        "tool_name": turn.tool_name,
+                        "invalid_call_fingerprint": details.get("invalid_call_fingerprint"),
+                        "repair_attempt": repair_attempt,
+                        "repair_limit": self.settings.forge_dev_tool_repair_limit,
+                        "invalid_fields": details.get("invalid_fields", []),
+                        "missing_fields": details.get("missing_fields", []),
+                    },
+                )
+                if repair_attempt >= self.settings.forge_dev_tool_repair_limit:
+                    await self.session.commit()
+                    error = ProviderCallError(
+                        "TOOL_ARGUMENT_REPAIR_LIMIT_EXHAUSTED",
+                        "The model repeated malformed arguments for the same tool call",
+                        category="TOOL_PROTOCOL",
+                    )
+                    await self._fail_task(
+                        completed,
+                        error,
+                        details={
+                            "phase": "EXECUTING",
+                            "tool_name": turn.tool_name,
+                            "invalid_call_fingerprint": details.get("invalid_call_fingerprint"),
+                            "repair_attempt": repair_attempt,
+                            "repair_limit": self.settings.forge_dev_tool_repair_limit,
+                        },
+                    )
+                    raise self._public_error(error)
             await self.session.commit()
             tool_steps += 1
 
@@ -581,6 +787,7 @@ class AgentRuntime:
         task_id: UUID,
         observations: list[ToolObservation],
         rollover: ContextRollover,
+        progress: DevelopmentProgress,
     ) -> tuple[int, int]:
         handoff = await self.session.scalar(
             select(Event)
@@ -594,14 +801,24 @@ class AgentRuntime:
         if handoff is None:
             return 0, 0
         rollover.handoff = dict(handoff.details)
-        rollover.count = int(
-            await self.session.scalar(
-                select(func.count()).select_from(Event).where(
-                    Event.task_id == task_id, Event.type == "DEV_CONTEXT_ROLLOVER"
-                )
+        rollover_events = list(
+            await self.session.scalars(
+                select(Event)
+                .where(Event.task_id == task_id, Event.type == "DEV_CONTEXT_ROLLOVER")
+                .order_by(Event.created_at)
             )
-            or 0
         )
+        rollover.count = len(rollover_events)
+        rollover.causes = [
+            {
+                "count": item.details.get("rollover_count"),
+                "reason": item.details.get("reason"),
+                "estimated_input_tokens": item.details.get("estimated_input_tokens"),
+                "tool_steps": item.details.get("tool_steps"),
+                "progress": item.details.get("progress_since_last_rollover", []),
+            }
+            for item in rollover_events
+        ]
         calls = list(
             await self.session.scalars(
                 select(ToolCall)
@@ -615,14 +832,21 @@ class AgentRuntime:
             if status not in {"succeeded", "failed", "denied", "cancelled"}:
                 continue
             restored_steps += 1
-            observations.append(
-                ToolObservation(
-                    tool_call_id=call.id,
-                    tool=call.tool_name,
-                    status="success" if status == "succeeded" else "failure",
-                    result=call.result,
-                    error=call.error,
-                )
+            observation = ToolObservation(
+                tool_call_id=call.id,
+                tool=call.tool_name,
+                status="success" if status == "succeeded" else "error",
+                result=call.result,
+                error=call.error,
+            )
+            observations.append(observation)
+            progress.record(
+                ToolRequestTurn(
+                    type="tool_call",
+                    tool_name=call.tool_name,
+                    arguments=dict(call.arguments),
+                ),
+                observation,
             )
             if status == "succeeded":
                 key = mutation_key(call.tool_name, dict(call.arguments))
@@ -631,10 +855,30 @@ class AgentRuntime:
         metric = await self.session.scalar(
             select(TaskRuntimeMetric).where(TaskRuntimeMetric.task_id == task_id)
         )
+        reused_steps = int(
+            await self.session.scalar(
+                select(func.count())
+                .select_from(Event)
+                .where(
+                    Event.task_id == task_id,
+                    Event.type == "DEV_OBSERVATION_REUSED",
+                )
+            )
+            or 0
+        )
+        restored_steps += reused_steps
+        if metric is not None:
+            progress.reused_observations = metric.reused_observations
+            progress.stale_invalidations = metric.stale_observation_invalidations
+            progress.stagnation_signals = metric.stagnation_signals
+            progress.last_useful_action = dict(metric.last_useful_action)
         duplicate_signals = (
             max(int(metric.tool_signature_counts.get("__last_count__", 1)) - 1, 0)
             if metric is not None
             else 0
+        )
+        rollover.budget_soft_checkpointed = any(
+            item.details.get("reason") == "TASK_BUDGET_SOFT_THRESHOLD" for item in rollover_events
         )
         return restored_steps, duplicate_signals
 
@@ -653,6 +897,9 @@ class AgentRuntime:
         duplicate_signals: int,
         stop_reason: str,
     ) -> None:
+        metric = await self.session.scalar(
+            select(TaskRuntimeMetric).where(TaskRuntimeMetric.task_id == task.id)
+        )
         failures = [
             {
                 "tool": item.tool,
@@ -692,6 +939,8 @@ class AgentRuntime:
             "failures": failures,
             "tool_steps": tool_steps,
             "rollover_count": rollover.count,
+            "rollover_limit": rollover.maximum,
+            "rollover_history": rollover.causes,
             "duplicate_signals": duplicate_signals,
             "mutation_fingerprints": sorted(rollover.executed_mutations),
             "model": model,
@@ -703,8 +952,15 @@ class AgentRuntime:
             "remaining_input_tokens": max(
                 budget.max_input_tokens - budget.consumed_input_tokens, 0
             ),
+            "cached_observations_reused": metric.reused_observations if metric else 0,
+            "stale_cache_invalidations": (metric.stale_observation_invalidations if metric else 0),
+            "malformed_tool_repair_attempts": (metric.malformed_tool_repairs if metric else 0),
+            "stagnation_signals": metric.stagnation_signals if metric else 0,
+            "last_useful_action": metric.last_useful_action if metric else {},
+            "context_component_bytes": metric.context_component_bytes if metric else {},
             "next_action": (
-                "Resume from durable evidence after the stop condition is resolved; "
+                rollover.handoff.get("next_action")
+                or "Resume from durable evidence after the stop condition is resolved; "
                 "do not replay mutations."
             ),
         }
@@ -818,6 +1074,7 @@ class AgentRuntime:
                 "qa_iteration": str(context.qa_feedback.get("qa_iteration", ""))
                 if context.qa_feedback
                 else "",
+                "context_component_bytes": json.dumps(instructions.context_components),
             },
             response_model=AgentTurnResponse,
             tools=tuple(
@@ -840,12 +1097,62 @@ class AgentRuntime:
                 recent_observation_limit=max(len(observations), 1),
             )
             baseline_bytes = len(baseline.user_prompt.encode("utf-8"))
-        await self.efficiency.record_context(
-            UUID(str(context.task["id"])),
-            sent_bytes,
-            baseline_bytes - sent_bytes,
+        return replace(
+            request,
+            metadata={
+                **request.metadata,
+                "estimated_unchanged_bytes_avoided": str(max(baseline_bytes - sent_bytes, 0)),
+            },
         )
-        return request
+
+    @staticmethod
+    def _request_context_components(request: ModelRequest) -> dict[str, int]:
+        raw = request.metadata.get("context_component_bytes", "{}")
+        try:
+            values = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return (
+            {
+                str(key): int(value)
+                for key, value in values.items()
+                if isinstance(value, int) and value >= 0
+            }
+            if isinstance(values, dict)
+            else {}
+        )
+
+    @staticmethod
+    def _required_validation_actions(context: ContextRecord) -> list[str]:
+        profile = context.development_profile
+        if not isinstance(profile, dict):
+            return []
+        allowed = {
+            "NODE_TEST",
+            "NODE_BUILD",
+            "NODE_LINT",
+            "NODE_TYPECHECK",
+            "PYTHON_TEST",
+            "PYTHON_LINT",
+        }
+        return sorted(
+            str(action) for action in profile.get("available_actions", []) if str(action) in allowed
+        )
+
+    @staticmethod
+    def _pending_argument_repair(
+        observations: list[ToolObservation], tool_name: str
+    ) -> ToolObservation | None:
+        for item in reversed(observations):
+            if item.error is not None and item.error.code == "TOOL_ARGUMENT_VALIDATION_FAILED":
+                details = item.error.details or {}
+                suggested = details.get("suggested_tool")
+                if item.tool == tool_name or suggested == tool_name:
+                    return item
+                return None
+            if item.status == "success" and item.tool == tool_name:
+                return None
+        return None
 
     @staticmethod
     def _developer_ready_for_final(
@@ -906,7 +1213,23 @@ class AgentRuntime:
                 "PYTHON_LINT",
             }
         )
-        return bool(required_actions) and required_actions.issubset(executed_actions)
+        has_mutation = bool({"filesystem.write", "filesystem.patch"}.intersection(tools))
+        if required_actions:
+            return required_actions.issubset(executed_actions)
+        return has_mutation
+
+    @staticmethod
+    def _provider_sends_structured_schema(profile: ModelProfile, request: ModelRequest) -> bool:
+        if profile.provider == "gemini":
+            return not request.tools
+        if profile.provider == "openrouter":
+            return (
+                profile.supported_parameters is None
+                or "response_format" in profile.supported_parameters
+            )
+        # OpenAI transports and explicit test/development providers use the runtime's structured
+        # response contract. Only known transports that omit it are excluded above.
+        return True
 
     async def _route_models(
         self,
@@ -971,8 +1294,7 @@ class AgentRuntime:
             rejected = []
             probe_results = []
             bounded_keys = {
-                (selection.profile.provider, selection.profile.model_id)
-                for selection in bounded
+                (selection.profile.provider, selection.profile.model_id) for selection in bounded
             }
             health_states = health
             for profile in profiles:

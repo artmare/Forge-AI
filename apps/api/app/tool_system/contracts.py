@@ -63,6 +63,7 @@ class ToolErrorPayload(BaseModel):
 
     code: str = Field(min_length=1)
     message: str = Field(min_length=1)
+    details: dict[str, Any] | None = None
 
 
 class ToolResult(BaseModel):
@@ -85,8 +86,13 @@ class ToolResult(BaseModel):
         return cls(status="success", result=result)
 
     @classmethod
-    def failure(cls, code: str, message: str) -> ToolResult:
-        return cls(status="error", error=ToolErrorPayload(code=code, message=message))
+    def failure(
+        cls, code: str, message: str, *, details: dict[str, Any] | None = None
+    ) -> ToolResult:
+        return cls(
+            status="error",
+            error=ToolErrorPayload(code=code, message=message, details=details),
+        )
 
 
 class ToolRequestTurn(BaseModel):

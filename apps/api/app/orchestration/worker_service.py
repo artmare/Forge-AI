@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -696,7 +696,13 @@ class WorkerExecutionService:
             else "Forge recorded a runtime failure without a classified error message."
         )
         upper = normalized_code.upper()
-        if "CHECKPOINT" in upper or upper.startswith("GIT_"):
+        if upper in {
+            "DUPLICATE_TOOL_LOOP",
+            "DEVELOPMENT_STAGNATION",
+            "TOOL_ARGUMENT_REPAIR_LIMIT_EXHAUSTED",
+        }:
+            category = "TOOL_OR_AGENT_RUNTIME_FAILURE"
+        elif "CHECKPOINT" in upper or upper.startswith("GIT_"):
             category = "CHECKPOINT_FAILURE"
         elif upper.startswith("DEVELOPMENT_") or "RUNNER" in upper or "LEASE" in upper:
             category = "INFRASTRUCTURE_FAILURE"
@@ -795,6 +801,13 @@ class WorkerExecutionService:
             .order_by(Event.created_at.desc())
             .limit(1)
         )
+        rollovers = list(
+            await self.session.scalars(
+                select(Event)
+                .where(Event.task_id == job.task_id, Event.type == "DEV_CONTEXT_ROLLOVER")
+                .order_by(Event.created_at)
+            )
+        )
         working_tree = dict(job.working_tree_state)
         if profile is not None:
             prior_count = working_tree.get("changed_files_count", 0)
@@ -832,16 +845,26 @@ class WorkerExecutionService:
                     )
                 ),
                 "context_bytes_sent": metric.context_bytes_sent if metric else 0,
-                "rollover_count": int(
-                    await self.session.scalar(
-                        select(func.count()).select_from(Event).where(
-                            Event.task_id == job.task_id,
-                            Event.type == "DEV_CONTEXT_ROLLOVER",
-                        )
-                    )
-                    or 0
-                ),
+                "rollover_count": len(rollovers),
+                "rollover_limit": self.settings.forge_dev_max_rollovers,
+                "rollover_reasons": [
+                    {
+                        "count": item.details.get("rollover_count"),
+                        "reason": item.details.get("reason"),
+                        "estimated_input_tokens": item.details.get("estimated_input_tokens"),
+                        "progress": item.details.get("progress_since_last_rollover", []),
+                    }
+                    for item in rollovers
+                ],
                 "last_rollover": rollover.details if rollover is not None else None,
+                "context_component_bytes": (metric.context_component_bytes if metric else {}),
+                "cached_observations_reused": (metric.reused_observations if metric else 0),
+                "stale_cache_invalidations": (
+                    metric.stale_observation_invalidations if metric else 0
+                ),
+                "malformed_tool_repair_attempts": (metric.malformed_tool_repairs if metric else 0),
+                "stagnation_signals": metric.stagnation_signals if metric else 0,
+                "last_useful_action": metric.last_useful_action if metric else {},
                 "rollover_disposition": (
                     "ROLLOVER_RECORDED"
                     if rollover is not None

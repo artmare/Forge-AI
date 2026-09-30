@@ -31,6 +31,12 @@ class RuntimeEfficiencyResponse(BaseModel):
     context_reduction_ratio: float
     repeated_reads_avoided: int
     duplicate_turns_detected: int
+    reused_observations: int
+    stale_observation_invalidations: int
+    malformed_tool_repairs: int
+    stagnation_signals: int
+    context_component_bytes: dict[str, int]
+    last_useful_action: dict[str, Any]
     deterministic_executions: int
     escalations: list[ModelEscalationResponse]
 

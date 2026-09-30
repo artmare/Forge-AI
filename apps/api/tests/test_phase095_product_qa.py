@@ -12,6 +12,7 @@ from app.domain.enums import TaskStatus
 from app.domain.models import Event, Task, TaskRuntimeBudget
 from app.infrastructure.database import get_session_factory
 from app.planning.mission_planner import MissionPlanner
+from app.services.event_factory import EventFactory
 from app.tool_system.contracts import ToolObservation, ToolRequestTurn
 from tests.helpers import (
     create_agent,
@@ -184,9 +185,7 @@ async def test_human_budget_resume_preserves_usage_and_adds_only_approved_tokens
             )
         )
         handoff = await session.scalar(
-            select(Event).where(
-                Event.task_id == task_id, Event.type == "DEV_BUDGET_HANDOFF"
-            )
+            select(Event).where(Event.task_id == task_id, Event.type == "DEV_BUDGET_HANDOFF")
         )
         assert budget is not None
         assert budget.max_input_tokens == 265_000
@@ -195,3 +194,66 @@ async def test_human_budget_resume_preserves_usage_and_adds_only_approved_tokens
         assert event is not None
         assert handoff is not None
         assert handoff.details["legacy_reconstructed"] is True
+
+
+async def test_human_context_resume_is_single_use_and_preserves_bounds(
+    client: AsyncClient,
+) -> None:
+    company = await create_company(client, slug=f"context-resume-{uuid4().hex[:8]}")
+    project = await create_project(client, company["id"])
+    agent = await create_agent(client, company["id"], role="DEVELOPER")
+    task = await create_task(client, company["id"], project["id"], agent["id"])
+    task_id = UUID(task["id"])
+    async with get_session_factory()() as session:
+        model = await session.get(Task, task_id)
+        assert model is not None
+        budget = await EfficientRuntimeService(session, Settings()).enforce_budget(model)
+        model.status = TaskStatus.FAILED
+        model.iteration = 1
+        model.max_iterations = 1
+        model.completed_at = datetime.now(UTC)
+        model.terminal_reason = {
+            "code": "MODEL_CONTEXT_ROLLOVER_LIMIT_EXHAUSTED",
+            "message": "Context rollover bound reached.",
+        }
+        budget.consumed_input_tokens = 219_681
+        await EventFactory(session).create(
+            company_id=model.company_id,
+            project_id=model.project_id,
+            agent_id=model.assigned_agent_id,
+            task_id=model.id,
+            correlation_id=model.id,
+            event_type="DEV_CONTEXT_FAILURE_HANDOFF",
+            message="Context recovery handoff.",
+            payload={
+                "stop_reason": "MODEL_CONTEXT_ROLLOVER_LIMIT_EXHAUSTED",
+                "checkpoint": {"created": True, "commit": "deadbeef"},
+                "rollover_count": 4,
+                "rollover_limit": 4,
+                "input_tokens_consumed": 219_681,
+                "mutation_fingerprints": ["write:index.html"],
+            },
+        )
+        await session.commit()
+
+    response = await client.post(f"/api/v1/tasks/{task_id}/resume-context")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "QUEUED"
+    assert response.json()["max_iterations"] == 2
+
+    duplicate = await client.post(f"/api/v1/tasks/{task_id}/resume-context")
+    assert duplicate.status_code == 409
+    async with get_session_factory()() as session:
+        budget = await session.scalar(
+            select(TaskRuntimeBudget).where(TaskRuntimeBudget.task_id == task_id)
+        )
+        approval = await session.scalar(
+            select(Event).where(
+                Event.task_id == task_id, Event.type == "DEV_CONTEXT_RESUME_APPROVED"
+            )
+        )
+        assert budget is not None
+        assert budget.max_input_tokens == 240_000
+        assert budget.consumed_input_tokens == 219_681
+        assert approval is not None
+        assert approval.details["rollover_limit_unchanged"] is True

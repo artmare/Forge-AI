@@ -96,6 +96,12 @@ async def resume_input_budget(
     return TaskResponse.model_validate(task)
 
 
+@router.post("/{task_id}/resume-context", response_model=TaskResponse)
+async def resume_context(task_id: UUID, session: Session) -> TaskResponse:
+    task = await EfficientRuntimeService(session, get_settings()).approve_context_resume(task_id)
+    return TaskResponse.model_validate(task)
+
+
 @router.post("/{task_id}/execute", response_model=AgentRunResponse)
 async def execute_task(
     task_id: UUID, payload: ExecuteTaskRequest, session: Session

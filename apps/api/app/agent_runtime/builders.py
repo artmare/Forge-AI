@@ -45,9 +45,17 @@ class ContextRecord(BaseModel):
 class BuiltInstructions(BaseModel):
     system_prompt: str
     user_prompt: str
+    context_components: dict[str, int] = Field(default_factory=dict)
     runtime_role: Literal[
-        "GENERAL", "RESEARCHER", "DEVELOPER", "QA", "ARCHITECT", "CODE_REVIEWER",
-        "PRODUCT_UX", "CREATIVE_DIRECTOR", "MARKETING_STRATEGY"
+        "GENERAL",
+        "RESEARCHER",
+        "DEVELOPER",
+        "QA",
+        "ARCHITECT",
+        "CODE_REVIEWER",
+        "PRODUCT_UX",
+        "CREATIVE_DIRECTOR",
+        "MARKETING_STRATEGY",
     ]
 
 
@@ -145,6 +153,11 @@ class ContextBuilder:
             if task.project_id is not None
             else []
         )
+        prior_checkpoints = (
+            [item for item in knowledge.checkpoints if str(item.get("task_id", "")) != str(task.id)]
+            if knowledge is not None
+            else []
+        )
         return ContextRecord(
             company={"id": str(company.id), "name": company.name, "goal": company.goal},
             project=(
@@ -220,7 +233,9 @@ class ContextBuilder:
                     "constraints": self._bounded_memory(knowledge.constraints[-20:], 1500),
                     "recent_changes": self._bounded_memory(knowledge.recent_changes[-10:], 2000),
                     "lessons": self._bounded_memory(knowledge.lessons[-10:], 2000),
-                    "checkpoints": self._bounded_memory(knowledge.checkpoints[-2:], 2500),
+                    # The current task handoff is injected explicitly after rollover. Including
+                    # its Project Brain checkpoint here duplicated the same state in one prompt.
+                    "checkpoints": self._bounded_memory(prior_checkpoints[-2:], 2500),
                 }
                 if knowledge is not None
                 else None
@@ -323,15 +338,22 @@ class InstructionBuilder:
         if requested_role == "LEAD_ENGINEER":
             requested_role = "DEVELOPER"
         role: Literal[
-            "GENERAL", "RESEARCHER", "DEVELOPER", "QA", "ARCHITECT", "CODE_REVIEWER",
-            "PRODUCT_UX", "CREATIVE_DIRECTOR", "MARKETING_STRATEGY"
-        ] = (
-            requested_role if requested_role in self.ROLE else "GENERAL"
-        )  # type: ignore[assignment]
+            "GENERAL",
+            "RESEARCHER",
+            "DEVELOPER",
+            "QA",
+            "ARCHITECT",
+            "CODE_REVIEWER",
+            "PRODUCT_UX",
+            "CREATIVE_DIRECTOR",
+            "MARKETING_STRATEGY",
+        ] = requested_role if requested_role in self.ROLE else "GENERAL"  # type: ignore[assignment]
         available_tools = tools or []
         if available_tools:
-            tool_guidance = "Available tools:\n" + json.dumps(
-                [tool.model_dump(mode="json") for tool in available_tools],
+            # Native provider tools carry the authoritative schema. Repeating full input/output
+            # schemas in the system prompt consumed thousands of tokens on every continuation.
+            tool_guidance = "Available native tools:\n" + json.dumps(
+                [{"name": tool.name, "description": tool.description} for tool in available_tools],
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -382,6 +404,35 @@ class InstructionBuilder:
         user_prompt = (
             label + ":\n" + json.dumps(visible_context, sort_keys=True, separators=(",", ":"))
         )
+        context_components = {
+            "task": len(
+                json.dumps(
+                    {
+                        "task": context.task,
+                        "agent": context.agent,
+                        "review": context.review,
+                        "qa_feedback": context.qa_feedback,
+                        "development_profile": context.development_profile,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ),
+            "project_brain": len(
+                json.dumps(
+                    context.project_knowledge,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ),
+            "source_context": len(
+                json.dumps(
+                    context.relevant_files,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ),
+        }
         if context.review is not None:
             artifact_guidance = (
                 "Relevant existing project artifacts: " + ", ".join(context.artifacts)
@@ -431,16 +482,24 @@ class InstructionBuilder:
                 sort_keys=True,
                 separators=(",", ":"),
             )
+            context_components["prompt_observations"] = len(
+                json.dumps(
+                    self._prompt_observations(recent),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            )
+        measured = sum(context_components.values())
+        context_components["prompt_framing"] = max(len(user_prompt.encode()) - measured, 0)
         return BuiltInstructions(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            context_components=context_components,
             runtime_role=role,
         )
 
     @classmethod
-    def _prompt_observations(
-        cls, observations: list[ToolObservation]
-    ) -> list[dict[str, Any]]:
+    def _prompt_observations(cls, observations: list[ToolObservation]) -> list[dict[str, Any]]:
         """Keep the newest unchanged file read and replace earlier copies with references."""
         seen_reads: set[tuple[str, str]] = set()
         values: list[dict[str, Any]] = []

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
@@ -20,18 +20,21 @@ class EmptyInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+ExecutableAction = Literal[
+    DevelopmentAction.NODE_TEST,
+    DevelopmentAction.NODE_BUILD,
+    DevelopmentAction.NODE_LINT,
+    DevelopmentAction.NODE_TYPECHECK,
+    DevelopmentAction.PYTHON_TEST,
+    DevelopmentAction.PYTHON_LINT,
+]
+
+
 class ExecuteInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    action: DevelopmentAction
+    action: ExecutableAction
     target: str | None = Field(default=None, max_length=512)
-
-    @field_validator("action")
-    @classmethod
-    def prohibit_install_and_git(cls, value: DevelopmentAction) -> DevelopmentAction:
-        if value.value.endswith("INSTALL") or value.value.startswith("GIT_"):
-            raise ValueError("Use the dedicated dependency or Git tool")
-        return value
 
 
 class DevelopmentOutput(BaseModel):
@@ -54,7 +57,9 @@ class DevelopmentTools:
         self, payload: ExecuteInput, context: ToolExecutionContext
     ) -> DevelopmentOutput:
         arguments = {"target": payload.target} if payload.target is not None else {}
-        return self.output(await self.service.execute(payload.action, arguments, context))
+        return self.output(
+            await self.service.execute(DevelopmentAction(payload.action), arguments, context)
+        )
 
     async def install(
         self, _payload: EmptyInput, context: ToolExecutionContext

@@ -112,6 +112,24 @@ class TaskRuntimeMetric(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     deterministic_executions: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False
     )
+    reused_observations: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    stale_observation_invalidations: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    malformed_tool_repairs: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    stagnation_signals: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    context_component_bytes: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    last_useful_action: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
     tool_signature_counts: Mapped[dict[str, Any]] = mapped_column(
         JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
     )

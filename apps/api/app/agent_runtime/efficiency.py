@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -39,9 +40,7 @@ class BudgetSnapshot:
 
 
 class ModelBudgetExceeded(RuntimeError):
-    def __init__(
-        self, reason: str, budget: TaskRuntimeBudget, snapshot: BudgetSnapshot
-    ) -> None:
+    def __init__(self, reason: str, budget: TaskRuntimeBudget, snapshot: BudgetSnapshot) -> None:
         self.reason = reason
         self.budget = budget
         self.snapshot = snapshot
@@ -78,13 +77,9 @@ class EfficientRuntimeService:
         self, task_id: UUID, additional_input_tokens: int
     ) -> Task:
         """Explicit human recovery; preserves consumption and durable task evidence."""
-        task = await self.session.scalar(
-            select(Task).where(Task.id == task_id).with_for_update()
-        )
+        task = await self.session.scalar(select(Task).where(Task.id == task_id).with_for_update())
         budget = await self.session.scalar(
-            select(TaskRuntimeBudget)
-            .where(TaskRuntimeBudget.task_id == task_id)
-            .with_for_update()
+            select(TaskRuntimeBudget).where(TaskRuntimeBudget.task_id == task_id).with_for_update()
         )
         if (
             task is None
@@ -128,9 +123,60 @@ class EfficientRuntimeService:
         await self.session.commit()
         return task
 
-    async def _ensure_resume_handoff(
-        self, task: Task, budget: TaskRuntimeBudget
-    ) -> None:
+    async def approve_context_resume(self, task_id: UUID) -> Task:
+        """Human-approved continuation that preserves all rollover and budget counters."""
+        task = await self.session.scalar(select(Task).where(Task.id == task_id).with_for_update())
+        handoff = await self.session.scalar(
+            select(Event)
+            .where(Event.task_id == task_id, Event.type == "DEV_CONTEXT_FAILURE_HANDOFF")
+            .order_by(Event.created_at.desc())
+            .limit(1)
+        )
+        prior_approval = await self.session.scalar(
+            select(Event)
+            .where(Event.task_id == task_id, Event.type == "DEV_CONTEXT_RESUME_APPROVED")
+            .order_by(Event.created_at.desc())
+            .limit(1)
+        )
+        eligible = (
+            task is not None
+            and task.status == TaskStatus.FAILED
+            and handoff is not None
+            and handoff.details.get("stop_reason") == "MODEL_CONTEXT_ROLLOVER_LIMIT_EXHAUSTED"
+            and isinstance(handoff.details.get("checkpoint"), dict)
+            and bool(handoff.details["checkpoint"].get("created"))
+            and (prior_approval is None or prior_approval.created_at < handoff.created_at)
+        )
+        if not eligible or task is None or handoff is None:
+            raise AgentRuntimeDomainError(
+                "TASK_CONTEXT_RESUME_NOT_ALLOWED",
+                "Task is not eligible for bounded context recovery",
+                409,
+            )
+        task.status = TaskStatus.QUEUED
+        task.completed_at = None
+        task.terminal_reason = None
+        task.max_iterations = max(task.max_iterations, task.iteration + 1)
+        await EventFactory(self.session).create(
+            company_id=task.company_id,
+            project_id=task.project_id,
+            agent_id=task.assigned_agent_id,
+            task_id=task.id,
+            correlation_id=task.id,
+            event_type="DEV_CONTEXT_RESUME_APPROVED",
+            message="Human approved one continuation from the durable context handoff.",
+            payload={
+                "handoff_event_id": str(handoff.id),
+                "rollover_count": handoff.details.get("rollover_count", 0),
+                "rollover_limit_unchanged": True,
+                "input_tokens_consumed": handoff.details.get("input_tokens_consumed", 0),
+                "mutation_fingerprints": handoff.details.get("mutation_fingerprints", []),
+            },
+        )
+        await self.session.commit()
+        return task
+
+    async def _ensure_resume_handoff(self, task: Task, budget: TaskRuntimeBudget) -> None:
         existing = await self.session.scalar(
             select(Event.id)
             .where(Event.task_id == task.id, Event.type == "DEV_BUDGET_HANDOFF")
@@ -318,10 +364,45 @@ class EfficientRuntimeService:
         await self.session.flush()
         return target
 
-    async def record_context(self, task_id: UUID, sent_bytes: int, avoided_bytes: int) -> None:
+    async def record_context(
+        self,
+        task_id: UUID,
+        sent_bytes: int,
+        avoided_bytes: int,
+        components: dict[str, int] | None = None,
+    ) -> None:
         metric = await self._metric(task_id)
         metric.context_bytes_sent += sent_bytes
         metric.estimated_unchanged_bytes_avoided += max(avoided_bytes, 0)
+        totals = dict(metric.context_component_bytes)
+        for name, value in (components or {}).items():
+            totals[name] = int(totals.get(name, 0)) + max(int(value), 0)
+        metric.context_component_bytes = totals
+        await self.session.flush()
+
+    async def record_observation_reuse(self, task_id: UUID, *, stagnation_signals: int) -> None:
+        metric = await self._metric(task_id)
+        metric.reused_observations += 1
+        metric.repeated_reads_avoided += 1
+        metric.stagnation_signals = max(metric.stagnation_signals, stagnation_signals)
+        await self.session.flush()
+
+    async def record_cache_invalidation(self, task_id: UUID, count: int) -> None:
+        if count <= 0:
+            return
+        metric = await self._metric(task_id)
+        metric.stale_observation_invalidations += count
+        await self.session.flush()
+
+    async def record_tool_repair(self, task_id: UUID) -> None:
+        metric = await self._metric(task_id)
+        metric.malformed_tool_repairs += 1
+        await self.session.flush()
+
+    async def record_useful_action(self, task_id: UUID, action: dict[str, Any]) -> None:
+        metric = await self._metric(task_id)
+        metric.last_useful_action = action
+        metric.stagnation_signals = 0
         await self.session.flush()
 
     async def record_tool_request(self, task_id: UUID, turn: ToolRequestTurn) -> int:

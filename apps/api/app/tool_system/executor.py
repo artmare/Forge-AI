@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 
 from pydantic import BaseModel, ValidationError
 
@@ -12,9 +14,57 @@ class ToolExecutor:
         try:
             return definition.input_model.model_validate(arguments)
         except ValidationError as exc:
+            schema = definition.input_model.model_json_schema()
+            issues = json.loads(
+                json.dumps(
+                    exc.errors(include_url=False, include_input=False),
+                    default=str,
+                )
+            )
+            invalid_fields = sorted({str(item["loc"][0]) for item in issues if item.get("loc")})
+            required = [str(item) for item in schema.get("required", [])]
+            provided = sorted(str(item) for item in arguments)
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {"tool": definition.name, "arguments": arguments},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode()
+            ).hexdigest()
+            suggested_tool = None
+            suggested_arguments: dict[str, object] | None = None
+            if definition.name == "development.execute":
+                action = arguments.get("action")
+                git_tools = {
+                    "GIT_STATUS": "git.status",
+                    "GIT_DIFF": "git.diff",
+                    "GIT_LOG": "git.log",
+                    "GIT_CHECKPOINT": "git.commit",
+                    "GIT_INIT": "git.init",
+                }
+                if isinstance(action, str) and action in git_tools:
+                    suggested_tool = git_tools[action]
+                    suggested_arguments = {}
             raise ToolSystemError(
                 "TOOL_ARGUMENT_VALIDATION_FAILED",
                 "Tool arguments do not match the required schema",
+                details={
+                    "tool_name": definition.name,
+                    "invalid_call_fingerprint": fingerprint,
+                    "required_fields": required,
+                    "provided_fields": provided,
+                    "missing_fields": sorted(set(required) - set(provided)),
+                    "invalid_fields": invalid_fields,
+                    "validation_errors": issues[:8],
+                    "schema": schema,
+                    "suggested_tool": suggested_tool,
+                    "suggested_arguments": suggested_arguments,
+                    "repair_instruction": (
+                        "Repair this tool call only. Use exactly the declared fields and allowed "
+                        "values; do not describe or execute the action in prose."
+                    ),
+                },
             ) from exc
 
     async def execute(
@@ -31,7 +81,7 @@ class ToolExecutor:
         except TimeoutError:
             return ToolResult.failure("TOOL_TIMEOUT", "Tool execution timed out")
         except ToolSystemError as exc:
-            return ToolResult.failure(exc.code, exc.message)
+            return ToolResult.failure(exc.code, exc.message, details=exc.details)
         except ValidationError:
             return ToolResult.failure(
                 "TOOL_OUTPUT_VALIDATION_FAILED",

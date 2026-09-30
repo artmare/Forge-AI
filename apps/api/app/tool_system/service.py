@@ -5,6 +5,7 @@ from time import perf_counter
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
@@ -98,7 +99,11 @@ class ToolExecutionService:
             validated = self.executor.validate_arguments(definition, call.arguments)
         except ToolSystemError as exc:
             return await self._finish_before_execution(
-                call_id, ToolCallStatus.FAILED, exc.code, exc.message
+                call_id,
+                ToolCallStatus.FAILED,
+                exc.code,
+                exc.message,
+                details=exc.details,
             )
 
         if call.status == ToolCallStatus.REQUESTED:
@@ -233,7 +238,9 @@ class ToolExecutionService:
             message = "Tool execution succeeded."
         else:
             call.status = ToolCallStatus.FAILED
-            call.error = result.error.model_dump(mode="json") if result.error else None
+            call.error = (
+                result.error.model_dump(mode="json", exclude_none=True) if result.error else None
+            )
             event_type = "TOOL_CALL_FAILED"
             message = "Tool execution failed."
         await self._event(call, event_type, message)
@@ -246,6 +253,8 @@ class ToolExecutionService:
         status: ToolCallStatus,
         code: str,
         message: str,
+        *,
+        details: dict[str, object] | None = None,
     ) -> ToolResult:
         call = await self.calls.get_for_update(call_id)
         if call is None:
@@ -259,12 +268,45 @@ class ToolExecutionService:
             await self.session.rollback()
             return ToolResult.failure("TOOL_ALREADY_RUNNING", "ToolCall has already been claimed")
         call.status = status
-        call.error = {"code": code, "message": message}
         call.completed_at = datetime.now(UTC)
+        if code == "TOOL_ARGUMENT_VALIDATION_FAILED" and details is not None:
+            fingerprint = details.get("invalid_call_fingerprint")
+            prior = list(
+                await self.session.scalars(
+                    select(ToolCall)
+                    .where(
+                        ToolCall.task_id == call.task_id,
+                        ToolCall.id != call.id,
+                    )
+                    .order_by(ToolCall.created_at, ToolCall.id)
+                )
+            )
+            attempt = 1
+            identical_attempt = 1
+            for item in reversed(prior):
+                if item.tool_name != call.tool_name or item.status == ToolCallStatus.SUCCEEDED:
+                    break
+                item_error = item.error or {}
+                item_details = item_error.get("details") or {}
+                if item_error.get("code") == code:
+                    attempt += 1
+                    if (
+                        isinstance(item_details, dict)
+                        and item_details.get("invalid_call_fingerprint") == fingerprint
+                    ):
+                        identical_attempt += 1
+            details = {
+                **details,
+                "repair_attempt": attempt,
+                "identical_repair_attempt": identical_attempt,
+            }
+        call.error = {"code": code, "message": message}
+        if details is not None:
+            call.error["details"] = details
         event_type = "TOOL_CALL_DENIED" if status == ToolCallStatus.DENIED else "TOOL_CALL_FAILED"
         await self._event(call, event_type, message)
         await self.session.commit()
-        return ToolResult.failure(code, message)
+        return ToolResult.failure(code, message, details=details)
 
     def observation(self, call: ToolCall, result: ToolResult) -> ToolObservation:
         payload = result.model_dump(mode="json")
@@ -359,5 +401,10 @@ class ToolExecutionService:
                 "code": "TOOL_EXECUTION_FAILED",
                 "message": "Tool execution did not complete",
             }
-            return ToolResult.failure(str(error["code"]), str(error["message"]))
+            details = error.get("details")
+            return ToolResult.failure(
+                str(error["code"]),
+                str(error["message"]),
+                details=details if isinstance(details, dict) else None,
+            )
         return None

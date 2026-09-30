@@ -122,6 +122,8 @@ class Settings(BaseSettings):
     forge_dev_context_limit: int = Field(default=32768, ge=1024)
     forge_dev_context_reserve_tokens: int = Field(default=2048, ge=0, le=32768)
     forge_dev_max_rollovers: int = Field(default=4, ge=0, le=20)
+    forge_dev_tool_repair_limit: int = Field(default=2, ge=1, le=4)
+    forge_dev_stagnation_limit: int = Field(default=4, ge=2, le=10)
     forge_dev_repository_path: str | None = None
     forge_dev_allowed_repository: str | None = None
     forge_dev_worktree_root: str | None = None
