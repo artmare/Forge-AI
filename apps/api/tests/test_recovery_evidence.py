@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -6,15 +7,25 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from app.agent_runtime.contracts import ModelResponse, ModelUsage
 from app.agent_runtime.efficiency import EfficientRuntimeService
 from app.agent_runtime.providers import MockModelProvider
 from app.agent_runtime.recovery_evidence import RecoveryEvidenceService
 from app.agent_runtime.runtime import AgentRuntime
 from app.core.config import Settings
+from app.development.tools import DevelopmentOutput, EmptyInput
+from app.domain.enums import (
+    DevelopmentAction,
+    DevelopmentExecutionStatus,
+    ToolPermission,
+    ToolRiskLevel,
+)
 from app.domain.exceptions import AgentRuntimeDomainError
 from app.domain.models import AgentRun, Event, Task, ToolCall
 from app.infrastructure.database import get_session_factory
 from app.services.event_factory import EventFactory
+from app.tool_system.contracts import ToolDefinition
+from app.tool_system.registry import ToolRegistry
 from tests.helpers import create_agent, create_company, create_project, transition_task
 
 
@@ -57,6 +68,95 @@ def _final(*, scope: str, calls: list[ToolCall]) -> dict:
             "notes": [],
         },
     }
+
+
+def _git_registry(workspace: Path) -> ToolRegistry:
+    registry = ToolRegistry()
+
+    def definition(tool_name: str, action: DevelopmentAction) -> ToolDefinition:
+        async def execute(_payload: EmptyInput, _context) -> DevelopmentOutput:
+            arguments = (
+                ("status", "--short")
+                if action == DevelopmentAction.GIT_STATUS
+                else ("diff", "--no-ext-diff", "--no-textconv", "--")
+            )
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                ["git", "-C", str(workspace), *arguments],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            status = (
+                DevelopmentExecutionStatus.SUCCEEDED
+                if completed.returncode == 0
+                else DevelopmentExecutionStatus.FAILED
+            )
+            return DevelopmentOutput(
+                execution_id=str(uuid4()),
+                action=action,
+                status=status,
+                exit_code=completed.returncode,
+                stdout_excerpt=completed.stdout,
+                stderr_excerpt=completed.stderr,
+                output_truncated=False,
+                duration_ms=0,
+                change_summary=None,
+            )
+
+        return ToolDefinition(
+            tool_name,
+            f"Inspect {action.value} in the isolated recovery fixture.",
+            EmptyInput,
+            DevelopmentOutput,
+            ToolRiskLevel.LOW,
+            ToolPermission.GIT_READ.value,
+            10,
+            True,
+            execute,
+        )
+
+    registry.register(definition("git.status", DevelopmentAction.GIT_STATUS))
+    registry.register(definition("git.diff", DevelopmentAction.GIT_DIFF))
+    return registry
+
+
+class _RecoveryGitProvider:
+    name = "mock"
+    paid = False
+
+    def __init__(self, historical_calls: list[ToolCall]) -> None:
+        self.historical_calls = historical_calls
+        self.call_count = 0
+        self.requests = []
+
+    async def generate(self, request) -> ModelResponse:
+        self.call_count += 1
+        self.requests.append(request)
+        if self.call_count == 1:
+            output = {"type": "tool_call", "tool_name": "git.status", "arguments": {}}
+        elif self.call_count == 2:
+            output = {"type": "tool_call", "tool_name": "git.diff", "arguments": {}}
+        else:
+            git_claims = [
+                {
+                    "kind": "GIT",
+                    "reference": exchange.response["result"]["action"],
+                    "scope": "CURRENT_RUN",
+                    "tool_call_id": exchange.response["tool_call_id"],
+                }
+                for exchange in request.tool_exchanges
+                if exchange.response.get("tool") in {"git.status", "git.diff"}
+            ]
+            output = _final(scope="HISTORICAL", calls=self.historical_calls)
+            output["result"]["output"]["execution_claims"].extend(git_claims)
+        return ModelResponse(
+            output=output,
+            usage=ModelUsage(input_tokens=12, output_tokens=18, total_tokens=30),
+            provider=self.name,
+            model=request.model,
+            response_id=f"recovery-git-{self.call_count}",
+        )
 
 
 async def _recovery_fixture(client: AsyncClient, tmp_path: Path) -> dict:
@@ -285,6 +385,51 @@ async def test_novanote_recovery_repairs_scope_without_replaying_mutations(
     assert truth_approval.details["model_calls_consumed"] >= 6
     assert task.status.value == "REVIEW"
     assert completed_snapshot.active is False
+    assert all(
+        (fixture["workspace"] / name).exists()
+        for name in ("index.html", "styles.css", "app.js")
+    )
+
+
+async def test_novanote_recovery_accepts_current_canonical_git_evidence_without_repair(
+    client: AsyncClient, tmp_path: Path
+) -> None:
+    fixture = await _recovery_fixture(client, tmp_path)
+    provider = _RecoveryGitProvider(fixture["calls"])
+
+    async with get_session_factory()() as session:
+        run = await AgentRuntime(
+            session,
+            settings=fixture["settings"],
+            provider=provider,
+            tool_registry=_git_registry(fixture["workspace"]),
+        ).execute(fixture["task_id"])
+        calls = list(
+            await session.scalars(
+                select(ToolCall)
+                .where(ToolCall.task_id == fixture["task_id"])
+                .order_by(ToolCall.created_at)
+            )
+        )
+        repairs = list(
+            await session.scalars(
+                select(Event).where(
+                    Event.task_id == fixture["task_id"],
+                    Event.type == "DEV_EXECUTION_TRUTH_REPAIR_REQUIRED",
+                )
+            )
+        )
+
+    assert run.status.value == "SUCCEEDED"
+    assert provider.call_count == 3
+    assert [call.tool_name for call in calls] == [
+        "filesystem.write",
+        "filesystem.write",
+        "filesystem.write",
+        "git.status",
+        "git.diff",
+    ]
+    assert repairs == []
     assert all(
         (fixture["workspace"] / name).exists()
         for name in ("index.html", "styles.css", "app.js")

@@ -4,7 +4,12 @@ import json
 
 from pydantic import BaseModel, ValidationError
 
-from app.tool_system.contracts import ToolDefinition, ToolExecutionContext, ToolResult
+from app.tool_system.contracts import (
+    GIT_TOOL_REFERENCES,
+    ToolDefinition,
+    ToolExecutionContext,
+    ToolResult,
+)
 from app.tool_system.errors import ToolSystemError
 
 
@@ -36,13 +41,7 @@ class ToolExecutor:
             suggested_arguments: dict[str, object] | None = None
             if definition.name == "development.execute":
                 action = arguments.get("action")
-                git_tools = {
-                    "GIT_STATUS": "git.status",
-                    "GIT_DIFF": "git.diff",
-                    "GIT_LOG": "git.log",
-                    "GIT_CHECKPOINT": "git.commit",
-                    "GIT_INIT": "git.init",
-                }
+                git_tools = {item.value: tool for tool, item in GIT_TOOL_REFERENCES.items()}
                 if isinstance(action, str) and action in git_tools:
                     suggested_tool = git_tools[action]
                     suggested_arguments = {}

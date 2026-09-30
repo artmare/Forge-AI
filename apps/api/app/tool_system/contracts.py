@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
+from types import MappingProxyType
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -14,7 +16,28 @@ from pydantic import (
 )
 
 from app.agent_runtime.contracts import BaseAgentResult
-from app.domain.enums import ToolRiskLevel
+from app.domain.enums import DevelopmentAction, ToolRiskLevel
+
+GIT_TOOL_REFERENCES = MappingProxyType(
+    {
+        "git.init": DevelopmentAction.GIT_INIT,
+        "git.status": DevelopmentAction.GIT_STATUS,
+        "git.diff": DevelopmentAction.GIT_DIFF,
+        "git.log": DevelopmentAction.GIT_LOG,
+        "git.commit": DevelopmentAction.GIT_CHECKPOINT,
+    }
+)
+
+
+def canonical_git_reference(tool_name: str) -> str | None:
+    """Return the Forge-owned semantic reference for a registered Git tool."""
+    action = GIT_TOOL_REFERENCES.get(tool_name)
+    return action.value if action is not None else None
+
+
+class ToolObservationProvenance(StrEnum):
+    EXECUTED_TOOL_CALL = "EXECUTED_TOOL_CALL"
+    REUSED_TOOL_CALL_RESULT = "REUSED_TOOL_CALL_RESULT"
 
 ToolArguments = Annotated[
     dict[str, Any],
@@ -145,6 +168,10 @@ class ToolObservation(BaseModel):
     error: ToolErrorPayload | None = None
     truncated: bool = False
     original_chars: int | None = None
+    provenance: ToolObservationProvenance = ToolObservationProvenance.EXECUTED_TOOL_CALL
+    task_id: UUID | None = None
+    task_run_id: UUID | None = None
+    agent_run_id: UUID | None = None
 
 
 class ToolDefinitionPublic(BaseModel):

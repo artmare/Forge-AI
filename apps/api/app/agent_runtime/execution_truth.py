@@ -9,7 +9,11 @@ from uuid import UUID
 
 from app.agent_runtime.builders import ContextRecord
 from app.agent_runtime.contracts import BaseAgentResult
-from app.tool_system.contracts import ToolObservation
+from app.tool_system.contracts import (
+    ToolObservation,
+    ToolObservationProvenance,
+    canonical_git_reference,
+)
 
 
 class EvidenceKind(StrEnum):
@@ -114,13 +118,13 @@ class ExecutionTruthValidator:
         historical_evidence: tuple[ExecutionEvidence, ...] = (),
         current_task_id: UUID | None = None,
         current_project_id: UUID | None = None,
-        current_agent_run_id: UUID | None = None,
+        current_task_run_id: UUID | None = None,
     ) -> ExecutionTruthDecision:
         current_evidence = cls.collect(
             observations,
             task_id=current_task_id,
             project_id=current_project_id,
-            agent_run_id=current_agent_run_id,
+            task_run_id=current_task_run_id,
         )
         trusted_history = tuple(
             item
@@ -178,6 +182,22 @@ class ExecutionTruthValidator:
             claim_reference = claim.get("reference")
             claim_scope = str(claim.get("scope") or "CURRENT_RUN").upper()
             claim_tool_call_id = claim.get("tool_call_id")
+            if claim_kind == EvidenceKind.GIT.value and (
+                not isinstance(claim_reference, str)
+                or not isinstance(claim_tool_call_id, str)
+            ):
+                return ExecutionTruthDecision(
+                    False,
+                    "UNVERIFIED_EXECUTION_CLAIM",
+                    "A Git execution claim requires its canonical reference and ToolCall ID.",
+                    evidence,
+                    {
+                        "kind": claim_kind,
+                        "reference": claim_reference,
+                        "scope": claim_scope,
+                        "tool_call_id": claim_tool_call_id,
+                    },
+                )
             matching_evidence = [item for item in evidence if item.kind.value == claim_kind]
             expected_provenance = (
                 EvidenceProvenance.RECOVERY_HISTORY
@@ -260,11 +280,17 @@ class ExecutionTruthValidator:
         *,
         task_id: UUID | None = None,
         project_id: UUID | None = None,
-        agent_run_id: UUID | None = None,
+        task_run_id: UUID | None = None,
     ) -> tuple[ExecutionEvidence, ...]:
         collected: list[ExecutionEvidence] = []
         for observation in observations:
-            if observation.status != "success":
+            if (
+                observation.status != "success"
+                or observation.provenance
+                != ToolObservationProvenance.EXECUTED_TOOL_CALL
+                or (task_id is not None and observation.task_id != task_id)
+                or (task_run_id is not None and observation.task_run_id != task_run_id)
+            ):
                 continue
             result: dict[str, Any] = observation.result or {}
             if observation.tool in cls._MUTATION_TOOLS:
@@ -276,7 +302,7 @@ class ExecutionTruthValidator:
                         str(path) if isinstance(path, str) else None,
                         task_id=task_id,
                         project_id=project_id,
-                        agent_run_id=agent_run_id,
+                        agent_run_id=observation.agent_run_id,
                         tool_call_id=observation.tool_call_id,
                     )
                 )
@@ -299,19 +325,20 @@ class ExecutionTruthValidator:
                         str(action) if action is not None else None,
                         task_id=task_id,
                         project_id=project_id,
-                        agent_run_id=agent_run_id,
+                        agent_run_id=observation.agent_run_id,
                         tool_call_id=observation.tool_call_id,
                     )
                 )
-            elif observation.tool.startswith("git."):
-                if str(result.get("status", "SUCCEEDED")).upper() == "SUCCEEDED":
+            elif (git_reference := canonical_git_reference(observation.tool)) is not None:
+                if str(result.get("status", "")).upper() == "SUCCEEDED":
                     collected.append(
                         ExecutionEvidence(
                             EvidenceKind.GIT,
                             observation.tool,
+                            git_reference,
                             task_id=task_id,
                             project_id=project_id,
-                            agent_run_id=agent_run_id,
+                            agent_run_id=observation.agent_run_id,
                             tool_call_id=observation.tool_call_id,
                         )
                     )
@@ -325,7 +352,7 @@ class ExecutionTruthValidator:
                         str(result["artifact"]),
                         task_id=task_id,
                         project_id=project_id,
-                        agent_run_id=agent_run_id,
+                        agent_run_id=observation.agent_run_id,
                         tool_call_id=observation.tool_call_id,
                     )
                 )

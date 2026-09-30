@@ -6,7 +6,11 @@ from app.agent_runtime.context_rollover import ContextRollover
 from app.agent_runtime.progress import DevelopmentProgress
 from app.development.tools import development_definitions
 from app.infrastructure.database import get_session_factory
-from app.tool_system.contracts import ToolObservation, ToolRequestTurn
+from app.tool_system.contracts import (
+    ToolObservation,
+    ToolObservationProvenance,
+    ToolRequestTurn,
+)
 from app.tool_system.errors import ToolSystemError
 from app.tool_system.executor import ToolExecutor
 
@@ -56,6 +60,24 @@ def test_alternating_unchanged_inspection_accumulates_stagnation_signals():
     assert progress.reusable(read) is not None
     assert progress.reusable(listed) is not None
     assert progress.stagnation_signals == 3
+
+
+def test_git_reuse_preserves_source_identity_without_claiming_new_execution():
+    progress = DevelopmentProgress()
+    request = turn("git.status")
+    source = observation(
+        "git.status",
+        {"action": "GIT_STATUS", "status": "SUCCEEDED", "stdout_excerpt": "clean"},
+    )
+    progress.record(request, source)
+
+    reused = progress.reusable(request)
+
+    assert reused is not None
+    assert reused.tool_call_id == source.tool_call_id
+    assert reused.result["action"] == "GIT_STATUS"
+    assert reused.provenance == ToolObservationProvenance.REUSED_TOOL_CALL_RESULT
+    assert progress.record_reuse(reused)["source_tool_call_id"] == str(source.tool_call_id)
 
 
 def test_rollover_snapshot_is_action_oriented_and_omits_raw_file_content():

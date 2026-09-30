@@ -7,7 +7,12 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.tool_system.contracts import ToolObservation, ToolRequestTurn
+from app.tool_system.contracts import (
+    ToolObservation,
+    ToolObservationProvenance,
+    ToolRequestTurn,
+    canonical_git_reference,
+)
 
 READ_ONLY_TOOLS = frozenset(
     {"filesystem.list", "filesystem.read", "git.status", "git.diff", "git.log"}
@@ -84,6 +89,9 @@ class DevelopmentProgress:
         compact["reused_from_tool_call_id"] = str(source.tool_call_id)
         compact["authoritative_result_sha256"] = cached.result_hash
         compact["workspace_generation"] = self.generation
+        git_reference = canonical_git_reference(source.tool)
+        if git_reference is not None:
+            compact["action"] = git_reference
         return ToolObservation(
             tool_call_id=source.tool_call_id,
             tool=source.tool,
@@ -92,6 +100,10 @@ class DevelopmentProgress:
             error=source.error,
             truncated=True,
             original_chars=source.original_chars,
+            provenance=ToolObservationProvenance.REUSED_TOOL_CALL_RESULT,
+            task_id=source.task_id,
+            task_run_id=source.task_run_id,
+            agent_run_id=source.agent_run_id,
         )
 
     def record(self, turn: ToolRequestTurn, observation: ToolObservation) -> int:
@@ -135,7 +147,13 @@ class DevelopmentProgress:
         result = observation.result or {}
         return {
             "tool": observation.tool,
-            "reference": result.get("path") or result.get("action"),
+            "reference": (
+                canonical_git_reference(observation.tool)
+                or result.get("path")
+                or result.get("action")
+            ),
+            "provenance": observation.provenance.value,
+            "source_tool_call_id": str(observation.tool_call_id),
             "result_sha256": result.get("authoritative_result_sha256"),
             "workspace_generation": self.generation,
             "stagnation_signals": self.stagnation_signals,

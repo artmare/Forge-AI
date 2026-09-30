@@ -311,6 +311,11 @@ class ToolExecutionService:
     def observation(self, call: ToolCall, result: ToolResult) -> ToolObservation:
         payload = result.model_dump(mode="json")
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        provenance = {
+            "task_id": call.task_id,
+            "task_run_id": call.task_run_id,
+            "agent_run_id": call.agent_run_id,
+        }
         if len(serialized) <= self.settings.tool_observation_max_chars:
             return ToolObservation(
                 tool_call_id=call.id,
@@ -318,6 +323,7 @@ class ToolExecutionService:
                 status=result.status,
                 result=result.result,
                 error=result.error,
+                **provenance,
             )
         if result.status == "success" and result.result is not None:
             limited = dict(result.result)
@@ -334,6 +340,7 @@ class ToolExecutionService:
                 result=limited,
                 truncated=True,
                 original_chars=len(serialized),
+                **provenance,
             )
         return ToolObservation(
             tool_call_id=call.id,
@@ -342,6 +349,7 @@ class ToolExecutionService:
             error=result.error,
             truncated=True,
             original_chars=len(serialized),
+            **provenance,
         )
 
     async def _event(self, call: ToolCall, event_type: str, message: str) -> None:

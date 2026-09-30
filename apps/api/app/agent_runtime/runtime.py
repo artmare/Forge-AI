@@ -581,7 +581,7 @@ class AgentRuntime:
                     historical_evidence=recovery.evidence,
                     current_task_id=task.id,
                     current_project_id=task.project_id,
-                    current_agent_run_id=run.id,
+                    current_task_run_id=run.task_run_id,
                 )
                 if not truth.accepted:
                     error = ProviderCallError(
@@ -910,6 +910,9 @@ class AgentRuntime:
                 status="success" if status == "succeeded" else "error",
                 result=call.result,
                 error=call.error,
+                task_id=call.task_id,
+                task_run_id=call.task_run_id,
+                agent_run_id=call.agent_run_id,
             )
             # Historical calls rebuild counters, caches, and mutation fingerprints. They are
             # intentionally not appended to the new run's observations: cross-run evidence has
@@ -926,6 +929,10 @@ class AgentRuntime:
                 key = mutation_key(call.tool_name, dict(call.arguments))
                 if key:
                     rollover.executed_mutations.add(key)
+        # Durable calls restore counters and mutation fingerprints, but a read from an earlier
+        # TaskRun must not masquerade as an execution in this recovery attempt. Same-attempt reuse
+        # remains available because newly executed reads are cached after this point.
+        progress.cache.clear()
         metric = await self.session.scalar(
             select(TaskRuntimeMetric).where(TaskRuntimeMetric.task_id == task_id)
         )

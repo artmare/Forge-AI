@@ -177,6 +177,14 @@ handoff labels accepted evidence as `HISTORICAL`; a structured historical claim 
 scope and the original ToolCall ID. Current-run claims still require current-run observations, and
 historical tests never prove tests after later source changes.
 
+Git evidence uses Forge-owned canonical references derived from the registered tool identity:
+`git.status` is `GIT_STATUS`, `git.diff` is `GIT_DIFF`, `git.log` is `GIT_LOG`, and checkpoint
+creation is `GIT_CHECKPOINT`. A structured `GIT` claim requires both that exact reference and the
+successful ToolCall ID. `CURRENT_RUN` means the active TaskRun continuation, which may contain
+several model-turn AgentRuns. Cached read observations retain their original ToolCall ID and are
+marked as reused; they do not create new current execution evidence. Recovery startup does not
+seed the live read cache from an earlier TaskRun, so a requested current Git check executes again.
+
 If a recovery model returns a premature unsupported final result, Forge stores the exact structured
 response, real provider usage, failed claim, and evidence summary, then issues only a bounded claim
 correction. Repetition stops as `EXECUTION_TRUTH_REPAIR_LIMIT_EXHAUSTED`. A human may approve one

@@ -539,7 +539,10 @@ class InstructionBuilder:
     @classmethod
     def prompt_observation(cls, observation: ToolObservation) -> dict[str, Any]:
         """Bound model context while the durable ToolCall retains complete raw evidence."""
-        value = observation.model_dump(mode="json")
+        value = observation.model_dump(
+            mode="json",
+            exclude={"provenance", "task_id", "task_run_id", "agent_run_id"},
+        )
         result = value.get("result")
         if not isinstance(result, dict):
             return value
