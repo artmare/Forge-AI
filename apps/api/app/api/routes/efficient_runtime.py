@@ -206,6 +206,7 @@ async def dev_mode_status(task_id: UUID, session: Session) -> dict:
     from app.domain.models import (
         Event,
         ModelCallRecord,
+        TaskRun,
         TaskRuntimeBudget,
         TaskRuntimeMetric,
         ToolCall,
@@ -257,6 +258,29 @@ async def dev_mode_status(task_id: UUID, session: Session) -> dict:
         ),
         None,
     )
+    completion_manifest = None
+    latest_task_run = await session.scalar(
+        select(TaskRun)
+        .where(TaskRun.task_id == task_id)
+        .order_by(TaskRun.iteration.desc(), TaskRun.created_at.desc())
+        .limit(1)
+    )
+    if latest_task_run is not None and task.project_id is not None:
+        from app.development.completion_manifest import CompletionManifestService
+        from app.tool_system.errors import ToolSystemError
+
+        try:
+            manifest = await CompletionManifestService(session).build(task_id, latest_task_run.id)
+        except (OSError, RuntimeError, ToolSystemError):
+            manifest = None
+        if manifest is not None:
+            completion_manifest = {
+                **manifest.bounded_summary(),
+                "manifest_bytes": CompletionManifestService.serialized_size(manifest),
+                "model_visible_bytes": CompletionManifestService.serialized_size(
+                    manifest, for_model=True
+                ),
+            }
     return {
         "task_id": str(task_id),
         "status": task.status.value,
@@ -281,6 +305,7 @@ async def dev_mode_status(task_id: UUID, session: Session) -> dict:
         ],
         "specialist_calls": sum(e.type == "DEV_SPECIALIST_RESERVED" for e in events),
         "human_promotion_required": True,
+        "completion_manifest": completion_manifest,
         "recovery_evidence": (
             {
                 "checkpoint": latest_recovery_evidence.details.get("checkpoint"),

@@ -255,6 +255,39 @@ FORGE_DEV_REPOSITORY_HOST_PATH=/absolute/path/to/ForgeAI \
 docker compose -f docker-compose.yml -f docker-compose.self-dev.yml up -d --build
 ```
 
+## Forge-owned completion manifests
+
+Developer output remains subject to `ExecutionTruthValidator`, but it is no longer the only view
+of completion. Before finalization, Forge derives a bounded `CompletionManifest` from successful
+ToolCalls, current workspace hashes, deterministic development executions, browser evidence,
+acceptance-verification records, QA, checkpoints, and approved recovery provenance. The manifest
+stores references and summaries rather than file contents or full command output.
+
+Artifact state is checked again against the authorized workspace. A missing file or a hash that no
+longer matches its authoritative write blocks readiness. Historical recovery writes retain their
+original AgentRun, TaskRun, and ToolCall identities and count only when an approved recovery event
+revalidated them against its checkpoint. They are never copied into the current run.
+
+Readiness has four states:
+
+- `BLOCKED`: a required artifact is missing or invalidated, or deterministic verification failed.
+- `NOT_READY`: deterministic QA has not reached its final gate.
+- `REQUIRES_JUDGMENT`: deterministic gates passed, but a semantic or visual criterion still needs
+  human or specialist judgment.
+- `READY`: required deterministic and judgment evidence is present.
+
+Test, build, lint, typecheck, and named-file criteria remain blocked when their deterministic
+evidence is unavailable. Unsupported semantic or visual criteria are never promoted to verified;
+they remain visible at the human-review boundary. A final-only Developer prompt receives a compact
+manifest summary in place of duplicated recent observation text. Construction is local and adds no
+model call. Dev Mode diagnostics expose the bounded manifest, readiness, blockers, and its byte
+size under `completion_manifest`.
+
+For vanilla static sites, Forge checks that required deliverables are safe regular workspace files,
+HTML is non-empty, and statically resolvable local stylesheet and script references exist. Browser
+captures normalize screenshot hashes, render state, and console errors when the browser tool is
+enabled. These checks do not assert visual quality.
+
 ## Browser verification
 
 `browser.capture` is an opt-in Forge tool for built static HTML. A separate browser-runner

@@ -55,6 +55,7 @@ from app.agent_runtime.routing import (
     required_capabilities,
 )
 from app.core.config import Settings, get_settings
+from app.development.completion_manifest import CompletionManifestService
 from app.domain.enums import (
     AgentRunStatus,
     TaskKind,
@@ -62,7 +63,7 @@ from app.domain.enums import (
     TaskStatus,
 )
 from app.domain.exceptions import AgentRuntimeDomainError, TaskRunStateConflictError
-from app.domain.models import AgentRun, Event, TaskRuntimeMetric, ToolCall
+from app.domain.models import AgentRun, Event, TaskRun, TaskRuntimeMetric, ToolCall
 from app.repositories.agent import AgentRepository
 from app.repositories.agent_run import AgentRunRepository
 from app.repositories.task import TaskRepository
@@ -77,6 +78,7 @@ from app.tool_system.contracts import (
     ToolObservation,
     ToolRequestTurn,
 )
+from app.tool_system.errors import ToolSystemError
 from app.tool_system.permissions import PermissionEngine
 from app.tool_system.registry import ToolRegistry
 from app.tool_system.service import ToolExecutionService
@@ -1114,16 +1116,49 @@ class AgentRuntime:
         )
         if force_final:
             allowed = []
+        instruction_observations = [] if force_final else observations
         instructions = InstructionBuilder().build(
             context,
             tools=[definition.public() for definition in allowed],
-            observations=observations,
+            observations=instruction_observations,
             turn_number=turn_number,
             recent_observation_limit=self.settings.context_recent_observations,
             budget_warning=budget_warning,
             duplicate_warning=duplicate_warning,
             completion_required=force_final,
         )
+        manifest_json = ""
+        if force_final and str(context.task.get("kind", "")).upper() == TaskKind.DEVELOPMENT.value:
+            task_run = await self.session.scalar(
+                select(TaskRun)
+                .where(
+                    TaskRun.task_id == UUID(str(context.task["id"])),
+                    TaskRun.status == TaskRunStatus.STARTED,
+                )
+                .order_by(TaskRun.started_at.desc())
+                .limit(1)
+            )
+            if task_run is not None:
+                try:
+                    manifest = await CompletionManifestService(
+                        self.session, self.settings
+                    ).build(UUID(str(context.task["id"])), task_run.id)
+                except (OSError, RuntimeError, ToolSystemError):
+                    manifest = None
+                if manifest is not None:
+                    manifest_json = json.dumps(
+                        manifest.model_summary(), sort_keys=True, separators=(",", ":")
+                    )
+                    instructions.user_prompt += (
+                        "\nForge-owned completion evidence (authoritative, compact):\n"
+                        + manifest_json
+                        + "\nForge constructs and validates execution evidence. Summarize the "
+                        "remaining semantic result. Leave execution_claims empty unless you "
+                        "must cite an exact action visible in the native tool exchange."
+                    )
+                    instructions.context_components["completion_manifest"] = len(
+                        manifest_json.encode()
+                    )
         task_input = context.task.get("input", {})
         mock_scenario = task_input.get("mock_scenario") if isinstance(task_input, dict) else None
         mock_path = task_input.get("path") if isinstance(task_input, dict) else None
@@ -1156,6 +1191,10 @@ class AgentRuntime:
                 if context.qa_feedback
                 else "",
                 "context_component_bytes": json.dumps(instructions.context_components),
+                "completion_manifest_bytes": str(len(manifest_json.encode())),
+                "completion_manifest_replaced_observation_count": str(
+                    len(observations) if force_final and manifest_json else 0
+                ),
             },
             response_model=AgentTurnResponse,
             tools=tuple(
@@ -1173,7 +1212,7 @@ class AgentRuntime:
             baseline = InstructionBuilder().build(
                 context,
                 tools=[definition.public() for definition in allowed],
-                observations=observations,
+                observations=instruction_observations,
                 turn_number=1,
                 recent_observation_limit=max(len(observations), 1),
             )

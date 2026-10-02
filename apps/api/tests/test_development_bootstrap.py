@@ -24,7 +24,13 @@ from app.domain.enums import (
     ToolCallStatus,
     ToolRiskLevel,
 )
-from app.domain.models import AcceptanceVerification, ProjectDevelopmentProfile, Task, ToolCall
+from app.domain.models import (
+    AcceptanceVerification,
+    Event,
+    ProjectDevelopmentProfile,
+    Task,
+    ToolCall,
+)
 from app.infrastructure.database import get_session_factory
 from app.services.task_state_machine import TaskStateMachine
 from app.tool_system.contracts import ToolDefinition, ToolExecutionContext
@@ -623,6 +629,50 @@ async def test_qa_fix_requeue_runs_developer_before_reusing_acceptance_evidence(
     assert (workspace / "src" / "qa-fix.mjs").is_file()
     assert second_qa.decision == QADecision.PASS
     assert stored is not None and stored.iteration == 2 and stored.status == TaskStatus.REVIEW
+
+
+async def test_manifest_allows_human_review_when_only_semantic_judgment_remains(
+    client: AsyncClient, tmp_path: Path
+) -> None:
+    task, company, project, settings = await create_development_domain(
+        client,
+        tmp_path,
+        criteria=["`index.html` exists", "The UI looks professional"],
+    )
+    workspace = WorkspaceManager(settings.tool_workspace_root).project_workspace(
+        UUID(str(company["id"])), UUID(str(project["id"]))
+    )
+    (workspace / "index.html").write_text(
+        "<main><h1>Deterministic fixture</h1></main>", encoding="utf-8"
+    )
+    run_id = await start_task_run(str(task["id"]))
+    async with get_session_factory()() as session:
+        stored = await session.get(Task, task["id"])
+        assert stored is not None
+        stored.input = {**stored.input, "deliverables": ["index.html"]}
+        await session.commit()
+        result = await DevelopmentWorkflowService(
+            session,
+            settings=settings,
+            runner=SimulatedControlledRunner(Path(settings.tool_workspace_root)),
+        ).finalize(UUID(str(task["id"])), run_id)
+        event = await session.scalar(
+            select(Event)
+            .where(
+                Event.task_id == UUID(str(task["id"])),
+                Event.type == "DEV_COMPLETION_MANIFEST_EVALUATED",
+            )
+            .order_by(Event.created_at.desc())
+            .limit(1)
+        )
+        await session.refresh(stored)
+
+    assert result.decision == QADecision.PASS
+    assert stored.status == TaskStatus.REVIEW
+    assert event is not None
+    assert event.details["readiness"] == "REQUIRES_JUDGMENT"
+    assert event.details["model_calls_added"] == 0
+    assert event.details["artifacts"][0]["path"] == "index.html"
 
 
 async def test_unresolved_write_runtime_failure_is_infrastructure_unverifiable(

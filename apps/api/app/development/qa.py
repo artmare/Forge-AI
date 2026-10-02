@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.development.bootstrap import DevelopmentPreconditions, ProjectBootstrapService
+from app.development.completion_contracts import criterion_requires_judgment
 from app.development.product_qa import ProductQAService
 from app.development.profile import DevelopmentProfileService
 from app.development.registry import CommandRegistry
@@ -285,6 +286,7 @@ class DevelopmentQAService:
                 }
             )
         blocking: list[dict[str, Any]] = []
+        non_blocking: list[dict[str, Any]] = []
         for check in checks:
             if check["status"] != "PASSED":
                 blocking.append(
@@ -295,12 +297,37 @@ class DevelopmentQAService:
                     }
                 )
         for verification in verifications:
-            if verification.status != AcceptanceVerificationStatus.PASSED:
+            if verification.status == AcceptanceVerificationStatus.FAILED:
                 blocking.append(
                     {
                         "title": (
                             f"Acceptance criterion {verification.criterion_index + 1} "
                             "is not verified"
+                        ),
+                        "description": verification.evidence_summary,
+                        "relatedFiles": [],
+                    }
+                )
+            elif (
+                verification.status == AcceptanceVerificationStatus.UNVERIFIED
+                and criterion_requires_judgment(verification.criterion)
+            ):
+                non_blocking.append(
+                    {
+                        "title": (
+                            f"Acceptance criterion {verification.criterion_index + 1} "
+                            "requires judgment"
+                        ),
+                        "description": verification.evidence_summary,
+                        "relatedFiles": [],
+                    }
+                )
+            elif verification.status == AcceptanceVerificationStatus.UNVERIFIED:
+                blocking.append(
+                    {
+                        "title": (
+                            f"Acceptance criterion {verification.criterion_index + 1} "
+                            "lacks deterministic evidence"
                         ),
                         "description": verification.evidence_summary,
                         "relatedFiles": [],
@@ -322,7 +349,12 @@ class DevelopmentQAService:
                     )
         decision = QADecision.PASS if checks and not blocking else QADecision.FAIL
         summary = (
-            "All deterministic QA checks and acceptance criteria passed."
+            (
+                "All deterministic QA checks passed; "
+                f"{len(non_blocking)} criterion/criteria require human judgment."
+                if non_blocking
+                else "All deterministic QA checks and acceptance criteria passed."
+            )
             if decision == QADecision.PASS
             else f"QA found {len(blocking)} blocking issue(s)."
         )
@@ -347,7 +379,7 @@ class DevelopmentQAService:
             ),
             checks=checks,
             blocking_issues=blocking,
-            non_blocking_issues=[],
+            non_blocking_issues=non_blocking,
             correlation_id=task.id,
         )
         self.session.add(result)
@@ -358,7 +390,7 @@ class DevelopmentQAService:
             "summary": summary,
             "checks": checks,
             "blockingIssues": blocking,
-            "nonBlockingIssues": [],
+            "nonBlockingIssues": non_blocking,
         }
         qa_run.completed_at = datetime.now(UTC)
         await self.events.create(
@@ -374,6 +406,7 @@ class DevelopmentQAService:
                 "iteration": task.iteration,
                 "check_count": len(checks),
                 "blocking_issue_count": len(blocking),
+                "judgment_required_count": len(non_blocking),
             },
         )
         await self.session.commit()
@@ -639,14 +672,66 @@ class DevelopmentWorkflowService:
         result = await DevelopmentQAService(
             self.session, settings=self.settings, runner=self.runner
         ).evaluate(task_id, task_run_id)
+        from app.development.completion_contracts import CompletionReadiness
+        from app.development.completion_manifest import CompletionManifestService
+
+        manifest = await CompletionManifestService(self.session, self.settings).build(
+            task_id, task_run_id
+        )
+        task = await self.session.get(Task, task_id)
+        if task is None:
+            raise RuntimeError("Development task disappeared during finalization")
+        await EventFactory(self.session).create(
+            company_id=task.company_id,
+            project_id=task.project_id,
+            agent_id=task.assigned_agent_id,
+            task_id=task.id,
+            correlation_id=task.id,
+            event_type="DEV_COMPLETION_MANIFEST_EVALUATED",
+            message="Forge derived completion readiness from authoritative evidence.",
+            payload={
+                **manifest.bounded_summary(),
+                "manifest_bytes": CompletionManifestService.serialized_size(manifest),
+                "model_calls_added": 0,
+            },
+        )
+        if result.decision == QADecision.PASS and manifest.readiness in {
+            CompletionReadiness.BLOCKED,
+            CompletionReadiness.NOT_READY,
+        }:
+            result.decision = QADecision.FAIL
+            result.summary = "Forge-owned completion evidence is not ready for human review."
+            result.failure_classification = "IMPLEMENTATION_FAILURE"
+            result.failure_code = "COMPLETION_MANIFEST_BLOCKED"
+            result.blocking_issues = [
+                {
+                    "title": "Completion manifest blocked finalization",
+                    "description": reason,
+                    "relatedFiles": [],
+                }
+                for reason in manifest.blocking_reasons
+            ] or [
+                {
+                    "title": "Completion manifest is not ready",
+                    "description": "Required deterministic verification has not completed.",
+                    "relatedFiles": [],
+                }
+            ]
+        await self.session.commit()
         if result.decision == QADecision.PASS:
             from app.development.self_workflow import SelfDevelopmentWorkflow
 
-            task = await self.session.get(Task, task_id)
-            if task is not None and SelfDevelopmentWorkflow.requested(task):
+            if SelfDevelopmentWorkflow.requested(task):
                 await SelfDevelopmentWorkflow(self.session, self.settings).complete(task)
             await TaskStateMachine(self.session).transition(
-                task_id, TaskStatus.REVIEW, "Deterministic QA passed.", commit=True
+                task_id,
+                TaskStatus.REVIEW,
+                (
+                    "Deterministic QA passed; human judgment remains required."
+                    if manifest.readiness == CompletionReadiness.REQUIRES_JUDGMENT
+                    else "Forge-owned completion readiness and deterministic QA passed."
+                ),
+                commit=True,
             )
         else:
             if result.failure_classification == "INFRASTRUCTURE_UNVERIFIABLE":
