@@ -9,13 +9,15 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
+from app.development.automatic_verification import AutomaticVerificationRunner
 from app.development.bootstrap import DevelopmentPreconditions, ProjectBootstrapService
 from app.development.completion_contracts import criterion_requires_judgment
 from app.development.product_qa import ProductQAService
 from app.development.profile import DevelopmentProfileService
 from app.development.registry import CommandRegistry
 from app.development.runner_client import RunnerClient
-from app.development.service import DevelopmentExecutionService
+from app.development.verification_contracts import VerificationStepStatus
+from app.development.verification_plan import VerificationPlanService
 from app.domain.enums import (
     AcceptanceVerificationStatus,
     AgentRunStatus,
@@ -183,7 +185,6 @@ class DevelopmentQAService:
             )
             if action is not None
         ]
-        actions = [DevelopmentAction.GIT_STATUS, *profile_actions]
         context = ToolExecutionContext(
             company_id=task.company_id,
             project_id=task.project_id,
@@ -193,11 +194,7 @@ class DevelopmentQAService:
             agent_run_id=qa_run.id,
             execution_origin="FORGE_QA",
         )
-        service = DevelopmentExecutionService(
-            self.session, settings=self.settings, runner=self.runner
-        )
         checks: list[dict[str, Any]] = []
-        executions = []
         unavailable_actions = self._unavailable_actions(preconditions)
         for issue in preconditions.implementation_errors:
             action_name = next(
@@ -227,19 +224,38 @@ class DevelopmentQAService:
             and profile.project_type != DevelopmentProjectType.STATIC_WEB
         ):
             checks.append(self._missing_implementation_evidence_check(profile.project_type.value))
-        for action in actions:
-            execution = await service.execute(action, {}, context)
-            executions.append(execution)
-            passed = execution.status == DevelopmentExecutionStatus.SUCCEEDED
+        plan = await VerificationPlanService(self.session, self.settings).build(
+            task.id, task_run.id
+        )
+        verification_run = await AutomaticVerificationRunner(
+            self.session, settings=self.settings, runner=self.runner
+        ).run(plan, context)
+        executions = list(verification_run.executions)
+        for verification_result in verification_run.results:
+            passed = verification_result.status == VerificationStepStatus.PASSED
             checks.append(
                 {
-                    "name": action.value,
-                    "status": "PASSED" if passed else "FAILED",
-                    "evidence": (
-                        f"{action.value} exited {execution.exit_code} in "
-                        f"{float(execution.duration_ms or 0):.0f}ms."
+                    "name": verification_result.kind.value,
+                    "status": (
+                        "PASSED"
+                        if passed
+                        else "SKIPPED"
+                        if verification_result.status == VerificationStepStatus.SKIPPED
+                        else "FAILED"
                     ),
-                    "execution_id": str(execution.id),
+                    "evidence": verification_result.summary,
+                    "execution_id": (
+                        str(verification_result.execution_id)
+                        if verification_result.execution_id
+                        else None
+                    ),
+                    "tool_call_id": (
+                        str(verification_result.tool_call_id)
+                        if verification_result.tool_call_id
+                        else None
+                    ),
+                    "reused": verification_result.reused,
+                    "source_generation": verification_result.source_generation,
                 }
             )
 

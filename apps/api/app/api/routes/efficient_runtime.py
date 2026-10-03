@@ -253,8 +253,7 @@ async def dev_mode_status(task_id: UUID, session: Session) -> dict:
         (
             e
             for e in events
-            if e.type
-            in {"DEV_EXECUTION_TRUTH_REJECTED", "DEV_EXECUTION_TRUTH_REPAIR_REQUIRED"}
+            if e.type in {"DEV_EXECUTION_TRUTH_REJECTED", "DEV_EXECUTION_TRUTH_REPAIR_REQUIRED"}
         ),
         None,
     )
@@ -281,6 +280,32 @@ async def dev_mode_status(task_id: UUID, session: Session) -> dict:
                     manifest, for_model=True
                 ),
             }
+    verification_events = [e for e in events if e.type == "DEV_VERIFICATION_RESULT"]
+    latest_plan_event = next(
+        (
+            e
+            for e in events
+            if e.type in {"DEV_VERIFICATION_PLAN_CREATED", "DEV_VERIFICATION_PLAN_RECONCILED"}
+        ),
+        None,
+    )
+    latest_plan_details = latest_plan_event.details if latest_plan_event is not None else {}
+    latest_plan = (
+        latest_plan_details.get("plan", {}) if isinstance(latest_plan_details, dict) else {}
+    )
+    result_payloads = [
+        e.details.get("result", {}) for e in verification_events if isinstance(e.details, dict)
+    ]
+    current_results: dict[str, dict] = {}
+    for item in result_payloads:
+        step_key = item.get("step_key")
+        if (
+            isinstance(step_key, str)
+            and step_key not in current_results
+            and item.get("source_generation") == latest_plan.get("source_generation")
+        ):
+            current_results[step_key] = item
+    latest_results = list(current_results.values())
     return {
         "task_id": str(task_id),
         "status": task.status.value,
@@ -306,6 +331,55 @@ async def dev_mode_status(task_id: UUID, session: Session) -> dict:
         "specialist_calls": sum(e.type == "DEV_SPECIALIST_RESERVED" for e in events),
         "human_promotion_required": True,
         "completion_manifest": completion_manifest,
+        "verification": {
+            "plan_version": latest_plan.get("version"),
+            "source_generation": latest_plan.get("source_generation"),
+            "planned_checks": latest_plan.get("steps", []),
+            "judgment_requirements": latest_plan.get("judgment_requirements", []),
+            "plan_bytes": latest_plan_details.get("plan_bytes")
+            if isinstance(latest_plan_details, dict)
+            else None,
+            "model_visible_plan_bytes": latest_plan_details.get("model_visible_bytes")
+            if isinstance(latest_plan_details, dict)
+            else None,
+            "results": latest_results,
+            "executed_checks": len(latest_results),
+            "reused_results": sum(bool(item.get("reused")) for item in latest_results),
+            "invalidated_results": sum(
+                item.get("source_generation") != latest_plan.get("source_generation")
+                for item in result_payloads
+            ),
+            "failed_checks": sum(item.get("status") == "FAILED" for item in latest_results),
+            "skipped_checks": sum(item.get("status") == "SKIPPED" for item in latest_results),
+            "visual_qa_calls": sum(e.type == "DEV_VISUAL_QA_RECORDED" for e in events),
+            "browser_captures": sum(
+                c.tool_name == "browser.capture" and c.status.value == "SUCCEEDED" for c in tools
+            ),
+            "efficiency": {
+                "model_calls": len(calls),
+                "input_tokens": sum(call.input_tokens for call in calls),
+                "output_tokens": sum(call.output_tokens for call in calls),
+                "tool_calls": len(tools),
+                "verification_executions": sum(
+                    not bool(item.get("reused")) for item in result_payloads
+                ),
+                "reused_verification_results": sum(
+                    bool(item.get("reused")) for item in result_payloads
+                ),
+                "repair_iterations": sum(
+                    event.type == "DEV_VERIFICATION_PLAN_RECONCILED" for event in events
+                ),
+                "visual_qa_calls": sum(
+                    event.type == "DEV_VISUAL_QA_RECORDED" for event in events
+                ),
+                "browser_captures": sum(
+                    call.tool_name == "browser.capture"
+                    and call.status.value == "SUCCEEDED"
+                    for call in tools
+                ),
+                "rollovers": sum(event.type == "DEV_CONTEXT_ROLLOVER" for event in events),
+            },
+        },
         "recovery_evidence": (
             {
                 "checkpoint": latest_recovery_evidence.details.get("checkpoint"),

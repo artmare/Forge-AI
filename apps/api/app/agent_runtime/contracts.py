@@ -97,6 +97,7 @@ class ModelRequest:
     tools: tuple[ModelTool, ...] = ()
     conversation_start_prompt: str | None = None
     tool_exchanges: tuple[ModelToolExchange, ...] = ()
+    image_data_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

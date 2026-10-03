@@ -9,6 +9,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.development.verification_contracts import (
+    VerificationResult,
+    VerificationStep,
+    VisualQAEvidence,
+)
+
 MAX_MANIFEST_ENTRIES = 100
 MAX_MANIFEST_SUMMARY = 500
 PATH_CRITERION = re.compile(
@@ -109,6 +115,11 @@ class CompletionManifest(BaseModel):
     verification_results: list[VerificationEvidence] = Field(
         default_factory=list, max_length=MAX_MANIFEST_ENTRIES
     )
+    verification_plan_version: int | None = None
+    verification_source_generation: str | None = Field(default=None, max_length=64)
+    planned_verification: list[VerificationStep] = Field(default_factory=list, max_length=32)
+    automatic_verification: list[VerificationResult] = Field(default_factory=list, max_length=32)
+    visual_qa: VisualQAEvidence | None = None
     acceptance_criteria: list[AcceptanceEvidence] = Field(
         default_factory=list, max_length=MAX_MANIFEST_ENTRIES
     )
@@ -169,6 +180,13 @@ class CompletionManifest(BaseModel):
                 }
                 for item in self.verification_results
             ],
+            "verification_plan": {
+                "version": self.verification_plan_version,
+                "source_generation": self.verification_source_generation,
+                "planned": [item.model_dump(mode="json") for item in self.planned_verification],
+                "results": [item.model_dump(mode="json") for item in self.automatic_verification],
+                "visual_qa": (self.visual_qa.model_dump(mode="json") if self.visual_qa else None),
+            },
             "acceptance": [
                 {
                     "criterion": item.criterion,

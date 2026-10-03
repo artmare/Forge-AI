@@ -254,11 +254,20 @@ class OpenAIModelProvider:
                 max_tool_calls=1,
             )
         try:
+            user_content: Any = request.user_prompt
+            if request.image_data_urls:
+                user_content = [
+                    {"type": "input_text", "text": request.user_prompt},
+                    *[
+                        {"type": "input_image", "image_url": value}
+                        for value in request.image_data_urls
+                    ],
+                ]
             response = await self.client.responses.parse(
                 model=request.model,
                 input=[
                     {"role": "system", "content": request.system_prompt},
-                    {"role": "user", "content": request.user_prompt},
+                    {"role": "user", "content": user_content},
                 ],
                 text_format=BaseAgentResult if native_tools else request.response_model,
                 **parse_options,
@@ -463,11 +472,20 @@ class OpenRouterModelProvider:
         }
 
     def _messages(self, request: ModelRequest) -> list[dict[str, Any]]:
+        user_content: Any = request.conversation_start_prompt or request.user_prompt
+        if request.image_data_urls:
+            user_content = [
+                {"type": "text", "text": user_content},
+                *[
+                    {"type": "image_url", "image_url": {"url": value}}
+                    for value in request.image_data_urls
+                ],
+            ]
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": request.system_prompt},
             {
                 "role": "user",
-                "content": request.conversation_start_prompt or request.user_prompt,
+                "content": user_content,
             },
         ]
         for exchange in request.tool_exchanges:
@@ -770,12 +788,17 @@ class GeminiModelProvider:
             generation["responseJsonSchema"] = self._gemini_schema(
                 request.response_model.model_json_schema()
             )
+        initial_parts: list[dict[str, Any]] = [
+            {"text": request.conversation_start_prompt or request.user_prompt}
+        ]
+        for value in request.image_data_urls:
+            header, encoded = value.split(",", 1)
+            mime_type = header.removeprefix("data:").split(";", 1)[0]
+            initial_parts.append({"inlineData": {"mimeType": mime_type, "data": encoded}})
         contents: list[dict[str, Any]] = [
             {
                 "role": "user",
-                "parts": [
-                    {"text": request.conversation_start_prompt or request.user_prompt}
-                ],
+                "parts": initial_parts,
             }
         ]
         for exchange in request.tool_exchanges:

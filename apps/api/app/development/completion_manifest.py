@@ -27,6 +27,13 @@ from app.development.completion_contracts import (
     criterion_requires_judgment,
 )
 from app.development.static_web_verifier import StaticWebVerifier
+from app.development.verification_contracts import (
+    VerificationResult,
+    VerificationStepStatus,
+    VisualQADecision,
+    VisualQAEvidence,
+)
+from app.development.verification_plan import VerificationPlanService
 from app.domain.enums import (
     AcceptanceVerificationStatus,
     DevelopmentAction,
@@ -59,6 +66,8 @@ _VERIFY_ACTIONS = frozenset(
         DevelopmentAction.PYTHON_LINT,
     }
 )
+
+
 class CompletionManifestService:
     """Derive completion readiness from Forge-owned data and current workspace state."""
 
@@ -101,7 +110,19 @@ class CompletionManifestService:
         static_results = await StaticWebVerifier().verify(workspace, artifacts)
         verifications.extend(static_results)
         verifications = verifications[:_MAX_ENTRIES]
+        plan = await VerificationPlanService(self.session, self.settings).latest(task.id)
+        automatic = await self._automatic_results(task.id, plan.source_generation if plan else None)
+        visual = await self._visual_evidence(task.id, plan.source_generation if plan else None)
         acceptance = await self._acceptance(task, task_run, artifacts, verifications)
+        if visual is not None and visual.decision == VisualQADecision.ACCEPT:
+            for item in acceptance:
+                if (
+                    item.criterion_index in visual.criteria_addressed
+                    and item.requires_judgment
+                    and item.status == ManifestEvidenceStatus.UNVERIFIED
+                ):
+                    item.status = ManifestEvidenceStatus.SUPPORTED
+                    item.evidence_summary = "Supported by capture-gated structured Visual QA."
         unresolved = self._unresolved_failures(artifacts, verifications)
         unresolved.extend(await self._unresolved_tool_failures(task, task_run))
         unresolved = list(dict.fromkeys(unresolved))[:50]
@@ -112,6 +133,18 @@ class CompletionManifestService:
             .limit(1)
         )
         blocking = self._blocking_reasons(artifacts, verifications, acceptance)
+        if plan is not None:
+            by_key = {item.step_key: item for item in automatic}
+            for step in plan.steps:
+                if not step.blocking:
+                    continue
+                result = by_key.get(step.key)
+                if result is None:
+                    blocking.append(f"Planned verification {step.kind.value} has not executed.")
+                elif result.status != VerificationStepStatus.PASSED:
+                    blocking.append(
+                        f"Planned verification {step.kind.value} is {result.status.value.lower()}."
+                    )
         blocking.extend(
             value for value in unresolved if value not in blocking
         )
@@ -142,6 +175,11 @@ class CompletionManifestService:
             checkpoint=checkpoint,
             artifacts=artifacts[:_MAX_ENTRIES],
             verification_results=verifications,
+            verification_plan_version=plan.version if plan else None,
+            verification_source_generation=plan.source_generation if plan else None,
+            planned_verification=plan.steps if plan else [],
+            automatic_verification=automatic,
+            visual_qa=visual,
             acceptance_criteria=acceptance[:_MAX_ENTRIES],
             unresolved_failures=unresolved[:50],
             blocking_reasons=blocking[:50],
@@ -149,6 +187,53 @@ class CompletionManifestService:
             readiness=readiness,
             generated_at=datetime.now(UTC),
         )
+
+    async def _automatic_results(
+        self, task_id: UUID, generation: str | None
+    ) -> list[VerificationResult]:
+        if generation is None:
+            return []
+        events = list(
+            await self.session.scalars(
+                select(Event)
+                .where(Event.task_id == task_id, Event.type == "DEV_VERIFICATION_RESULT")
+                .order_by(Event.created_at.desc(), Event.id.desc())
+                .limit(100)
+            )
+        )
+        output: dict[str, VerificationResult] = {}
+        for event in events:
+            raw = event.details.get("result") if isinstance(event.details, dict) else None
+            try:
+                result = VerificationResult.model_validate(raw)
+            except (TypeError, ValueError):
+                continue
+            if result.source_generation == generation and result.step_key not in output:
+                output[result.step_key] = result
+        return list(reversed(list(output.values())))[:32]
+
+    async def _visual_evidence(
+        self, task_id: UUID, generation: str | None
+    ) -> VisualQAEvidence | None:
+        if generation is None:
+            return None
+        events = list(
+            await self.session.scalars(
+                select(Event)
+                .where(Event.task_id == task_id, Event.type == "DEV_VISUAL_QA_RECORDED")
+                .order_by(Event.created_at.desc(), Event.id.desc())
+                .limit(10)
+            )
+        )
+        for event in events:
+            raw = event.details.get("evidence") if isinstance(event.details, dict) else None
+            try:
+                evidence = VisualQAEvidence.model_validate(raw)
+            except (TypeError, ValueError):
+                continue
+            if evidence.source_generation == generation:
+                return evidence
+        return None
 
     async def _artifacts(
         self,

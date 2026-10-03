@@ -56,6 +56,7 @@ from app.agent_runtime.routing import (
 )
 from app.core.config import Settings, get_settings
 from app.development.completion_manifest import CompletionManifestService
+from app.development.verification_plan import VerificationPlanService
 from app.domain.enums import (
     AgentRunStatus,
     TaskKind,
@@ -1128,6 +1129,39 @@ class AgentRuntime:
             completion_required=force_final,
         )
         manifest_json = ""
+        verification_plan_json = ""
+        if str(context.task.get("kind", "")).upper() == TaskKind.DEVELOPMENT.value and (
+            turn_number == 1 or force_final
+        ):
+            task_run = await self.session.scalar(
+                select(TaskRun)
+                .where(
+                    TaskRun.task_id == UUID(str(context.task["id"])),
+                    TaskRun.status == TaskRunStatus.STARTED,
+                )
+                .order_by(TaskRun.started_at.desc())
+                .limit(1)
+            )
+            if task_run is not None:
+                try:
+                    plan = await VerificationPlanService(self.session, self.settings).build(
+                        UUID(str(context.task["id"])), task_run.id
+                    )
+                except (OSError, RuntimeError, ToolSystemError):
+                    plan = None
+                if plan is not None:
+                    verification_plan_json = json.dumps(
+                        plan.model_projection(), sort_keys=True, separators=(",", ":")
+                    )
+                    instructions.user_prompt += (
+                        "\nForge-owned verification requirements (compact):\n"
+                        + verification_plan_json
+                        + "\nForge will execute required deterministic checks automatically. "
+                        "Implement toward these requirements; do not invent verifier commands."
+                    )
+                    instructions.context_components["verification_plan"] = len(
+                        verification_plan_json.encode()
+                    )
         if force_final and str(context.task.get("kind", "")).upper() == TaskKind.DEVELOPMENT.value:
             task_run = await self.session.scalar(
                 select(TaskRun)
@@ -1192,6 +1226,7 @@ class AgentRuntime:
                 else "",
                 "context_component_bytes": json.dumps(instructions.context_components),
                 "completion_manifest_bytes": str(len(manifest_json.encode())),
+                "verification_plan_bytes": str(len(verification_plan_json.encode())),
                 "completion_manifest_replaced_observation_count": str(
                     len(observations) if force_final and manifest_json else 0
                 ),

@@ -288,6 +288,38 @@ HTML is non-empty, and statically resolvable local stylesheet and script referen
 captures normalize screenshot hashes, render state, and console errors when the browser tool is
 enabled. These checks do not assert visual quality.
 
+## Verification planning and automatic QA
+
+Development tasks now receive a Forge-owned `VerificationPlan` before the first model request. The
+plan is derived locally from required deliverables, acceptance criteria, the persisted development
+profile, repository markers, and configured package scripts. It never invents a command. Its full
+form remains durable in bounded Dev Mode events; the Developer sees only deliverables, required
+verification categories, and judgment requirements. Plan construction and reconciliation add no
+model calls.
+
+At QA, Forge reconciles the plan against the current workspace and runs it cheap-first: safe-file
+existence, static reference checks, Git status, configured lint/typecheck/test/build actions,
+browser captures, then capture-gated visual judgment. Every command still passes through the
+existing development runner, permissions, workspace confinement, and durable execution records.
+A blocking early failure marks dependent expensive checks skipped. Successful checks are reused
+only when their step-specific input fingerprint is unchanged and their original successful
+DevelopmentExecution or ToolCall still exists. A mutation invalidates only affected fingerprints;
+raw output is not copied into the plan.
+
+When browser verification is enabled for a frontend task, the plan requests desktop (1440x900) and
+mobile (390x844) captures. Console errors fail the browser verifier. If acceptance criteria require
+visual judgment, a free vision-capable reviewer receives the real bounded screenshots and a compact
+rubric. The reviewer has no tools and returns `VisualQAEvidence` with capture IDs/hashes, findings,
+severity, and an accept/revise/reject decision. Screenshot bytes never enter CompletionManifest or
+Dev Mode events. A later source generation supersedes earlier visual evidence, and repair remains
+bounded by normal task, model-call, token, and iteration limits.
+
+CompletionManifest includes the current plan, executed/reused/skipped checks, visual evidence, and
+source generation. A missing, failed, skipped, or stale blocking verifier prevents readiness;
+model-authored output cannot remove a plan step or override that result. Dev Mode diagnostics expose
+plan/model-visible byte sizes and counts for executions, reuse, failures, browser captures, and
+visual calls without exposing prompts, file contents, screenshots, or secrets.
+
 ## Browser verification
 
 `browser.capture` is an opt-in Forge tool for built static HTML. A separate browser-runner
