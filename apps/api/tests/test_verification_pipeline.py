@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 from httpx import AsyncClient
+from sqlalchemy import select
 
 from app.agent_runtime.contracts import ModelRequest
 from app.agent_runtime.providers import MockModelProvider, OpenRouterModelProvider
@@ -13,6 +14,7 @@ from app.agent_runtime.routing import EconomicTier, ModelCapability, ModelProfil
 from app.agent_runtime.runtime import AgentRuntime
 from app.core.config import Settings
 from app.development.automatic_verification import AutomaticVerificationRunner
+from app.development.completion_contracts import CompletionReadiness
 from app.development.completion_manifest import CompletionManifestService
 from app.development.contracts import RunnerResponse
 from app.development.runner_client import FakeRunnerClient
@@ -30,8 +32,16 @@ from app.development.verification_contracts import (
 )
 from app.development.verification_plan import VerificationPlanService
 from app.development.visual_qa import VisualQAService
-from app.domain.enums import DevelopmentAction, DevelopmentExecutionStatus, DevelopmentProjectType
+from app.domain.enums import (
+    DevelopmentAction,
+    DevelopmentExecutionStatus,
+    DevelopmentProjectType,
+    QADecision,
+    ToolCallStatus,
+)
+from app.domain.models import QAResult, ToolCall
 from app.infrastructure.database import get_session_factory
+from app.services.event_factory import EventFactory
 from app.tool_system.contracts import ToolExecutionContext
 from app.tool_system.errors import ToolSystemError
 from app.tool_system.workspace import WorkspaceManager
@@ -415,6 +425,183 @@ async def test_source_mutation_reuses_unaffected_node_verifier_fingerprint(
         (workspace / "styles.css").write_text("main{color:navy}", encoding="utf-8")
         after = runner._step_fingerprint(node_step, workspace, plan)
     assert before == after
+
+
+async def test_representative_frontend_evidence_reaches_manifest_ready(
+    client: AsyncClient, tmp_path: Path
+) -> None:
+    fixture = await _static_runtime_fixture(client, tmp_path)
+    initial_model_calls = fixture["provider"].call_count
+    async with get_session_factory()() as session:
+        initial_plan = await VerificationPlanService(session, fixture["settings"]).build(
+            fixture["task_id"], fixture["run"].task_run_id
+        )
+        context = ToolExecutionContext(
+            company_id=fixture["company_id"],
+            project_id=fixture["project_id"],
+            task_id=fixture["task_id"],
+            task_run_id=fixture["run"].task_run_id,
+            agent_id=fixture["agent_id"],
+            agent_run_id=fixture["run"].id,
+            execution_origin="FORGE_QA",
+        )
+        await AutomaticVerificationRunner(
+            session,
+            settings=fixture["settings"],
+            runner=FakeRunnerClient([_runner_response()]),
+        ).run(initial_plan, context)
+
+        browser_settings = fixture["settings"].model_copy(
+            update={"forge_browser_enabled": True}
+        )
+        plan = await VerificationPlanService(session, browser_settings).build(
+            fixture["task_id"], fixture["run"].task_run_id
+        )
+        events = EventFactory(session)
+        captures: list[VisualQACaptureReference] = []
+        for key, width, height in (
+            ("browser-desktop", 1440, 900),
+            ("browser-mobile", 390, 844),
+        ):
+            call = ToolCall(
+                agent_run_id=fixture["run"].id,
+                task_run_id=fixture["run"].task_run_id,
+                task_id=fixture["task_id"],
+                agent_id=fixture["agent_id"],
+                tool_name="browser.capture",
+                status=ToolCallStatus.SUCCEEDED,
+                arguments={"path": "index.html", "width": width, "height": height},
+                result={
+                    "path": "index.html",
+                    "artifact": f"browser/{key}.png",
+                    "sha256": key.encode().hex().ljust(64, "0")[:64],
+                    "rendered": True,
+                    "title": "Representative fixture",
+                    "console_errors": [],
+                    "viewport": {"width": width, "height": height},
+                },
+                permission="browser.capture",
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+            )
+            session.add(call)
+            await session.flush()
+            capture = VisualQACaptureReference(
+                tool_call_id=call.id,
+                artifact=call.result["artifact"],
+                sha256=call.result["sha256"],
+                width=width,
+                height=height,
+            )
+            captures.append(capture)
+            result = VerificationResult(
+                step_key=key,
+                kind=(
+                    VerificationKind.BROWSER_DESKTOP
+                    if width == 1440
+                    else VerificationKind.BROWSER_MOBILE
+                ),
+                status=VerificationStepStatus.PASSED,
+                source_generation=plan.source_generation,
+                input_fingerprint="b" * 64,
+                summary=f"Rendered {width}x{height}; console_errors=0.",
+                tool_call_id=call.id,
+                evidence_reference=call.result["artifact"],
+                recorded_at=datetime.now(UTC),
+            )
+            await events.create(
+                company_id=fixture["company_id"],
+                project_id=fixture["project_id"],
+                task_id=fixture["task_id"],
+                correlation_id=fixture["task_id"],
+                event_type="DEV_VERIFICATION_RESULT",
+                message=f"Verification {key} is PASSED.",
+                payload={"result": result.model_dump(mode="json")},
+            )
+        visual_step = next(step for step in plan.steps if step.kind == VerificationKind.VISUAL_QA)
+        visual = VisualQAEvidence(
+            task_id=fixture["task_id"],
+            task_run_id=fixture["run"].task_run_id,
+            source_generation=plan.source_generation,
+            captures=captures,
+            reviewer_provider="fixture",
+            reviewer_model="free-vision-fixture",
+            decision=VisualQADecision.ACCEPT,
+            findings=[],
+            criteria_addressed=visual_step.criterion_indices,
+            summary="Both viewports satisfy the bounded visual rubric.",
+            recorded_at=datetime.now(UTC),
+        )
+        await events.create(
+            company_id=fixture["company_id"],
+            project_id=fixture["project_id"],
+            task_id=fixture["task_id"],
+            correlation_id=fixture["task_id"],
+            event_type="DEV_VISUAL_QA_RECORDED",
+            message="Visual QA returned ACCEPT.",
+            payload={"evidence": visual.model_dump(mode="json")},
+        )
+        visual_result = VerificationResult(
+            step_key=visual_step.key,
+            kind=VerificationKind.VISUAL_QA,
+            status=VerificationStepStatus.PASSED,
+            source_generation=plan.source_generation,
+            input_fingerprint="c" * 64,
+            summary=visual.summary,
+            evidence_reference="DEV_VISUAL_QA_RECORDED",
+            recorded_at=datetime.now(UTC),
+        )
+        await events.create(
+            company_id=fixture["company_id"],
+            project_id=fixture["project_id"],
+            task_id=fixture["task_id"],
+            correlation_id=fixture["task_id"],
+            event_type="DEV_VERIFICATION_RESULT",
+            message="Verification visual-qa is PASSED.",
+            payload={"result": visual_result.model_dump(mode="json")},
+        )
+        session.add(
+            QAResult(
+                task_id=fixture["task_id"],
+                task_run_id=fixture["run"].task_run_id,
+                verifier_agent_id=fixture["agent_id"],
+                iteration=1,
+                decision=QADecision.PASS,
+                summary="The Forge-owned verification plan passed.",
+                checks=[],
+                blocking_issues=[],
+                non_blocking_issues=[],
+                correlation_id=fixture["task_id"],
+            )
+        )
+        await session.commit()
+        manifest = await CompletionManifestService(session, browser_settings).build(
+            fixture["task_id"], fixture["run"].task_run_id
+        )
+        writes = list(
+            await session.scalars(
+                select(ToolCall).where(
+                    ToolCall.task_id == fixture["task_id"],
+                    ToolCall.tool_name == "filesystem.write",
+                )
+            )
+        )
+    assert {step.kind for step in plan.steps} == {
+        VerificationKind.ARTIFACTS,
+        VerificationKind.STATIC_WEB,
+        VerificationKind.GIT_STATUS,
+        VerificationKind.BROWSER_DESKTOP,
+        VerificationKind.BROWSER_MOBILE,
+        VerificationKind.VISUAL_QA,
+    }
+    assert len(manifest.automatic_verification) == 6
+    assert manifest.visual_qa is not None
+    assert manifest.visual_qa.decision == VisualQADecision.ACCEPT
+    assert manifest.readiness == CompletionReadiness.READY
+    assert not manifest.blocking_reasons
+    assert not manifest.judgment_required
+    assert len(writes) == 3
+    assert fixture["provider"].call_count == initial_model_calls == 4
 
 
 def _contract_plan(workspace: Path) -> VerificationPlan:

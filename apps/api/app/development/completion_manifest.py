@@ -114,6 +114,28 @@ class CompletionManifestService:
         automatic = await self._automatic_results(task.id, plan.source_generation if plan else None)
         visual = await self._visual_evidence(task.id, plan.source_generation if plan else None)
         acceptance = await self._acceptance(task, task_run, artifacts, verifications)
+        if plan is not None:
+            automatic_by_key = {item.step_key: item for item in automatic}
+            acceptance_by_index = {item.criterion_index: item for item in acceptance}
+            for step in plan.steps:
+                result = automatic_by_key.get(step.key)
+                if (
+                    not step.deterministic
+                    or result is None
+                    or result.status != VerificationStepStatus.PASSED
+                ):
+                    continue
+                for criterion_index in step.criterion_indices:
+                    item = acceptance_by_index.get(criterion_index)
+                    if item is None or item.status != ManifestEvidenceStatus.UNVERIFIED:
+                        continue
+                    item.status = ManifestEvidenceStatus.VERIFIED
+                    item.requires_judgment = False
+                    item.evidence_summary = (
+                        f"Verified by Forge plan step {step.kind.value}: {result.summary}"
+                    )[:_MAX_SUMMARY]
+                    evidence_id = result.tool_call_id or result.execution_id
+                    item.evidence_ids = [str(evidence_id)] if evidence_id else []
         if visual is not None and visual.decision == VisualQADecision.ACCEPT:
             for item in acceptance:
                 if (

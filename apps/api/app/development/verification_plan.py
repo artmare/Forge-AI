@@ -49,6 +49,7 @@ _VISUAL_TERMS = frozenset(
         "desktop",
         "layout",
         "hero",
+        "feature",
         "pricing",
         "typography",
         "professional",
@@ -58,6 +59,8 @@ _VISUAL_TERMS = frozenset(
         "appearance",
     }
 )
+_BROWSER_RUNTIME_TERMS = frozenset({"console", "load", "render", "title"})
+_STATIC_WEB_TERMS = frozenset({"asset", "reference", "non-empty", "nonempty"})
 
 
 class VerificationPlanService:
@@ -188,9 +191,13 @@ class VerificationPlanService:
         self, task, project_type, profile, deliverables, workspace
     ) -> list[VerificationStep]:
         criteria = [str(value) for value in task.acceptance_criteria]
-        all_indices = list(range(len(criteria)))
         artifact_indices = [
             index for index, criterion in enumerate(criteria) if PATH_CRITERION.search(criterion)
+        ]
+        static_indices = [
+            index
+            for index, criterion in enumerate(criteria)
+            if any(term in criterion.lower() for term in _STATIC_WEB_TERMS)
         ]
         steps = [
             VerificationStep(
@@ -214,7 +221,7 @@ class VerificationPlanService:
                     key="static-web",
                     kind=VerificationKind.STATIC_WEB,
                     reason="Local HTML references must resolve before runtime checks.",
-                    criterion_indices=all_indices,
+                    criterion_indices=static_indices,
                     deliverables=deliverables,
                     mechanism="forge.static_web_verifier",
                     dependencies=["artifacts"],
@@ -267,6 +274,12 @@ class VerificationPlanService:
             index
             for index, criterion in enumerate(criteria)
             if any(term in criterion.lower() for term in _VISUAL_TERMS)
+            and not any(term in criterion.lower() for term in _BROWSER_RUNTIME_TERMS)
+        ]
+        browser_indices = [
+            index
+            for index, criterion in enumerate(criteria)
+            if any(term in criterion.lower() for term in _BROWSER_RUNTIME_TERMS)
         ]
         if static_frontend and self.settings.forge_browser_enabled:
             for key, kind, width, height in (
@@ -280,7 +293,7 @@ class VerificationPlanService:
                         reason=(
                             f"Frontend verification requires a {width}x{height} rendered capture."
                         ),
-                        criterion_indices=visual_indices,
+                        criterion_indices=browser_indices,
                         mechanism=f"browser.capture:{width}x{height}",
                         dependencies=["static-web"],
                         expected_evidence="Rendered PNG hash, viewport, title, and console errors.",
