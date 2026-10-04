@@ -84,6 +84,96 @@ async def test_runtime_rollover_retains_truth_and_blocks_mutation_replay(client,
         assert "Forge context handoff" in provider.requests[1].user_prompt
 
 
+async def test_missing_third_deliverable_rollover_cannot_force_completion(
+    client, monkeypatch
+):
+    company = await create_company(client)
+    project = await create_project(client, company["id"])
+    agent = await create_agent(
+        client,
+        company["id"],
+        role="LEAD_ENGINEER",
+        permissions={"filesystem.write": True, "git.read": True},
+    )
+    response = await client.post(
+        "/api/v1/tasks",
+        json={
+            "company_id": company["id"],
+            "project_id": project["id"],
+            "assigned_agent_id": agent["id"],
+            "type": "IMPLEMENTATION",
+            "kind": "DEVELOPMENT",
+            "title": "Three-file rollover regression",
+            "input": {"deliverables": ["index.html", "styles.css", "app.js"]},
+            "acceptance_criteria": [
+                "index.html, styles.css, and app.js exist and link correctly"
+            ],
+            "max_iterations": 2,
+        },
+    )
+    assert response.status_code == 201, response.text
+    task = response.json()
+    await transition_task(client, task["id"], "QUEUED")
+    provider = MockModelProvider(
+        responses=[
+            tool(
+                "filesystem.write",
+                path="index.html",
+                content='<link rel="stylesheet" href="styles.css"><script src="app.js"></script>',
+            ),
+            tool("filesystem.write", path="styles.css", content="body{margin:0}"),
+            tool("git.status"),
+            tool("git.diff"),
+            final("All three deliverables are complete.", ["index.html", "styles.css", "app.js"]),
+        ]
+    )
+    threshold_checks = 0
+
+    def trigger_one_rollover(self, request, limit, *, reserve_tokens=0):
+        nonlocal threshold_checks
+        threshold_checks += 1
+        return threshold_checks == 4
+
+    monkeypatch.setattr(ContextRollover, "needed", trigger_one_rollover)
+    settings = Settings(
+        forge_dev_mode_enabled=True,
+        forge_dev_context_reserve_tokens=0,
+    )
+    async with get_session_factory()() as session:
+        await ProjectBootstrapService(session, settings=settings).ensure_task(
+            UUID(task["id"]), checkpoint=True
+        )
+        with pytest.raises(AgentRuntimeDomainError) as raised:
+            await AgentRuntime(session, settings=settings, provider=provider).execute(
+                UUID(task["id"])
+            )
+        assert raised.value.code == "UNVERIFIED_EXECUTION_CLAIM"
+        rollover = await session.scalar(
+            select(Event).where(
+                Event.task_id == UUID(task["id"]), Event.type == "DEV_CONTEXT_ROLLOVER"
+            )
+        )
+        calls = list(
+            await session.scalars(
+                select(ToolCall)
+                .where(ToolCall.task_id == UUID(task["id"]))
+                .order_by(ToolCall.created_at, ToolCall.id)
+            )
+        )
+    assert rollover is not None
+    assert rollover.details["completion_safety"]["incomplete_deliverables"] == ["app.js"]
+    assert rollover.details["continuation_mode"] == "EXECUTION_REPAIR"
+    assert "app.js" in rollover.details["next_action"]
+    assert "final result" not in rollover.details["next_action"]
+    assert provider.requests[3].tools
+    assert provider.requests[4].tools
+    assert [item.tool_name for item in calls].count("filesystem.write") == 2
+    assert not any(
+        item.tool_name == "filesystem.write" and item.arguments.get("path") == "app.js"
+        for item in calls
+    )
+
+
 async def test_development_budget_preflight_persists_recoverable_handoff(
     client, tmp_path, monkeypatch
 ):

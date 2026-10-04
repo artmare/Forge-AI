@@ -20,11 +20,34 @@ MAX_MANIFEST_SUMMARY = 500
 PATH_CRITERION = re.compile(
     r"(?:`|\b)([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.[A-Za-z0-9]+)(?:`|\b)"
 )
+_JUDGMENT_TERMS = frozenset(
+    {
+        "appearance",
+        "cta",
+        "dashboard graphic",
+        "feature section",
+        "footer",
+        "hero",
+        "hierarchy",
+        "how it works",
+        "layout",
+        "mobile",
+        "navigation",
+        "pricing",
+        "professional",
+        "responsive",
+        "spacing",
+        "typography",
+        "visual",
+    }
+)
 
 
 def criterion_requires_judgment(criterion: str) -> bool:
     """Return false when an unverified criterion names a deterministic Forge gate."""
     lower = criterion.lower()
+    if any(term in lower for term in _JUDGMENT_TERMS):
+        return True
     if any(term in lower for term in ("test", "build", "lint", "typecheck", "type check")):
         return False
     return PATH_CRITERION.search(criterion) is None

@@ -16,7 +16,6 @@ from app.core.config import Settings, get_settings
 from app.development.completion_contracts import (
     MAX_MANIFEST_ENTRIES,
     MAX_MANIFEST_SUMMARY,
-    PATH_CRITERION,
     AcceptanceEvidence,
     ArtifactEvidence,
     ArtifactProvenance,
@@ -25,6 +24,11 @@ from app.development.completion_contracts import (
     ManifestEvidenceStatus,
     VerificationEvidence,
     criterion_requires_judgment,
+)
+from app.development.completion_safety import (
+    criterion_paths,
+    criterion_requires_static_verification,
+    required_deliverables,
 )
 from app.development.static_web_verifier import StaticWebVerifier
 from app.development.verification_contracts import (
@@ -555,9 +559,14 @@ class CompletionManifestService:
                 for item in persisted[:_MAX_ENTRIES]
             ]
         by_reference = {item.reference: item for item in verifications}
+        static_by_path = {
+            item.reference: item for item in verifications if item.kind == "STATIC_WEB"
+        }
         by_path = {item.path: item for item in artifacts}
         return [
-            self._derive_acceptance(index, str(raw), by_path, by_reference)
+            self._derive_acceptance(
+                index, str(raw), by_path, by_reference, static_by_path
+            )
             for index, raw in enumerate(task.acceptance_criteria[:_MAX_ENTRIES])
         ]
 
@@ -577,6 +586,7 @@ class CompletionManifestService:
         criterion: str,
         by_path: dict[str, ArtifactEvidence],
         by_reference: dict[str, VerificationEvidence],
+        static_by_path: dict[str, VerificationEvidence],
     ) -> AcceptanceEvidence:
         lower = criterion.lower()
         action = None
@@ -601,32 +611,96 @@ class CompletionManifestService:
                 evidence_summary=evidence.summary,
                 evidence_ids=[str(evidence.execution_id)] if evidence.execution_id else [],
             )
-        path_match = PATH_CRITERION.search(criterion)
-        if path_match and path_match.group(1) in by_path:
-            artifact = by_path[path_match.group(1)]
-            verified = artifact.status in {
-                ManifestEvidenceStatus.VERIFIED,
-                ManifestEvidenceStatus.SUPPORTED,
-            }
+        paths = criterion_paths(criterion)
+        if paths:
+            artifacts = [by_path.get(path) for path in paths]
+            failed_paths = [
+                path
+                for path, artifact in zip(paths, artifacts, strict=True)
+                if artifact is None
+                or artifact.status
+                in {
+                    ManifestEvidenceStatus.FAILED,
+                    ManifestEvidenceStatus.INVALIDATED,
+                    ManifestEvidenceStatus.MISSING,
+                    ManifestEvidenceStatus.UNVERIFIED,
+                }
+            ]
+            static_required = criterion_requires_static_verification(criterion)
+            html_paths = [path for path in paths if Path(path).suffix.lower() in {".html", ".htm"}]
+            static_evidence = [static_by_path.get(path) for path in html_paths]
+            static_failed = [
+                item
+                for item in static_evidence
+                if item is not None and item.status == ManifestEvidenceStatus.FAILED
+            ]
+            static_missing = static_required and (
+                not html_paths or any(item is None for item in static_evidence)
+            )
+            evidence_ids = [
+                str(artifact.originating_tool_call_id)
+                for artifact in artifacts
+                if artifact is not None and artifact.originating_tool_call_id is not None
+            ][:20]
+            if failed_paths or static_failed:
+                reasons = []
+                if failed_paths:
+                    reasons.append("missing or invalid artifacts: " + ", ".join(failed_paths))
+                if static_failed:
+                    reasons.append(
+                        "static reference verification failed: "
+                        + ", ".join(item.reference for item in static_failed)
+                    )
+                return AcceptanceEvidence(
+                    criterion_index=index,
+                    criterion=criterion[:1000],
+                    status=ManifestEvidenceStatus.FAILED,
+                    evidence_summary=("; ".join(reasons))[:_MAX_SUMMARY],
+                    evidence_ids=evidence_ids,
+                )
+            if static_missing:
+                return AcceptanceEvidence(
+                    criterion_index=index,
+                    criterion=criterion[:1000],
+                    status=ManifestEvidenceStatus.UNVERIFIED,
+                    evidence_summary=(
+                        "Artifact existence is supported, but required static link verification "
+                        "has no authoritative result."
+                    ),
+                    evidence_ids=evidence_ids,
+                )
+            if criterion_requires_judgment(criterion):
+                return AcceptanceEvidence(
+                    criterion_index=index,
+                    criterion=criterion[:1000],
+                    status=ManifestEvidenceStatus.UNVERIFIED,
+                    evidence_summary=(
+                        "Deterministic artifact requirements are supported; semantic or visual "
+                        "requirements still require judgment."
+                    ),
+                    evidence_ids=evidence_ids,
+                    requires_judgment=True,
+                )
+            fully_verified = all(
+                artifact is not None and artifact.status == ManifestEvidenceStatus.VERIFIED
+                for artifact in artifacts
+            ) and all(
+                item is not None and item.status == ManifestEvidenceStatus.VERIFIED
+                for item in static_evidence
+            )
             return AcceptanceEvidence(
                 criterion_index=index,
                 criterion=criterion[:1000],
                 status=(
                     ManifestEvidenceStatus.VERIFIED
-                    if verified
-                    else ManifestEvidenceStatus.FAILED
+                    if fully_verified
+                    else ManifestEvidenceStatus.SUPPORTED
                 ),
                 evidence_summary=(
-                    f"Current workspace artifact {artifact.path} exists with sha256 "
-                    f"{artifact.sha256}."
-                    if verified
-                    else artifact.issue or f"Artifact {artifact.path} is not valid."
+                    "All required artifact paths are current and"
+                    + (" static references passed." if static_required else " supported.")
                 )[:_MAX_SUMMARY],
-                evidence_ids=(
-                    [str(artifact.originating_tool_call_id)]
-                    if artifact.originating_tool_call_id
-                    else []
-                ),
+                evidence_ids=evidence_ids,
             )
         return AcceptanceEvidence(
             criterion_index=index,
@@ -640,12 +714,11 @@ class CompletionManifestService:
 
     @staticmethod
     def _required_deliverables(task: Task) -> set[str]:
-        raw = task.input.get("deliverables", []) if isinstance(task.input, dict) else []
-        return {
-            item
-            for item in raw[:_MAX_ENTRIES]
-            if isinstance(item, str) and item and len(item) <= 4096
-        }
+        return set(
+            required_deliverables(
+                task.input if isinstance(task.input, dict) else {}, task.acceptance_criteria
+            )
+        )
 
     @staticmethod
     def _unresolved_failures(

@@ -35,6 +35,8 @@ from app.agent_runtime.dev_models import (
 from app.agent_runtime.economics import ModelEconomicsService
 from app.agent_runtime.efficiency import EfficientRuntimeService, ModelBudgetExceeded
 from app.agent_runtime.execution_truth import (
+    EvidenceKind,
+    EvidenceProvenance,
     ExecutionEvidence,
     ExecutionTruthDecision,
     ExecutionTruthValidator,
@@ -56,6 +58,10 @@ from app.agent_runtime.routing import (
 )
 from app.core.config import Settings, get_settings
 from app.development.completion_manifest import CompletionManifestService
+from app.development.completion_safety import (
+    CompletionSafetySnapshot,
+    DevelopmentCompletionSafety,
+)
 from app.development.verification_plan import VerificationPlanService
 from app.domain.enums import (
     AgentRunStatus,
@@ -64,7 +70,7 @@ from app.domain.enums import (
     TaskStatus,
 )
 from app.domain.exceptions import AgentRuntimeDomainError, TaskRunStateConflictError
-from app.domain.models import AgentRun, Event, TaskRun, TaskRuntimeMetric, ToolCall
+from app.domain.models import AgentRun, Event, Task, TaskRun, TaskRuntimeMetric, ToolCall
 from app.repositories.agent import AgentRepository
 from app.repositories.agent_run import AgentRunRepository
 from app.repositories.task import TaskRepository
@@ -77,6 +83,7 @@ from app.tool_system.contracts import (
     FinalTurn,
     ToolExecutionContext,
     ToolObservation,
+    ToolObservationProvenance,
     ToolRequestTurn,
 )
 from app.tool_system.errors import ToolSystemError
@@ -201,16 +208,22 @@ class AgentRuntime:
         )
         if recovery.active:
             rollover.handoff["recovery_evidence"] = recovery.prompt_summary()
-            if recovery.evidence:
+            recovery_safety = await self._completion_safety(
+                initial_task, observations, recovery.evidence
+            )
+            rollover.handoff["completion_safety"] = recovery_safety.handoff_summary()
+            if recovery.evidence and recovery_safety.ready:
                 rollover.handoff["next_action"] = (
                     "Return a precise final result using HISTORICAL scope for the verified "
                     "earlier writes. Do not claim this AgentRun recreated them. Deterministic "
                     "QA will run after the Developer result."
                 )
             else:
+                incomplete = ", ".join(recovery_safety.incomplete_deliverables[:20])
                 rollover.handoff["next_action"] = (
-                    "Historical artifact evidence is stale or missing. Inspect only the listed "
-                    "invalidated artifacts and repair the current workspace if required."
+                    "Recovery completion evidence is incomplete. Create or repair only the "
+                    f"listed required deliverables: {incomplete or 'see completion_safety'}. "
+                    "Do not finalize until Forge records accepted evidence for each one."
                 )
         truth_repair_attempts = recovery.truth_repair_attempts
 
@@ -219,6 +232,9 @@ class AgentRuntime:
             current_task = await self.tasks.get_current(task_id)
             if current_task is None:
                 raise AgentRuntimeDomainError("AGENT_RUNTIME_ERROR", "Task was not found")
+            completion_safety = await self._completion_safety(
+                current_task, observations, recovery.evidence
+            )
             try:
                 budget = await self.efficiency.enforce_budget(current_task)
             except ModelBudgetExceeded as exc:
@@ -259,7 +275,7 @@ class AgentRuntime:
                 budget_warning=budget.warning_active,
                 duplicate_warning=duplicate_signals > 0 or progress.stagnation_signals > 0,
                 force_final=self._developer_ready_for_final(
-                    context, observations, recovery.evidence
+                    context, observations, recovery.evidence, completion_safety
                 ),
             )
             if rollover.handoff:
@@ -343,6 +359,9 @@ class AgentRuntime:
                     )
                 )
                 required_actions = self._required_validation_actions(context)
+                completion_safety = await self._completion_safety(
+                    current_task, observations, recovery.evidence
+                )
                 progress_interval = list(progress.progress_since_rollover)
                 try:
                     handoff = rollover.checkpoint(
@@ -354,6 +373,7 @@ class AgentRuntime:
                         reason=rollover_reason,
                         file_states=context.relevant_files,
                         required_actions=required_actions,
+                        completion_safety=completion_safety.handoff_summary(),
                         remaining_budget={
                             "input_tokens": remaining_input,
                             "model_calls": max(
@@ -447,7 +467,7 @@ class AgentRuntime:
                     budget_warning=budget.warning_active,
                     duplicate_warning=duplicate_signals > 0 or progress.stagnation_signals > 0,
                     force_final=self._developer_ready_for_final(
-                        context, observations, recovery.evidence
+                        context, observations, recovery.evidence, completion_safety
                     ),
                 )
                 handoff_json = json.dumps(handoff, separators=(",", ":"))
@@ -1294,6 +1314,49 @@ class AgentRuntime:
             str(action) for action in profile.get("available_actions", []) if str(action) in allowed
         )
 
+    async def _completion_safety(
+        self,
+        task: Task | None,
+        observations: list[ToolObservation],
+        historical_evidence: tuple[ExecutionEvidence, ...],
+    ) -> CompletionSafetySnapshot:
+        if task is None or task.kind != TaskKind.DEVELOPMENT:
+            return CompletionSafetySnapshot()
+        current_mutations = self._current_mutation_paths(task.id, observations)
+        recovery_hashes = {
+            str(item.reference): str(item.artifact_sha256)
+            for item in historical_evidence
+            if item.kind == EvidenceKind.FILE_MUTATION
+            and item.provenance == EvidenceProvenance.RECOVERY_HISTORY
+            and item.task_id == task.id
+            and item.project_id == task.project_id
+            and item.reference is not None
+            and item.artifact_sha256 is not None
+        }
+        return await DevelopmentCompletionSafety(self.settings).evaluate(
+            company_id=task.company_id,
+            project_id=task.project_id,
+            task_input=task.input if isinstance(task.input, dict) else {},
+            acceptance_criteria=task.acceptance_criteria,
+            current_mutations=current_mutations,
+            recovery_hashes=recovery_hashes,
+        )
+
+    @staticmethod
+    def _current_mutation_paths(
+        task_id: UUID, observations: list[ToolObservation]
+    ) -> set[str]:
+        """Return paths backed by successful current-task Forge mutation executions."""
+        return {
+            str(path)
+            for item in observations
+            if item.status == "success"
+            and item.provenance == ToolObservationProvenance.EXECUTED_TOOL_CALL
+            and item.task_id == task_id
+            and item.tool in {"filesystem.write", "filesystem.patch"}
+            and isinstance(path := (item.result or {}).get("path"), str)
+        }
+
     @staticmethod
     def _pending_argument_repair(
         observations: list[ToolObservation], tool_name: str
@@ -1314,6 +1377,7 @@ class AgentRuntime:
         context: ContextRecord,
         observations: list[ToolObservation],
         historical_evidence: tuple[ExecutionEvidence, ...] = (),
+        completion_safety: CompletionSafetySnapshot | None = None,
     ) -> bool:
         """Require a final-only turn after this Developer run has enough durable evidence."""
         if str(context.agent.get("role", "")).upper() not in {
@@ -1321,6 +1385,8 @@ class AgentRuntime:
             "LEAD_ENGINEER",
             "LEAD ENGINEER",
         }:
+            return False
+        if completion_safety is not None and not completion_safety.ready:
             return False
         successful = [
             item

@@ -13,6 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.development.completion_contracts import PATH_CRITERION, criterion_requires_judgment
+from app.development.completion_safety import (
+    criterion_requires_static_verification,
+    required_deliverables,
+)
 from app.development.profile import DevelopmentProfileService
 from app.development.verification_contracts import (
     MAX_VERIFICATION_STEPS,
@@ -60,7 +64,7 @@ _VISUAL_TERMS = frozenset(
     }
 )
 _BROWSER_RUNTIME_TERMS = frozenset({"console", "load", "render", "title"})
-_STATIC_WEB_TERMS = frozenset({"asset", "reference", "non-empty", "nonempty"})
+_STATIC_WEB_TERMS = frozenset({"asset", "link", "reference", "non-empty", "nonempty"})
 
 
 class VerificationPlanService:
@@ -192,7 +196,11 @@ class VerificationPlanService:
     ) -> list[VerificationStep]:
         criteria = [str(value) for value in task.acceptance_criteria]
         artifact_indices = [
-            index for index, criterion in enumerate(criteria) if PATH_CRITERION.search(criterion)
+            index
+            for index, criterion in enumerate(criteria)
+            if PATH_CRITERION.search(criterion)
+            and not criterion_requires_static_verification(criterion)
+            and not criterion_requires_judgment(criterion)
         ]
         static_indices = [
             index
@@ -328,11 +336,9 @@ class VerificationPlanService:
 
     @staticmethod
     def _deliverables(task: Task) -> list[str]:
-        values = task.input.get("deliverables", []) if isinstance(task.input, dict) else []
-        result = [value for value in values if isinstance(value, str) and 0 < len(value) <= 4096]
-        for criterion in task.acceptance_criteria:
-            result.extend(match.group(1) for match in PATH_CRITERION.finditer(str(criterion)))
-        return sorted(dict.fromkeys(result))[:100]
+        return required_deliverables(
+            task.input if isinstance(task.input, dict) else {}, task.acceptance_criteria
+        )
 
     @staticmethod
     def source_generation(workspace: Path, deliverables: list[str] | None = None) -> str:

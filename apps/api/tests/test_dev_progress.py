@@ -151,6 +151,42 @@ def test_rollover_snapshot_does_not_reopen_a_repaired_schema_failure():
     assert "Return the final structured result" in snapshot["next_action"]
 
 
+def test_rollover_keeps_missing_required_deliverable_in_execution_mode():
+    state = ContextRollover(0.7, 4)
+    snapshot = state.checkpoint(
+        task_id="task",
+        goal="Build page",
+        observations=[
+            observation("filesystem.write", {"path": "index.html", "byte_size": 100}),
+            observation("filesystem.write", {"path": "styles.css", "byte_size": 100}),
+            observation(
+                "git.status",
+                {"action": "GIT_STATUS", "status": "SUCCEEDED", "stdout_excerpt": ""},
+            ),
+        ],
+        tool_steps=3,
+        duplicate_signals=0,
+        completion_safety={
+            "completion_safe": False,
+            "required_deliverables": ["app.js", "index.html", "styles.css"],
+            "incomplete_deliverables": ["app.js"],
+            "deliverable_states": [
+                {
+                    "path": "app.js",
+                    "status": "MISSING",
+                    "sha256": None,
+                    "reason": "Required deliverable is missing.",
+                }
+            ],
+        },
+    )
+    assert snapshot["continuation_mode"] == "EXECUTION_REPAIR"
+    assert snapshot["verification_still_required"] is True
+    assert snapshot["completion_safety"]["incomplete_deliverables"] == ["app.js"]
+    assert "app.js" in snapshot["next_action"]
+    assert "final result" not in snapshot["next_action"]
+
+
 async def test_malformed_development_execute_has_targeted_repair_schema():
     async with get_session_factory()() as session:
         definition = next(

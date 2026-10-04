@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -12,11 +11,19 @@ from app.core.config import Settings, get_settings
 from app.development.automatic_verification import AutomaticVerificationRunner
 from app.development.bootstrap import DevelopmentPreconditions, ProjectBootstrapService
 from app.development.completion_contracts import criterion_requires_judgment
+from app.development.completion_safety import (
+    criterion_paths,
+    criterion_requires_static_verification,
+)
 from app.development.product_qa import ProductQAService
 from app.development.profile import DevelopmentProfileService
 from app.development.registry import CommandRegistry
 from app.development.runner_client import RunnerClient
-from app.development.verification_contracts import VerificationStepStatus
+from app.development.verification_contracts import (
+    VerificationKind,
+    VerificationResult,
+    VerificationStepStatus,
+)
 from app.development.verification_plan import VerificationPlanService
 from app.domain.enums import (
     AcceptanceVerificationStatus,
@@ -43,6 +50,7 @@ from app.domain.models import (
 from app.services.event_factory import EventFactory
 from app.services.task_state_machine import TaskStateMachine
 from app.tool_system.contracts import ToolExecutionContext
+from app.tool_system.errors import ToolSystemError
 from app.tool_system.workspace import WorkspaceManager
 
 _WRITE_RUNTIME_INFRASTRUCTURE_CODES = frozenset(
@@ -266,7 +274,12 @@ class DevelopmentQAService:
             )
         )
         verifications = self._verify_criteria(
-            task, task_run, qa_agent, executions, unavailable_actions
+            task,
+            task_run,
+            qa_agent,
+            executions,
+            unavailable_actions,
+            list(verification_run.results),
         )
         self.session.add_all(verifications)
         product_qa = await ProductQAService(self.session, self.settings).evaluate(
@@ -540,9 +553,13 @@ class DevelopmentQAService:
         qa_agent: Agent,
         executions: list[Any],
         unavailable_actions: dict[str, str],
+        verification_results: list[VerificationResult],
     ) -> list[AcceptanceVerification]:
         by_action = {execution.action: execution for execution in executions}
-        workspace = self.workspace.project_workspace(task.company_id, task.project_id)  # type: ignore[arg-type]
+        static_result = next(
+            (item for item in verification_results if item.kind == VerificationKind.STATIC_WEB),
+            None,
+        )
         records: list[AcceptanceVerification] = []
         for index, raw in enumerate(task.acceptance_criteria):
             criterion = str(raw)
@@ -584,20 +601,46 @@ class DevelopmentQAService:
                     f"unavailable: {unavailable_actions[action.value]}"
                 )
             else:
-                path_match = re.search(
-                    r"(?:`|\b)([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.[A-Za-z0-9]+)(?:`|\b)",
-                    criterion,
-                )
-                if path_match:
-                    candidate = workspace / path_match.group(1)
-                    exists = candidate.is_file() and not candidate.is_symlink()
-                    status = (
-                        AcceptanceVerificationStatus.PASSED
-                        if exists
-                        else AcceptanceVerificationStatus.FAILED
+                paths = criterion_paths(criterion)
+                if paths:
+                    missing: list[str] = []
+                    for path in paths:
+                        try:
+                            _, candidate = self.workspace.resolve(
+                                task.company_id,
+                                task.project_id,  # type: ignore[arg-type]
+                                path,
+                                must_exist=True,
+                            )
+                            self.workspace.ensure_regular_file(candidate)
+                        except (OSError, ToolSystemError):
+                            missing.append(path)
+                    static_required = criterion_requires_static_verification(criterion)
+                    static_failed = static_required and (
+                        static_result is None
+                        or static_result.status != VerificationStepStatus.PASSED
                     )
-                    state = "exists" if exists else "does not exist"
-                    evidence = f"File {path_match.group(1)} {state} in the project workspace."
+                    requires_judgment = criterion_requires_judgment(criterion)
+                    status = (
+                        AcceptanceVerificationStatus.FAILED
+                        if missing or static_failed
+                        else AcceptanceVerificationStatus.UNVERIFIED
+                        if requires_judgment
+                        else AcceptanceVerificationStatus.PASSED
+                    )
+                    if missing:
+                        evidence = "Required artifact paths are missing or unsafe: " + ", ".join(
+                            missing
+                        )
+                    elif static_failed:
+                        evidence = "Required static link verification did not pass."
+                    elif requires_judgment:
+                        evidence = (
+                            "Deterministic artifact requirements passed; semantic or visual "
+                            "requirements still require judgment."
+                        )
+                    else:
+                        evidence = "All required artifact paths and deterministic link checks pass."
             records.append(
                 AcceptanceVerification(
                     task_id=task.id,

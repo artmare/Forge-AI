@@ -105,6 +105,7 @@ class ContextRollover:
         reason: str = "MODEL_CONTEXT_THRESHOLD",
         file_states: list[dict[str, Any]] | None = None,
         required_actions: list[str] | None = None,
+        completion_safety: dict[str, Any] | None = None,
         remaining_budget: dict[str, int] | None = None,
         progress: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -179,6 +180,15 @@ class ContextRollover:
             and str((item.result or {}).get("status", "")).upper() == "SUCCEEDED"
         }
         missing_actions = sorted(set(required_actions or []) - completed_actions)
+        safety = completion_safety or {
+            "completion_safe": True,
+            "required_deliverables": [],
+            "incomplete_deliverables": [],
+            "deliverable_states": [],
+        }
+        incomplete_deliverables = [
+            str(item) for item in safety.get("incomplete_deliverables", []) if item
+        ][:30]
         successful_tools = {item.tool for item in observations if item.status == "success"}
         unresolved = failures[-1] if failures else None
         if unresolved and (unresolved.get("error") or {}).get("code") == (
@@ -194,6 +204,13 @@ class ContextRollover:
         elif unresolved:
             next_action = (
                 f"Resolve the recorded {unresolved['tool']} failure before any further inspection."
+            )
+        elif incomplete_deliverables:
+            next_action = (
+                "Create or repair the next incomplete required deliverable with an authorized "
+                f"mutation tool: {incomplete_deliverables[0]}. Incomplete deliverables: "
+                + ", ".join(incomplete_deliverables)
+                + ". Do not finalize until Forge records successful evidence for each one."
             )
         elif missing_actions:
             next_action = (
@@ -233,7 +250,11 @@ class ContextRollover:
             "failures": failures[-20:],
             "required_validation_actions": sorted(required_actions or []),
             "remaining_validation_actions": missing_actions,
-            "verification_still_required": bool(missing_actions),
+            "verification_still_required": bool(missing_actions or incomplete_deliverables),
+            "continuation_mode": (
+                "EXECUTION_REPAIR" if incomplete_deliverables else "VERIFICATION_FINALIZATION"
+            ),
+            "completion_safety": safety,
             "mutation_fingerprints": sorted(self.executed_mutations),
             "progress_since_last_rollover": (progress or [])[-20:],
             "remaining_budget": remaining_budget or {},

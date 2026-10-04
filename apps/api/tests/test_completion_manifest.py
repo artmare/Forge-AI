@@ -213,6 +213,48 @@ async def test_missing_statically_referenced_asset_is_deterministically_failed(
     assert manifest.readiness == CompletionReadiness.BLOCKED
 
 
+async def test_compound_artifact_acceptance_requires_every_path_and_static_links(
+    client: AsyncClient, tmp_path: Path
+) -> None:
+    fixture = await _static_run(client, tmp_path)
+    task_id = UUID(fixture["task"]["id"])
+    compound = "index.html, styles.css, and app.js exist and link correctly"
+    semantic = (
+        "Page contains navigation, hero with dashboard graphic, three feature sections, "
+        "How it works, pricing, final CTA, and footer."
+    )
+    async with get_session_factory()() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        task.acceptance_criteria = [compound, semantic]
+        await session.commit()
+        complete = await CompletionManifestService(session, fixture["settings"]).build(
+            task_id, fixture["run"].task_run_id
+        )
+        compound_complete = next(
+            item for item in complete.acceptance_criteria if item.criterion == compound
+        )
+        semantic_complete = next(
+            item for item in complete.acceptance_criteria if item.criterion == semantic
+        )
+        assert compound_complete.status == ManifestEvidenceStatus.VERIFIED
+        assert semantic_complete.status == ManifestEvidenceStatus.UNVERIFIED
+        assert semantic_complete.requires_judgment is True
+
+        (fixture["workspace"] / "app.js").unlink()
+        incomplete = await CompletionManifestService(session, fixture["settings"]).build(
+            task_id, fixture["run"].task_run_id
+        )
+    compound_incomplete = next(
+        item for item in incomplete.acceptance_criteria if item.criterion == compound
+    )
+    assert compound_incomplete.status == ManifestEvidenceStatus.FAILED
+    assert "app.js" in compound_incomplete.evidence_summary
+    assert incomplete.readiness == CompletionReadiness.BLOCKED
+    assert any("Artifact app.js is missing" in item for item in incomplete.blocking_reasons)
+    assert any("Verification index.html failed" in item for item in incomplete.blocking_reasons)
+
+
 async def test_normalized_verification_and_acceptance_drive_readiness(
     client: AsyncClient, tmp_path: Path
 ) -> None:
