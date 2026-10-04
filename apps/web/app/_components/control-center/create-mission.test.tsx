@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CreateMission } from "./create-mission";
@@ -14,6 +14,8 @@ describe("CreateMission", () => {
 
     await user.type(screen.getByLabelText("Mission title"), "Runtime verification");
     await user.type(screen.getByLabelText("Outcome"), "Persist, plan, activate, and expose the execution state.");
+    expect((screen.getByRole("checkbox", { name: "Internet access" }) as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByRole("checkbox", { name: "Browser access" }) as HTMLInputElement).checked).toBe(false);
     await user.click(screen.getByRole("button", { name: "Create & start" }));
 
     await waitFor(() => expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({
@@ -21,6 +23,65 @@ describe("CreateMission", () => {
       goal: "Persist, plan, activate, and expose the execution state.",
       start_immediately: true,
       constraints: expect.objectContaining({ max_agents: 3, max_tasks: 8, internet_access: false, browser_access: false }),
+    })));
+  });
+
+  it("enables browser access independently and submits the selected capability", async () => {
+    const onCreate = vi.fn(async () => undefined);
+    const user = userEvent.setup();
+    render(<CreateMission open busy={false} stage={null} retrying={false} runtimePaused={false} onClose={vi.fn()} onCreate={onCreate} />);
+
+    await user.type(screen.getByLabelText("Mission title"), "Browser mission");
+    await user.type(screen.getByLabelText("Outcome"), "Verify the rendered application.");
+    screen.getByRole("checkbox", { name: "Browser access" }).focus();
+    await user.keyboard(" ");
+
+    expect((screen.getByRole("checkbox", { name: "Browser access" }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("checkbox", { name: "Internet access" }) as HTMLInputElement).checked).toBe(false);
+    expect(screen.getByText("ON")).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: "Create & start" }));
+    await waitFor(() => expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({
+      constraints: expect.objectContaining({ internet_access: false, browser_access: true }),
+    })));
+  });
+
+  it("toggles capabilities off and preserves structured planning constraints", async () => {
+    const onCreate = vi.fn(async () => undefined);
+    const user = userEvent.setup();
+    render(<CreateMission open busy={false} stage={null} retrying={false} runtimePaused={false} onClose={vi.fn()} onCreate={onCreate} />);
+
+    const internetAccess = screen.getByRole("checkbox", { name: "Internet access" });
+    const browserAccess = screen.getByRole("checkbox", { name: "Browser access" });
+    await user.click(internetAccess);
+    await user.click(internetAccess);
+    expect((internetAccess as HTMLInputElement).checked).toBe(false);
+    await user.click(internetAccess);
+    await user.click(browserAccess);
+    await user.click(browserAccess);
+    expect((internetAccess as HTMLInputElement).checked).toBe(true);
+    expect((browserAccess as HTMLInputElement).checked).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: /Advanced structured inputs/ }));
+    fireEvent.change(screen.getByLabelText("Constraints JSON"), {
+      target: { value: '{"priority":"high","internet_access":false}' },
+    });
+    await user.clear(screen.getByLabelText("Maximum agents"));
+    await user.type(screen.getByLabelText("Maximum agents"), "5");
+    await user.clear(screen.getByLabelText("Maximum tasks"));
+    await user.type(screen.getByLabelText("Maximum tasks"), "12");
+    await user.type(screen.getByLabelText("Mission title"), "Connected mission");
+    await user.type(screen.getByLabelText("Outcome"), "Use explicitly granted internet access.");
+    await user.click(screen.getByRole("button", { name: "Create & start" }));
+
+    await waitFor(() => expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({
+      constraints: {
+        priority: "high",
+        max_agents: 5,
+        max_tasks: 12,
+        internet_access: true,
+        browser_access: false,
+      },
     })));
   });
 
