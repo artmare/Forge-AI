@@ -37,8 +37,8 @@ from app.domain.exceptions import (
     MissionPlanningError,
 )
 from app.domain.models import Mission, PlanningRun
-from app.planning.contracts import PlanProposal, PlanValidationResult
-from app.planning.validator import PlanValidator
+from app.planning.contracts import PlanProposal, PlanValidationError, PlanValidationResult
+from app.planning.validator import PlanValidationPolicy, PlanValidator
 from app.repositories.mission import MissionRepository
 from app.repositories.planning_run import PlanningRunRepository
 from app.services.event_factory import EventFactory
@@ -51,11 +51,14 @@ class MissionPlanner:
         "You are Forge's bounded project planner. Create the smallest useful team and Task DAG "
         "for the user-supplied Mission. Respect the supplied capabilities and limits. Do not "
         "assume unavailable tools, do not claim work has happened, and provide measurable "
-        "acceptance criteria. For user-facing frontend work, include measurable product criteria "
-        "covering the 1440x900, 768x1024, and 390x844 viewport contract: no unintended "
-        "horizontal overflow, readable wrapping, associated form labels, visible keyboard focus, "
-        "and explicit loading/empty/error states where applicable. Do not claim screenshots or "
-        "browser checks are available. You only propose structured data; you never mutate "
+        "acceptance criteria. For user-facing frontend work, include measurable responsive, "
+        "accessibility, and product criteria covering the 1440x900, 768x1024, and 390x844 "
+        "contract: no unintended horizontal overflow, readable wrapping, associated form labels, "
+        "and visible keyboard focus. Require screenshots, rendered viewport checks, or browser "
+        "evidence only when the effective Mission policy permits browser access. When it does "
+        "not, use permitted static or behavioral criteria, do not claim screenshots or browser "
+        "checks are available, and leave unsupported visual judgment to human review. You only "
+        "propose structured data; you never mutate "
         "databases."
         " A DEVELOPMENT plan must include a DEVELOPER with the required filesystem, "
         "development.execute, and Git-read permissions, an independent QA Agent, and the "
@@ -92,9 +95,10 @@ class MissionPlanner:
         selections, capabilities = await self._route_models(
             mission, resolved.alias, resolved.model_id
         )
+        planning_policy = self.validator.policy_for(mission.constraints)
         mission, run = await self._start(mission_id, selections[0], capabilities)
         started = perf_counter()
-        request = self._request(mission, selections[0].profile.model_id)
+        request = self._request(mission, selections[0].profile.model_id, planning_policy)
         try:
             response, repair_attempted, selection = await self._generate_with_retry(
                 run.id,
@@ -102,6 +106,7 @@ class MissionPlanner:
                 mission,
                 selections,
                 capabilities,
+                planning_policy,
             )
         except ProviderCallError as exc:
             failed = await self._fail(mission_id, run.id, exc)
@@ -124,6 +129,7 @@ class MissionPlanner:
                     capabilities,
                     category="SCHEMA_PARSE",
                     errors=schema_errors,
+                    policy=planning_policy,
                 )
                 if repaired is not None:
                     response = repaired
@@ -157,8 +163,10 @@ class MissionPlanner:
                     details=self._failure_details(failed, error),
                 ) from None
 
-        validation = self.validator.validate(proposal)
+        validation = self.validator.validate(proposal, policy=planning_policy)
         if not validation.valid and not repair_attempted:
+            prior_proposal = proposal
+            reported_errors = tuple(validation.errors)
             repaired = await self._targeted_repair(
                 run.id,
                 mission,
@@ -167,6 +175,7 @@ class MissionPlanner:
                 category="CANONICAL_VALIDATION",
                 errors=[item.model_dump(mode="json") for item in validation.errors],
                 prior=proposal,
+                policy=planning_policy,
             )
             if repaired is not None:
                 response = repaired
@@ -194,7 +203,17 @@ class MissionPlanner:
                         self._status_code(error),
                         details=self._failure_details(failed, error),
                     ) from None
-                validation = self.validator.validate(proposal)
+                validation = self.validator.validate(proposal, policy=planning_policy)
+                scope_errors = self._repair_scope_errors(
+                    prior_proposal, proposal, reported_errors
+                )
+                if scope_errors:
+                    validation = validation.model_copy(
+                        update={
+                            "valid": False,
+                            "errors": [*validation.errors, *scope_errors],
+                        }
+                    )
         if not validation.valid:
             if repair_attempted:
                 await self._finalize_repair_attempt(
@@ -262,6 +281,7 @@ class MissionPlanner:
         mission: Mission,
         selections: list[ModelSelection],
         capabilities: frozenset[ModelCapability],
+        policy: PlanValidationPolicy,
     ) -> tuple[ModelResponse, bool, ModelSelection]:
         max_attempts = max(self.settings.planner_provider_max_attempts, 1)
         total_attempt = 0
@@ -390,6 +410,7 @@ class MissionPlanner:
                         selection.profile.model_id,
                         category="SCHEMA_PARSE",
                         errors=error.safe_details().get("validation_errors", []),
+                        policy=policy,
                     )
                     continue
                 if should_retry:
@@ -596,7 +617,9 @@ class MissionPlanner:
             await self.session.rollback()
             raise
 
-    def _request(self, mission: Mission, model_id: str) -> ModelRequest:
+    def _request(
+        self, mission: Mission, model_id: str, policy: PlanValidationPolicy
+    ) -> ModelRequest:
         planner_input = {
             "mission": {
                 "title": mission.title,
@@ -605,18 +628,7 @@ class MissionPlanner:
                 "context": mission.context,
             },
             "capabilities": self.validator.capability_manifest,
-            "limits": {
-                "max_agents": self.settings.mission_max_agents,
-                "max_tasks": self.settings.mission_max_tasks,
-                "max_dependencies": self.settings.mission_max_dependencies,
-            },
-            "runtime_boundaries": {
-                "internet": False,
-                "browser": False,
-                "shell": False,
-                "email": False,
-                "deployment": False,
-            },
+            "effective_policy": policy.prompt_summary(),
         }
         return ModelRequest(
             model=model_id,
@@ -656,6 +668,76 @@ class MissionPlanner:
             )
         return evidence
 
+    @classmethod
+    def _repair_scope_errors(
+        cls,
+        prior: PlanProposal,
+        repaired: PlanProposal,
+        reported_errors: tuple[PlanValidationError, ...],
+    ) -> list[PlanValidationError]:
+        """Reject unrelated topology changes made during a targeted canonical repair."""
+        allowed = {item.path for item in reported_errors if item.path}
+        changes = cls._topology_changes(prior, repaired)
+        unrelated = [
+            path
+            for path in changes
+            if not any(
+                path == target
+                or path.startswith(f"{target}.")
+                for target in allowed
+            )
+        ]
+        return [
+            PlanValidationError(
+                code="REPAIR_SCOPE_VIOLATION",
+                message=(
+                    "Targeted repair changed valid topology outside the reported validation "
+                    "error paths."
+                ),
+                path=path,
+            )
+            for path in unrelated[:20]
+        ]
+
+    @staticmethod
+    def _topology_changes(prior: PlanProposal, repaired: PlanProposal) -> list[str]:
+        changes: list[str] = []
+        if len(prior.agents) != len(repaired.agents):
+            changes.append("agents")
+        for index, (before, after) in enumerate(
+            zip(prior.agents, repaired.agents, strict=False)
+        ):
+            for field in ("key", "role", "model_alias"):
+                if getattr(before, field) != getattr(after, field):
+                    changes.append(f"agents.{index}.{field}")
+            permission_keys = set(before.requested_permissions) | set(
+                after.requested_permissions
+            )
+            for permission in sorted(permission_keys):
+                if before.requested_permissions.get(
+                    permission
+                ) != after.requested_permissions.get(permission):
+                    changes.append(
+                        f"agents.{index}.requested_permissions.{permission}"
+                    )
+        if len(prior.tasks) != len(repaired.tasks):
+            changes.append("tasks")
+        for index, (before, after) in enumerate(
+            zip(prior.tasks, repaired.tasks, strict=False)
+        ):
+            for field in ("key", "assigned_agent_key", "kind", "max_iterations"):
+                if getattr(before, field) != getattr(after, field):
+                    changes.append(f"tasks.{index}.{field}")
+        if len(prior.dependencies) != len(repaired.dependencies):
+            changes.append("dependencies")
+        for index, (before, after) in enumerate(
+            zip(prior.dependencies, repaired.dependencies, strict=False)
+        ):
+            for field in ("task", "depends_on"):
+                if getattr(before, field) != getattr(after, field):
+                    changes.append(f"dependencies.{index}.{field}")
+        return changes
+
     def _repair_request(
         self,
         mission: Mission,
@@ -664,6 +746,7 @@ class MissionPlanner:
         category: str,
         errors: object,
         prior: PlanProposal | None = None,
+        policy: PlanValidationPolicy,
     ) -> ModelRequest:
         prior_value: object | None = None
         if prior is not None:
@@ -687,9 +770,15 @@ class MissionPlanner:
             "prior_candidate": prior_value,
             "canonical_schema": PlanProposal.model_json_schema(),
             "capability_manifest": self.validator.capability_manifest,
+            "mission_constraints": mission.constraints,
+            "effective_policy": policy.prompt_summary(),
             "instruction": (
-                "Return one corrected PlanProposal. Fix only the reported contract errors; "
-                "do not add unavailable capabilities or explanatory prose."
+                "Return one corrected PlanProposal. Change every field identified by the exact "
+                "validation error path so the stated invariant is satisfied. Preserve valid "
+                "project, agent, task, dependency, permission, and identifier fields unless a "
+                "reported error requires changing them. Do not add unavailable capabilities. "
+                "An unchanged rejected value will fail canonical validation again. Return no "
+                "explanatory prose."
             ),
         }
         return ModelRequest(
@@ -719,6 +808,7 @@ class MissionPlanner:
         category: str,
         errors: object,
         prior: PlanProposal | None = None,
+        policy: PlanValidationPolicy,
     ) -> ModelResponse | None:
         run = await self.runs.get(run_id)
         maximum = max(self.settings.planner_provider_max_attempts, 1)
@@ -736,6 +826,7 @@ class MissionPlanner:
             category=category,
             errors=errors,
             prior=prior,
+            policy=policy,
         )
         attempt = run.provider_attempts + 1
         try:
@@ -879,6 +970,13 @@ class MissionPlanner:
             "failure_category": "CANONICAL_VALIDATION",
             "repair_attempted": repair_attempted,
             "repair_eligible": False,
+            "repair_attempts": 1 if repair_attempted else 0,
+            "max_repair_attempts": 1,
+            "provider_attempts_remaining": max(
+                max(self.settings.planner_provider_max_attempts, 1)
+                - run.provider_attempts,
+                0,
+            ),
             "validation_errors": [item.model_dump(mode="json") for item in validation.errors],
             "last_failure_at": now.isoformat(),
             "mission_attempt_consumed": True,

@@ -64,7 +64,9 @@ class CompanyFactory:
                 )
             proposal = PlanProposal.model_validate(run.proposal)
             stored_validation = PlanValidationResult.model_validate(run.validation_result)
-            current_validation = self.validator.validate(proposal)
+            current_validation = self.validator.validate(
+                proposal, policy=self.validator.policy_for(mission.constraints)
+            )
             if not stored_validation.valid or not current_validation.valid:
                 raise MissionConflictError(
                     "INVALID_PLAN", "Mission plan no longer passes capability validation."

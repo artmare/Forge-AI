@@ -1,10 +1,12 @@
-import re
 from collections import Counter, deque
+from dataclasses import dataclass
+from typing import Any
 
 from app.agent_runtime.registry import ModelRegistry
 from app.core.config import Settings, get_settings
 from app.domain.enums import ToolPermission
 from app.domain.exceptions import ModelAliasNotFoundError
+from app.planning.acceptance import analyze_acceptance_criterion
 from app.planning.contracts import (
     PlanProposal,
     PlanValidationError,
@@ -13,6 +15,38 @@ from app.planning.contracts import (
     ProposedTask,
 )
 from app.tool_system.registry import ToolRegistry
+
+
+@dataclass(frozen=True)
+class PlanValidationPolicy:
+    max_agents: int
+    max_tasks: int
+    max_dependencies: int
+    browser_access: bool
+    browser_requested: bool
+    browser_available: bool
+    internet_access: bool = False
+
+    def prompt_summary(self) -> dict[str, object]:
+        return {
+            "limits": {
+                "max_agents": self.max_agents,
+                "max_tasks": self.max_tasks,
+                "max_dependencies": self.max_dependencies,
+            },
+            "runtime_boundaries": {
+                "browser": self.browser_access,
+                "internet": self.internet_access,
+                "shell": False,
+                "email": False,
+                "deployment": False,
+            },
+            "browser": {
+                "owner_requested": self.browser_requested,
+                "available": self.browser_available,
+                "permitted": self.browser_access,
+            },
+        }
 
 
 class PlanValidator:
@@ -42,13 +76,6 @@ class PlanValidator:
         "QA": "QA",
         "RESEARCH": "RESEARCHER",
     }
-    VERIFIABLE_CUE = re.compile(
-        r"(?:\b(?:test|build|lint|typecheck|type check|pass|fail|return|contain|exist|"
-        r"write|read|match|render|support|respond|produce|create|verify|no\s+)\w*\b|"
-        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+|[A-Za-z0-9_-]+\.[A-Za-z0-9]+)",
-        re.IGNORECASE,
-    )
-
     def __init__(
         self,
         settings: Settings | None = None,
@@ -87,9 +114,35 @@ class PlanValidator:
             },
         }
 
-    def validate(self, proposal: PlanProposal) -> PlanValidationResult:
+    def policy_for(self, constraints: dict[str, Any] | None) -> PlanValidationPolicy:
+        values = constraints if isinstance(constraints, dict) else {}
+        tools = set(self.capability_manifest["tools"])
+        browser_requested = values.get("browser_access") is True
+        browser_available = "browser.capture" in tools
+
+        def bounded_limit(key: str, configured: int) -> int:
+            value = values.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return min(value, configured)
+            return configured
+
+        return PlanValidationPolicy(
+            max_agents=bounded_limit("max_agents", self.settings.mission_max_agents),
+            max_tasks=bounded_limit("max_tasks", self.settings.mission_max_tasks),
+            max_dependencies=bounded_limit(
+                "max_dependencies", self.settings.mission_max_dependencies
+            ),
+            browser_access=browser_requested and browser_available,
+            browser_requested=browser_requested,
+            browser_available=browser_available,
+        )
+
+    def validate(
+        self, proposal: PlanProposal, *, policy: PlanValidationPolicy | None = None
+    ) -> PlanValidationResult:
+        resolved_policy = policy or self.policy_for({})
         errors: list[PlanValidationError] = []
-        self._validate_limits(proposal, errors)
+        self._validate_limits(proposal, resolved_policy, errors)
         agent_keys = [agent.key for agent in proposal.agents]
         task_keys = [task.key for task in proposal.tasks]
         self._duplicates(agent_keys, "agent", errors)
@@ -98,6 +151,11 @@ class PlanValidator:
         agents_by_key = {agent.key: agent for agent in proposal.agents}
         agent_indices = {agent.key: index for index, agent in enumerate(proposal.agents)}
         roles = {agent.role.strip().upper() for agent in proposal.agents}
+        browser_qa_available = any(
+            agent.role.strip().upper() == "QA"
+            and agent.requested_permissions.get(ToolPermission.BROWSER_CAPTURE.value) is True
+            for agent in proposal.agents
+        )
         tasks = set(task_keys)
         permission_manifest = self.capability_manifest["permissions"]
         assert isinstance(permission_manifest, list)
@@ -140,6 +198,21 @@ class PlanValidator:
                             path=f"agents.{index}.requested_permissions.{permission}",
                         )
                     )
+                elif (
+                    permission == ToolPermission.BROWSER_CAPTURE.value
+                    and requested
+                    and not resolved_policy.browser_access
+                ):
+                    errors.append(
+                        PlanValidationError(
+                            code="CAPABILITY_POLICY_CONFLICT",
+                            message=(
+                                "Agent requested browser.capture, but effective Mission policy "
+                                "does not permit browser access."
+                            ),
+                            path=f"agents.{index}.requested_permissions.{permission}",
+                        )
+                    )
 
         for index, task in enumerate(proposal.tasks):
             if task.assigned_agent_key not in agents:
@@ -162,7 +235,9 @@ class PlanValidator:
                     )
                 )
             for criterion_index, criterion in enumerate(task.acceptance_criteria):
-                if not self.VERIFIABLE_CUE.search(criterion):
+                analysis = analyze_acceptance_criterion(criterion)
+                path = f"tasks.{index}.acceptance_criteria.{criterion_index}"
+                if not analysis.observable:
                     errors.append(
                         PlanValidationError(
                             code="UNVERIFIABLE_ACCEPTANCE_CRITERION",
@@ -170,7 +245,35 @@ class PlanValidator:
                                 "Acceptance criteria must name observable file, command, "
                                 "behavior, or verification evidence."
                             ),
-                            path=f"tasks.{index}.acceptance_criteria.{criterion_index}",
+                            path=path,
+                        )
+                    )
+                elif analysis.browser_required and not resolved_policy.browser_access:
+                    reason = (
+                        "Mission policy forbids browser access."
+                        if not resolved_policy.browser_requested
+                        else "Forge browser capture is unavailable in this environment."
+                    )
+                    errors.append(
+                        PlanValidationError(
+                            code="CAPABILITY_POLICY_CONFLICT",
+                            message=(
+                                "Acceptance criterion requires browser or rendered viewport "
+                                f"evidence, but {reason} Use a permitted verification mechanism "
+                                "or leave the judgment to human review."
+                            ),
+                            path=path,
+                        )
+                    )
+                elif analysis.browser_required and not browser_qa_available:
+                    errors.append(
+                        PlanValidationError(
+                            code="BROWSER_PERMISSION_REQUIRED",
+                            message=(
+                                "Browser-verifiable acceptance criteria require a QA Agent with "
+                                "browser.capture explicitly enabled."
+                            ),
+                            path=path,
                         )
                     )
             assigned = agents_by_key.get(task.assigned_agent_key)
@@ -301,14 +404,19 @@ class PlanValidator:
                 )
             )
 
-    def _validate_limits(self, proposal: PlanProposal, errors: list[PlanValidationError]) -> None:
+    def _validate_limits(
+        self,
+        proposal: PlanProposal,
+        policy: PlanValidationPolicy,
+        errors: list[PlanValidationError],
+    ) -> None:
         limits = (
-            ("agents", len(proposal.agents), self.settings.mission_max_agents),
-            ("tasks", len(proposal.tasks), self.settings.mission_max_tasks),
+            ("agents", len(proposal.agents), policy.max_agents),
+            ("tasks", len(proposal.tasks), policy.max_tasks),
             (
                 "dependencies",
                 len(proposal.dependencies),
-                self.settings.mission_max_dependencies,
+                policy.max_dependencies,
             ),
         )
         for name, actual, maximum in limits:

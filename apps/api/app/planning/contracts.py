@@ -17,6 +17,7 @@ RequestedPermissions = Annotated[
                 "development.install_dependencies": {"type": "boolean"},
                 "git.read": {"type": "boolean"},
                 "git.write": {"type": "boolean"},
+                "browser.capture": {"type": "boolean"},
             },
             "required": [
                 "filesystem.list",
@@ -26,6 +27,7 @@ RequestedPermissions = Annotated[
                 "development.install_dependencies",
                 "git.read",
                 "git.write",
+                "browser.capture",
             ],
             "additionalProperties": False,
         }
