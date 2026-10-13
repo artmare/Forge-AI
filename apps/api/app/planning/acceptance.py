@@ -34,6 +34,7 @@ _COMMAND = re.compile(
     r"\b(?:npm|pnpm|yarn)\s+(?:run\s+)?[A-Za-z0-9:_-]+\b)",
     re.IGNORECASE,
 )
+_GIT_COMMAND = re.compile(r"\bgit(?:\.|\s+)(?:status|diff|log)\b", re.IGNORECASE)
 _COMMAND_OUTCOME = re.compile(
     r"\b(?:pass(?:es|ed|ing)?|fail(?:s|ed|ing)?|succeed(?:s|ed|ing)?|"
     r"exit(?:s|ed|ing)?|result|output|error(?:s)?|status)\b",
@@ -77,8 +78,12 @@ def analyze_acceptance_criterion(criterion: str) -> AcceptanceCriterionAnalysis:
     """Classify observable mechanisms without treating evidence prose as evidence itself."""
     mechanisms: set[AcceptanceMechanism] = set()
     has_path = _PATH.search(criterion) is not None
-    has_command = _COMMAND.search(criterion) is not None
-    has_command_outcome = _COMMAND_OUTCOME.search(criterion) is not None
+    has_git_command = _GIT_COMMAND.search(criterion) is not None
+    has_command = _COMMAND.search(criterion) is not None or has_git_command
+    # `status` is also a supported Git operation name. Remove Forge-owned Git command
+    # tokens before looking for an outcome so a bare `git status` is not self-verifying.
+    outcome_text = _GIT_COMMAND.sub("", criterion) if has_git_command else criterion
+    has_command_outcome = _COMMAND_OUTCOME.search(outcome_text) is not None
     has_behavior = _OBSERVABLE_BEHAVIOR.search(criterion) is not None
     has_verification_action = _VERIFICATION_ACTION.search(criterion) is not None
     has_evidence = _EVIDENCE.search(criterion) is not None

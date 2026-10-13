@@ -12,6 +12,7 @@ from app.agent_runtime.contracts import BaseAgentResult
 from app.tool_system.contracts import (
     ToolObservation,
     ToolObservationProvenance,
+    canonical_git_claim_reference,
     canonical_git_reference,
 )
 
@@ -43,6 +44,19 @@ class ExecutionEvidence:
     checkpoint: str | None = None
     executed_at: datetime | None = None
     verified_at: datetime | None = None
+
+    def as_claim(self) -> dict[str, str | None]:
+        """Return the bounded claim Forge can authoritatively support for this evidence."""
+        return {
+            "kind": self.kind.value,
+            "reference": self.reference,
+            "scope": (
+                "HISTORICAL"
+                if self.provenance == EvidenceProvenance.RECOVERY_HISTORY
+                else "CURRENT_RUN"
+            ),
+            "tool_call_id": str(self.tool_call_id) if self.tool_call_id else None,
+        }
 
 
 @dataclass(frozen=True)
@@ -198,6 +212,9 @@ class ExecutionTruthValidator:
                         "tool_call_id": claim_tool_call_id,
                     },
                 )
+            reference_for_matching = claim_reference
+            if claim_kind == EvidenceKind.GIT.value:
+                reference_for_matching = canonical_git_claim_reference(claim_reference)
             matching_evidence = [item for item in evidence if item.kind.value == claim_kind]
             expected_provenance = (
                 EvidenceProvenance.RECOVERY_HISTORY
@@ -207,10 +224,14 @@ class ExecutionTruthValidator:
             matching_evidence = [
                 item for item in matching_evidence if item.provenance == expected_provenance
             ]
-            if isinstance(claim_reference, str):
+            if isinstance(reference_for_matching, str):
                 matching_evidence = [
-                    item for item in matching_evidence if item.reference == claim_reference
+                    item
+                    for item in matching_evidence
+                    if item.reference == reference_for_matching
                 ]
+            elif claim_reference is not None:
+                matching_evidence = []
             if isinstance(claim_tool_call_id, str):
                 matching_evidence = [
                     item
@@ -357,3 +378,41 @@ class ExecutionTruthValidator:
                     )
                 )
         return tuple(collected)
+
+    @classmethod
+    def supported_scope_correction(
+        cls,
+        decision: ExecutionTruthDecision,
+    ) -> dict[str, str | None] | None:
+        """Derive one exact scope correction without accepting the invalid claim."""
+        claim = decision.failed_claim or {}
+        kind = claim.get("kind")
+        reference = claim.get("reference")
+        scope = str(claim.get("scope") or "CURRENT_RUN").upper()
+        tool_call_id = claim.get("tool_call_id")
+        if scope not in {"CURRENT_RUN", "HISTORICAL"} or not isinstance(kind, str):
+            return None
+        reference_for_matching = reference
+        if kind == EvidenceKind.GIT.value and isinstance(reference, str):
+            reference_for_matching = canonical_git_claim_reference(reference)
+        candidates = [
+            item
+            for item in decision.evidence
+            if item.kind.value == kind and item.reference == reference_for_matching
+        ]
+        if isinstance(tool_call_id, str):
+            candidates = [
+                item for item in candidates if str(item.tool_call_id) == tool_call_id
+            ]
+        provenances = {item.provenance for item in candidates}
+        if len(provenances) != 1:
+            return None
+        supported = candidates[-1]
+        supported_scope = (
+            "HISTORICAL"
+            if supported.provenance == EvidenceProvenance.RECOVERY_HISTORY
+            else "CURRENT_RUN"
+        )
+        if supported_scope == scope:
+            return None
+        return supported.as_claim()

@@ -242,8 +242,12 @@ class PlanValidator:
                         PlanValidationError(
                             code="UNVERIFIABLE_ACCEPTANCE_CRITERION",
                             message=(
-                                "Acceptance criteria must name observable file, command, "
-                                "behavior, or verification evidence."
+                                "Acceptance criteria must name an exact file path, a supported "
+                                "command with an observable outcome, behavior, or verification "
+                                "evidence. Examples: 'styles.css contains responsive media-query "
+                                "rules' or 'git.status and git.diff outputs are recorded in "
+                                "qa_report.md'. Generic phrases such as 'CSS file' or "
+                                "'requirements verified' are insufficient."
                             ),
                             path=path,
                         )

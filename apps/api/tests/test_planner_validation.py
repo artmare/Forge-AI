@@ -240,6 +240,93 @@ def test_artifact_and_command_acceptance_remain_canonically_valid() -> None:
         assert result.valid, result.errors
 
 
+def test_forge_git_acceptance_requires_an_observable_outcome() -> None:
+    for command in (
+        "git status",
+        "git diff",
+        "git log",
+        "git.status",
+        "git.diff",
+        "git.log",
+    ):
+        observed = analyze_acceptance_criterion(
+            f"{command} output is recorded in qa_report.md"
+        )
+        assert AcceptanceMechanism.COMMAND in observed.mechanisms
+        assert AcceptanceMechanism.VERIFICATION_EVIDENCE in observed.mechanisms
+
+        command_only = analyze_acceptance_criterion(command)
+        assert not command_only.observable
+
+
+def test_static_acceptance_requires_a_concrete_file_path() -> None:
+    exact = analyze_acceptance_criterion(
+        "styles.css contains responsive media-query rules"
+    )
+    assert AcceptanceMechanism.ARTIFACT in exact.mechanisms
+
+    generic = analyze_acceptance_criterion(
+        "CSS file includes media queries and layout rules for responsive viewports"
+    )
+    assert not generic.observable
+
+
+def test_pennypilot_e2e6_acceptance_phrasing_remains_strict_and_actionable() -> None:
+    criteria = (
+        "CSS file includes media queries and layout rules for responsive viewports",
+        "Git status and diff output successfully reviewed and logged",
+        "Static code and responsiveness requirements verified against static criteria",
+    )
+    analyses = [analyze_acceptance_criterion(item) for item in criteria]
+
+    assert not analyses[0].observable
+    assert AcceptanceMechanism.COMMAND in analyses[1].mechanisms
+    assert not analyses[2].observable
+
+    result = PlanValidator(Settings()).validate(
+        PlanProposal.model_validate(
+            planner_proposal("Static code and responsiveness requirements verified")
+        )
+    )
+    error = next(
+        item
+        for item in result.errors
+        if item.code == "UNVERIFIABLE_ACCEPTANCE_CRITERION"
+    )
+    assert "styles.css contains responsive media-query rules" in error.message
+    assert "git.status and git.diff outputs are recorded in qa_report.md" in error.message
+    assert "'CSS file'" in error.message
+    assert "'requirements verified'" in error.message
+
+
+async def test_canonical_repair_receives_actionable_acceptance_guidance(
+    client: AsyncClient,
+) -> None:
+    mission = await create_planner_mission(client, browser_access=False)
+    initial = planner_proposal("Requirements verified")
+    repaired = copy.deepcopy(initial)
+    repaired["tasks"][1]["acceptance_criteria"][1] = (
+        "git.status and git.diff outputs are recorded in qa_report.md"
+    )
+    provider = ScriptedPlannerProvider([initial, repaired])
+
+    async with get_session_factory()() as session:
+        run = await MissionPlanner(session, provider=provider).plan(UUID(mission["id"]))
+
+    assert run.status == PlanningRunStatus.SUCCEEDED
+    assert provider.call_count == 2
+    assert "exact file paths or supported commands with observable outcomes" in (
+        provider.requests[0].system_prompt
+    )
+    repair = json.loads(provider.requests[1].user_prompt)
+    error = repair["validation_errors"][0]
+    assert error["path"] == "tasks.1.acceptance_criteria.1"
+    assert "styles.css contains responsive media-query rules" in error["message"]
+    assert "git.status and git.diff outputs are recorded in qa_report.md" in error["message"]
+    assert "'CSS file'" in error["message"]
+    assert "'requirements verified'" in error["message"]
+
+
 async def test_canonical_repair_receives_exact_policy_error_and_preserves_topology(
     client: AsyncClient,
 ) -> None:

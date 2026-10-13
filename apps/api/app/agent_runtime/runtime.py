@@ -207,6 +207,10 @@ class AgentRuntime:
             task_id, observations, rollover, progress
         )
         if recovery.active:
+            # A durable failure handoff belongs to an earlier TaskRun. Only the recovery service
+            # may promote its revalidated evidence into this continuation, as HISTORICAL.
+            rollover.handoff.pop("execution_scope", None)
+            rollover.handoff.pop("current_execution_claims", None)
             rollover.handoff["recovery_evidence"] = recovery.prompt_summary()
             recovery_safety = await self._completion_safety(
                 initial_task, observations, recovery.evidence
@@ -363,6 +367,23 @@ class AgentRuntime:
                     current_task, observations, recovery.evidence
                 )
                 progress_interval = list(progress.progress_since_rollover)
+                active_task_run_id = next(
+                    (
+                        item.task_run_id
+                        for item in reversed(observations)
+                        if item.task_run_id is not None
+                    ),
+                    None,
+                )
+                current_execution_claims = [
+                    item.as_claim()
+                    for item in ExecutionTruthValidator.collect(
+                        observations,
+                        task_id=current_task.id,
+                        project_id=current_task.project_id,
+                        task_run_id=active_task_run_id,
+                    )
+                ]
                 try:
                     handoff = rollover.checkpoint(
                         task_id=str(task_id),
@@ -371,6 +392,10 @@ class AgentRuntime:
                         tool_steps=tool_steps,
                         duplicate_signals=duplicate_signals,
                         reason=rollover_reason,
+                        current_task_run_id=(
+                            str(active_task_run_id) if active_task_run_id else None
+                        ),
+                        current_execution_claims=current_execution_claims,
                         file_states=context.relevant_files,
                         required_actions=required_actions,
                         completion_safety=completion_safety.handoff_summary(),
@@ -612,7 +637,8 @@ class AgentRuntime:
                         truth.message,
                         category="TOOL_PROTOCOL",
                     )
-                    if recovery.active:
+                    scope_correction = ExecutionTruthValidator.supported_scope_correction(truth)
+                    if recovery.active or scope_correction is not None:
                         truth_repair_attempts += 1
                         rejected = await self._reject_final_for_repair(
                             run.id,
@@ -624,7 +650,11 @@ class AgentRuntime:
                         )
                         if truth_repair_attempts < self.settings.forge_dev_tool_repair_limit:
                             rollover.handoff["execution_truth_correction"] = (
-                                self._truth_correction(truth, recovery)
+                                self._truth_correction(
+                                    truth,
+                                    recovery,
+                                    supported_scope_claim=scope_correction,
+                                )
                             )
                             rollover.handoff["next_action"] = (
                                 "Correct only the unsupported completion claim described in "
@@ -633,7 +663,7 @@ class AgentRuntime:
                             continue
                         terminal = ProviderCallError(
                             "EXECUTION_TRUTH_REPAIR_LIMIT_EXHAUSTED",
-                            "The recovery model repeated unsupported execution claims",
+                            "The model repeated unsupported execution claims",
                             category="TOOL_PROTOCOL",
                         )
                         await self._fail_task(
@@ -2160,7 +2190,10 @@ class AgentRuntime:
 
     @staticmethod
     def _truth_correction(
-        truth: ExecutionTruthDecision, recovery: RecoveryEvidenceSnapshot
+        truth: ExecutionTruthDecision,
+        recovery: RecoveryEvidenceSnapshot,
+        *,
+        supported_scope_claim: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
         claim = truth.failed_claim or {}
         reference = claim.get("reference")
@@ -2177,6 +2210,13 @@ class AgentRuntime:
                 "evidence; do not request or imply mutation replay."
             ),
         }
+        if supported_scope_claim is not None:
+            correction["supported_claim"] = supported_scope_claim
+            correction["instruction"] = (
+                "The action is supported, but the submitted scope was wrong. Use the exact "
+                "supported_claim fields. Do not replay the action or claim a different TaskRun."
+            )
+            return correction
         if matching is not None:
             correction["supported_historical_claim"] = {
                 "kind": matching.kind.value,

@@ -1,11 +1,17 @@
 import { eventMessage, eventType } from "./helpers";
-import type { ControlData, View } from "./types";
+import type { ControlData } from "./types";
 import { EmptyState, Panel, SectionHeading, StatusBadge, formatTime, relativeTime, shortId } from "./ui";
 
-export function OperationsView({ view, data, onInspectTask }: { view: Exclude<View, "overview"|"missions"|"activity"|"system">; data: ControlData; onInspectTask: (taskId: string) => void }) {
+export function OperationsView({ view, data, onInspectTask }: { view: "companies" | "projects" | "agents" | "tasks"; data: ControlData; onInspectTask: (taskId: string) => void }) {
   const titles = { companies: ["Organization", "Companies"], projects: ["Delivery", "Projects"], agents: ["Workforce", "Agents"], tasks: ["Execution", "Tasks"] } as const;
+  const descriptions = {
+    companies: "The operating companies managed by your Forge workspace.",
+    projects: "The projects created and executed across your companies.",
+    agents: "Specialized roles that make up your AI company.",
+    tasks: "The live execution inventory across active projects.",
+  } as const;
   const [eyebrow, title] = titles[view];
-  return <div className="space-y-4"><div><p className="eyebrow">{eyebrow}</p><h1 className="page-title">{title}</h1></div>
+  return <div className="space-y-4"><div className="reference-heading"><p className="eyebrow">{eyebrow}</p><h1 className="page-title">{title}</h1><p>{descriptions[view]}</p></div>
     {data.inventoryError && <div className="global-error" role="alert">{data.inventoryError}</div>}
     {view === "companies" && (data.companies === null ? <Panel><EmptyState icon="companies" title="Loading companies" body="Reading the live Forge organization inventory…" /></Panel> : <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">{data.companies.map((company) => <Panel key={company.id} className="p-5"><div className="flex items-start justify-between gap-4"><div className="org-mark">{company.name.slice(0,2).toUpperCase()}</div><StatusBadge status={company.status ?? "ACTIVE"} /></div><h2 className="mt-5 text-lg font-semibold text-white">{company.name}</h2><p className="mt-2 line-clamp-3 text-xs leading-5 text-slate-500">{company.description || company.goal || "Forge operating company"}</p><p className="mt-5 font-mono text-[10px] text-slate-700">{shortId(company.id)}</p></Panel>)}{!data.companies.length && <Panel className="md:col-span-2 xl:col-span-3"><EmptyState icon="companies" title="No companies yet" body="A company is provisioned when a mission plan is activated." /></Panel>}</div>)}
     {view === "projects" && (data.projects === null ? <Panel><EmptyState icon="projects" title="Loading projects" body="Reading projects across all Forge companies…" /></Panel> : <div className="grid gap-3 lg:grid-cols-2">{data.projects.map((project) => <Panel key={project.id} className="p-5"><div className="flex items-start justify-between gap-4"><StatusBadge status={project.status ?? "ACTIVE"} /><span className="font-mono text-[10px] text-slate-700">{shortId(project.id)}</span></div><h2 className="mt-4 text-lg font-semibold text-white">{project.name}</h2><p className="mt-2 text-xs leading-5 text-slate-500">{project.description || project.goal || "Mission delivery project"}</p><p className="mt-5 text-[10px] uppercase tracking-[.12em] text-slate-600">{data.companies?.find((company) => company.id === project.company_id)?.name ?? "Forge company"}</p></Panel>)}{!data.projects.length && <Panel className="lg:col-span-2"><EmptyState icon="projects" title="No projects yet" body="Projects appear after an approved mission is activated." /></Panel>}</div>)}

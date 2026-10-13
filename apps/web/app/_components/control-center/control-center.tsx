@@ -3,7 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { forge, focusNode } from "./helpers";
 import { CreateMission } from "./create-mission";
-import { MissionView } from "./mission-view";
+import { ArtifactViewer } from "./artifact-viewer";
+import { SettingsPage } from "./settings-page";
+import { ArtifactsView, MissionView } from "./mission-view";
 import { MissionDirectory } from "./mission-directory";
 import { ActivityPage, OperationsView, SystemPage } from "./operations";
 import { Overview } from "./overview";
@@ -15,14 +17,16 @@ import type {
 import { Icon, type IconName } from "./ui";
 
 const navigation: Array<{ id: View; label: string; icon: IconName }> = [
-  { id: "overview", label: "Overview", icon: "overview" },
+  { id: "overview", label: "Dashboard", icon: "overview" },
   { id: "missions", label: "Missions", icon: "missions" },
   { id: "companies", label: "Companies", icon: "companies" },
   { id: "projects", label: "Projects", icon: "projects" },
   { id: "agents", label: "Agents", icon: "agents" },
+  { id: "artifacts", label: "Artifacts", icon: "file" },
   { id: "tasks", label: "Tasks", icon: "tasks" },
   { id: "activity", label: "Activity", icon: "activity" },
-  { id: "system", label: "System", icon: "system" },
+  { id: "system", label: "System", icon: "pulse" },
+  { id: "settings", label: "Settings", icon: "system" },
 ];
 const emptyData: ControlData = {
   status: null, missions: [], archivedMissions: [], mission: null, plan: null,
@@ -85,6 +89,16 @@ export function ControlCenter() {
   const [createStage, setCreateStage] = useState<string | null>(null);
   const [pendingCreate, setPendingCreate] = useState<Mission | null>(null);
   const [controlBusy, setControlBusy] = useState(false);
+  const [selectedArtifact, setSelectedArtifact] = useState<ArtifactMetadata | null>(null);
+  const [theme, setTheme] = useState<"light" | "dark">("dark");
+  useEffect(() => {
+    try { const saved = localStorage.getItem("forge-theme-v1"); if (saved === "light" || saved === "dark") setTheme(saved); } catch {}
+  }, []);
+  const toggleTheme = () => {
+    const next = theme === "light" ? "dark" : "light";
+    setTheme(next);
+    try { localStorage.setItem("forge-theme-v1", next); } catch {}
+  };
   const [drawer, setDrawer] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -253,7 +267,7 @@ export function ControlCenter() {
     const nextMission = next === "overview" && data.mission?.archived_at ? data.missions[0]?.id ?? null : selectedId;
     syncRoute({ view: next, tab: nextTab ?? tab, missionId: nextMission, inspect: next === "missions" ? inspectionTaskId : null });
     setMobileNav(false);
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    window.scrollTo({ top: 0 });
   };
   const chooseMission = (missionId: string | null, scope: MissionScope, nextTab: MissionTab = "overview") => syncRoute({ view: "missions", missionId, scope, tab: nextTab, inspect: null });
   const chooseTab = (nextTab: MissionTab) => syncRoute({ view: "missions", tab: nextTab, inspect: nextTab === "tasks" ? inspectionTaskId : null });
@@ -334,23 +348,25 @@ export function ControlCenter() {
     (data.graph?.nodes.filter((node) => ["REVIEW", "FIX_REQUIRED", "FAILED"].includes(node.status) || node.blocked_reason?.includes("FAILED")).length ?? 0);
   const runtimeOnline = Boolean(data.status?.orchestrator.orchestrator_online);
 
-  return <div className="control-center">
+  return <div className="control-center" data-theme={theme} data-view={view}>
     <button className={`mobile-scrim ${mobileNav ? "mobile-scrim-open" : ""}`} onClick={() => setMobileNav(false)} aria-label="Close navigation" />
     <aside className={`sidebar ${mobileNav ? "sidebar-open" : ""}`}>
-      <div className="brand"><div className="brand-mark"><span /></div><div><strong>FORGE</strong><small>CONTROL CENTER</small></div><button className="ml-auto md:hidden" onClick={() => setMobileNav(false)} aria-label="Close navigation"><Icon name="close" /></button></div>
+      <div className="brand"><div className="brand-mark"><span /></div><div><strong>Forge</strong></div><button className="ml-auto md:hidden" onClick={() => setMobileNav(false)} aria-label="Close navigation"><Icon name="close" /></button></div>
       <nav aria-label="Primary navigation">{navigation.map((item) => <button key={item.id} onClick={() => navigate(item.id)} aria-current={view === item.id ? "page" : undefined} className={view === item.id ? "nav-active" : ""}><Icon name={item.icon} /><span>{item.label}</span>{item.id === "missions" && attention > 0 && <em>{attention}</em>}</button>)}</nav>
       <div className="sidebar-missions"><p>Recent missions</p>{loading && !data.missions.length && <span className="sidebar-loading">Loading missions…</span>}{data.missions.slice(0, 5).map((mission) => <button key={mission.id} className={mission.id === selectedId ? "selected" : ""} onClick={() => chooseMission(mission.id, "active")}><span className={`mission-state mission-state-${mission.status.toLowerCase()}`} /><span className="truncate">{mission.title}</span></button>)}{!loading && !data.missions.length && <span className="sidebar-loading">No active missions</span>}<button className="sidebar-view-all" onClick={() => chooseMission(data.missions[0]?.id ?? null, "active")}>View all missions <Icon name="arrow" /></button></div>
       <div className="sidebar-footer"><div className="runtime-indicator"><span className={runtimeOnline ? "online" : ""} /><div><strong>{runtimeOnline ? "Runtime online" : "Runtime offline"}</strong><small>{data.status?.orchestrator.active_workers ?? 0} active workers</small></div></div><p>Forge v{data.status?.system.version ?? "0.8.0"}</p></div>
     </aside>
     <div className="workspace">
-      <header className="topbar"><button className="icon-button md:hidden" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Icon name="menu" /></button><div className="topbar-mission"><span>MISSION</span><button onClick={() => navigate("missions")}>{data.mission?.title ?? "No active mission"}<Icon name="arrow" /></button></div><div className="topbar-actions"><div className="stream-status hidden items-center gap-2 lg:flex" title={`Live updates: ${streamState}`}><span className={`health-dot ${streamState === "connected" ? "health-online" : ""}`} /><span>{streamState === "connected" ? "Live updates" : streamState === "connecting" ? "Connecting…" : "Reconnecting…"}</span></div><button disabled={controlBusy || !runtimeOnline} title={!runtimeOnline ? "Runtime must be online before autonomy can be controlled." : undefined} onClick={() => void setAutonomy(!data.status?.orchestrator.autonomy_enabled)} className={`autonomy-control ${data.status?.orchestrator.autonomy_enabled ? "autonomy-on" : ""}`}><Icon name={data.status?.orchestrator.autonomy_enabled ? "pause" : "play"} /><span className="hidden sm:inline">{controlBusy ? "Applying…" : data.status?.orchestrator.autonomy_enabled ? "Pause autonomy" : "Resume autonomy"}</span><span className="sm:hidden">{data.status?.orchestrator.autonomy_enabled ? "Pause" : "Resume"}</span></button><button onClick={() => setDrawer(true)} className="create-button"><Icon name="plus" /><span className="hidden sm:inline">New mission</span></button></div></header>
+      <header className="topbar"><button className="icon-button md:hidden" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Icon name="menu" /></button><div className="topbar-mission"><span>MISSION</span><button onClick={() => navigate("missions")}>{data.mission?.title ?? "No active mission"}<Icon name="arrow" /></button></div><div className="topbar-actions"><button className="theme-toggle" onClick={toggleTheme} aria-label={`Switch to ${theme === "light" ? "dark" : "light"} mode`} title={`Switch to ${theme === "light" ? "dark" : "light"} mode`}>{theme === "light" ? "☾" : "☀"}</button><div className="stream-status hidden items-center gap-2 lg:flex" title={`Live updates: ${streamState}`}><span className={`health-dot ${streamState === "connected" ? "health-online" : ""}`} /><span>{streamState === "connected" ? "Live updates" : streamState === "connecting" ? "Connecting…" : "Reconnecting…"}</span></div><button disabled={controlBusy || !runtimeOnline} title={!runtimeOnline ? "Runtime must be online before autonomy can be controlled." : undefined} onClick={() => void setAutonomy(!data.status?.orchestrator.autonomy_enabled)} className={`autonomy-control ${data.status?.orchestrator.autonomy_enabled ? "autonomy-on" : ""}`}><Icon name={data.status?.orchestrator.autonomy_enabled ? "pause" : "play"} /><span className="hidden sm:inline">{controlBusy ? "Applying…" : data.status?.orchestrator.autonomy_enabled ? "Pause autonomy" : "Resume autonomy"}</span><span className="sm:hidden">{data.status?.orchestrator.autonomy_enabled ? "Pause" : "Resume"}</span></button><button onClick={() => setDrawer(true)} className="create-button"><Icon name="plus" /><span className="hidden sm:inline">New mission</span></button></div></header>
       <main className="content-area">
         {error && <div className="global-error" role="alert"><Icon name="alert" /><span>{error}</span><button className="error-retry" onClick={() => { setError(null); void refreshCore(); void refreshDetail(); }}>Refresh</button><button onClick={() => setError(null)} aria-label="Dismiss error"><Icon name="close" /></button></div>}
-        {view === "overview" && <Overview data={data} loading={loading} onNavigate={navigate} onInspectTask={inspectTask} />}
+        {view === "overview" && <Overview data={data} loading={loading} onNavigate={navigate} onOpenMission={(id) => chooseMission(id, "active")} />}
         {view === "missions" && <div className="space-y-8"><MissionView key={data.mission?.id ?? "no-mission"} data={data} tab={tab} busy={busy} inspectionTaskId={inspectionTaskId} onTab={chooseTab} onAction={action} onInspectTask={inspectTask} /><MissionDirectory current={data.missions} archived={data.archivedMissions} scope={missionScope} selectedId={selectedId} busy={busy} onScope={(scope) => chooseMission((scope === "archived" ? data.archivedMissions : data.missions)[0]?.id ?? null, scope)} onOpen={(mission) => chooseMission(mission.id, mission.archived_at ? "archived" : "active")} onAction={action} /></div>}
         {["companies", "projects", "agents", "tasks"].includes(view) && <OperationsView view={view as "companies" | "projects" | "agents" | "tasks"} data={data} onInspectTask={inspectTask} />}
         {view === "activity" && <ActivityPage data={data} />}
         {view === "system" && <SystemPage data={data} />}
+        {view === "settings" && <SettingsPage theme={theme} onToggleTheme={toggleTheme} data={data} />}
+        {view === "artifacts" && <div className="space-y-6"><div className="reference-heading"><h1 className="page-title">Artifacts</h1><p>Files and results from {data.mission?.title ?? "your selected mission"}.</p></div><label className="artifact-mission-picker">Mission<select value={selectedId ?? ""} onChange={(event) => syncRoute({ missionId: event.target.value })}>{[...data.missions, ...data.archivedMissions].map((mission) => <option key={mission.id} value={mission.id}>{mission.title}</option>)}</select></label><ArtifactsView data={data} onOpenArtifact={setSelectedArtifact} /><ArtifactViewer key={selectedArtifact?.path ?? "no-artifact"} projectId={data.mission?.project_id ?? null} artifact={selectedArtifact} onClose={() => setSelectedArtifact(null)} /></div>}
       </main>
     </div>
     <CreateMission open={drawer} busy={busy} stage={createStage} retrying={Boolean(pendingCreate)} runtimePaused={!data.status?.orchestrator.autonomy_enabled} onClose={() => { if (!busy) setDrawer(false); }} onCreate={create} />

@@ -35,6 +35,23 @@ def canonical_git_reference(tool_name: str) -> str | None:
     return action.value if action is not None else None
 
 
+def canonical_git_claim_reference(reference: str) -> str | None:
+    """Normalize an explicit Git claim alias to a Forge-owned semantic reference.
+
+    Claims still require a successful, scoped ToolCall. This only reconciles the
+    canonical action name with the registered tool's dotted or human-readable name.
+    """
+    candidate = reference.strip().casefold()
+    for tool_name, action in GIT_TOOL_REFERENCES.items():
+        if candidate in {
+            action.value.casefold(),
+            tool_name.casefold(),
+            tool_name.replace(".", " ").casefold(),
+        }:
+            return action.value
+    return None
+
+
 class ToolObservationProvenance(StrEnum):
     EXECUTED_TOOL_CALL = "EXECUTED_TOOL_CALL"
     REUSED_TOOL_CALL_RESULT = "REUSED_TOOL_CALL_RESULT"

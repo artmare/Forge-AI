@@ -1,4 +1,4 @@
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -8,6 +8,7 @@ from app.agent_runtime.execution_truth import (
     EvidenceKind,
     EvidenceProvenance,
     ExecutionEvidence,
+    ExecutionTruthDecision,
     ExecutionTruthValidator,
 )
 from app.tool_system.contracts import ToolObservation, ToolObservationProvenance
@@ -194,6 +195,77 @@ def test_historical_evidence_cannot_prove_current_run_performed_mutation() -> No
     }
 
 
+def test_current_task_run_evidence_cannot_be_claimed_as_historical() -> None:
+    task_id = uuid4()
+    task_run_id = uuid4()
+    call_id = uuid4()
+    observation = ToolObservation(
+        tool_call_id=call_id,
+        tool="filesystem.write",
+        status="success",
+        result={"path": "index.html"},
+        task_id=task_id,
+        task_run_id=task_run_id,
+        agent_run_id=uuid4(),
+    )
+    result = _result(["index.html"])
+    result.output["execution_claims"] = [
+        {
+            "kind": "FILE_MUTATION",
+            "reference": "index.html",
+            "scope": "HISTORICAL",
+            "tool_call_id": None,
+        }
+    ]
+
+    decision = ExecutionTruthValidator.validate(
+        _context(),
+        result,
+        [observation],
+        current_task_id=task_id,
+        current_task_run_id=task_run_id,
+    )
+
+    assert not decision.accepted
+    assert ExecutionTruthValidator.supported_scope_correction(decision) == {
+        "kind": "FILE_MUTATION",
+        "reference": "index.html",
+        "scope": "CURRENT_RUN",
+        "tool_call_id": str(call_id),
+    }
+
+
+def test_scope_correction_is_not_derived_from_conflicting_provenance() -> None:
+    current = ExecutionEvidence(
+        kind=EvidenceKind.FILE_MUTATION,
+        tool="filesystem.write",
+        reference="index.html",
+        provenance=EvidenceProvenance.CURRENT_RUN,
+        tool_call_id=uuid4(),
+    )
+    historical = ExecutionEvidence(
+        kind=EvidenceKind.FILE_MUTATION,
+        tool="filesystem.write",
+        reference="index.html",
+        provenance=EvidenceProvenance.RECOVERY_HISTORY,
+        tool_call_id=uuid4(),
+    )
+    decision = ExecutionTruthDecision(
+        accepted=False,
+        code="UNVERIFIED_EXECUTION_CLAIM",
+        message="A structured execution claim has no matching Forge evidence.",
+        evidence=(current, historical),
+        failed_claim={
+            "kind": "FILE_MUTATION",
+            "reference": "index.html",
+            "scope": "HISTORICAL",
+            "tool_call_id": None,
+        },
+    )
+
+    assert ExecutionTruthValidator.supported_scope_correction(decision) is None
+
+
 def test_historical_evidence_from_another_task_or_workspace_is_rejected() -> None:
     task_id = uuid4()
     project_id = uuid4()
@@ -359,6 +431,220 @@ def test_current_git_claim_requires_matching_reference_and_tool_call_id() -> Non
     assert not ExecutionTruthValidator.validate(
         _context(), _git_result("GIT_DIFF", str(call_id)), [observation]
     ).accepted
+
+
+@pytest.mark.parametrize("reference", ["GIT_STATUS", "git.status", "git status"])
+def test_git_claim_alias_is_canonicalized_but_still_requires_exact_tool_call(
+    reference: str,
+) -> None:
+    call_id = uuid4()
+    observation = _git_observation("git.status", "GIT_STATUS", tool_call_id=call_id)
+
+    assert ExecutionTruthValidator.validate(
+        _context(), _git_result(reference, str(call_id)), [observation]
+    ).accepted
+    assert not ExecutionTruthValidator.validate(
+        _context(), _git_result(reference, str(uuid4())), [observation]
+    ).accepted
+
+
+def test_human_readable_git_reference_cannot_fabricate_another_operation() -> None:
+    call_id = uuid4()
+    observation = _git_observation("git.status", "GIT_STATUS", tool_call_id=call_id)
+
+    decision = ExecutionTruthValidator.validate(
+        _context(), _git_result("git diff", str(call_id)), [observation]
+    )
+
+    assert not decision.accepted
+    assert decision.failed_claim == {
+        "kind": "GIT",
+        "reference": "git diff",
+        "scope": "CURRENT_RUN",
+        "tool_call_id": str(call_id),
+    }
+
+
+def _pennypilot_result(
+    write_ids: dict[str, UUID],
+    git_status_id: UUID,
+) -> BaseAgentResult:
+    result = _result(["index.html", "styles.css", "app.js"])
+    result.output["execution_claims"] = [
+        {
+            "kind": "FILE_MUTATION",
+            "reference": "index.html",
+            "scope": "CURRENT_RUN",
+            "tool_call_id": None,
+        },
+        {
+            "kind": "FILE_MUTATION",
+            "reference": "styles.css",
+            "scope": "CURRENT_RUN",
+            "tool_call_id": None,
+        },
+        {
+            "kind": "FILE_MUTATION",
+            "reference": "app.js",
+            "scope": "CURRENT_RUN",
+            "tool_call_id": str(write_ids["app.js"]),
+        },
+        {
+            "kind": "GIT",
+            "reference": "git status",
+            "scope": "CURRENT_RUN",
+            "tool_call_id": str(git_status_id),
+        },
+    ]
+    return result
+
+
+def _pennypilot_observations(
+    *,
+    task_id: UUID,
+    task_run_id: UUID,
+    write_ids: dict[str, UUID],
+    git_status_id: UUID,
+) -> list[ToolObservation]:
+    before_rollover = uuid4()
+    after_rollover = uuid4()
+    return [
+        ToolObservation(
+            tool_call_id=write_ids[path],
+            tool="filesystem.write",
+            status="success",
+            result={"path": path},
+            task_id=task_id,
+            task_run_id=task_run_id,
+            agent_run_id=before_rollover if path != "app.js" else after_rollover,
+        )
+        for path in ("index.html", "styles.css", "app.js")
+    ] + [
+        _git_observation(
+            "git.status",
+            "GIT_STATUS",
+            tool_call_id=git_status_id,
+            task_id=task_id,
+            task_run_id=task_run_id,
+            agent_run_id=after_rollover,
+        ),
+        _git_observation(
+            "git.diff",
+            "GIT_DIFF",
+            task_id=task_id,
+            task_run_id=task_run_id,
+            agent_run_id=after_rollover,
+        ),
+    ]
+
+
+def test_pennypilot_rollover_keeps_same_task_run_execution_evidence_current() -> None:
+    task_id = uuid4()
+    project_id = uuid4()
+    task_run_id = uuid4()
+    write_ids = {path: uuid4() for path in ("index.html", "styles.css", "app.js")}
+    git_status_id = uuid4()
+    observations = _pennypilot_observations(
+        task_id=task_id,
+        task_run_id=task_run_id,
+        write_ids=write_ids,
+        git_status_id=git_status_id,
+    )
+
+    decision = ExecutionTruthValidator.validate(
+        _context(),
+        _pennypilot_result(write_ids, git_status_id),
+        observations,
+        current_task_id=task_id,
+        current_project_id=project_id,
+        current_task_run_id=task_run_id,
+    )
+
+    assert decision.accepted
+    assert len(decision.evidence) == 5
+    assert {item.agent_run_id for item in decision.evidence} == {
+        observations[0].agent_run_id,
+        observations[-1].agent_run_id,
+    }
+
+
+@pytest.mark.parametrize("failure", ["missing", "failed", "unrelated_task", "previous_task_run"])
+def test_pennypilot_rollover_rejects_untrusted_mutation_evidence(failure: str) -> None:
+    task_id = uuid4()
+    task_run_id = uuid4()
+    write_ids = {path: uuid4() for path in ("index.html", "styles.css", "app.js")}
+    git_status_id = uuid4()
+    observations = _pennypilot_observations(
+        task_id=task_id,
+        task_run_id=task_run_id,
+        write_ids=write_ids,
+        git_status_id=git_status_id,
+    )
+    app = observations[2]
+    if failure == "missing":
+        observations.remove(app)
+    elif failure == "failed":
+        observations[2] = app.model_copy(update={"status": "error", "result": None})
+    elif failure == "unrelated_task":
+        observations[2] = app.model_copy(update={"task_id": uuid4()})
+    else:
+        observations[2] = app.model_copy(update={"task_run_id": uuid4()})
+
+    decision = ExecutionTruthValidator.validate(
+        _context(),
+        _pennypilot_result(write_ids, git_status_id),
+        observations,
+        current_task_id=task_id,
+        current_task_run_id=task_run_id,
+    )
+
+    assert not decision.accepted
+    assert "app.js" in decision.message
+
+
+def test_pennypilot_historical_write_cannot_satisfy_current_run_claim() -> None:
+    task_id = uuid4()
+    project_id = uuid4()
+    task_run_id = uuid4()
+    write_ids = {path: uuid4() for path in ("index.html", "styles.css", "app.js")}
+    git_status_id = uuid4()
+    observations = _pennypilot_observations(
+        task_id=task_id,
+        task_run_id=task_run_id,
+        write_ids=write_ids,
+        git_status_id=git_status_id,
+    )
+    observations.pop(2)
+    historical = ExecutionEvidence(
+        kind=EvidenceKind.FILE_MUTATION,
+        tool="filesystem.write",
+        reference="app.js",
+        provenance=EvidenceProvenance.RECOVERY_HISTORY,
+        task_id=task_id,
+        project_id=project_id,
+        agent_run_id=uuid4(),
+        tool_call_id=write_ids["app.js"],
+        artifact_sha256="a" * 64,
+        checkpoint="deadbee",
+    )
+
+    decision = ExecutionTruthValidator.validate(
+        _context(),
+        _pennypilot_result(write_ids, git_status_id),
+        observations,
+        historical_evidence=(historical,),
+        current_task_id=task_id,
+        current_project_id=project_id,
+        current_task_run_id=task_run_id,
+    )
+
+    assert not decision.accepted
+    assert decision.failed_claim == {
+        "kind": "FILE_MUTATION",
+        "reference": "app.js",
+        "scope": "CURRENT_RUN",
+        "tool_call_id": str(write_ids["app.js"]),
+    }
 
 
 def test_failed_or_reused_git_observation_is_not_current_execution_evidence() -> None:

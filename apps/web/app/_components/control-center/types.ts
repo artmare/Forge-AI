@@ -1,4 +1,4 @@
-export type View = "overview" | "missions" | "companies" | "projects" | "agents" | "tasks" | "activity" | "system";
+export type View = "artifacts" | "settings" | "overview" | "missions" | "companies" | "projects" | "agents" | "tasks" | "activity" | "system";
 export type MissionTab = "overview" | "plan" | "tasks" | "artifacts" | "activity" | "technical";
 export type HealthValue = "healthy" | "unhealthy";
 
@@ -12,12 +12,18 @@ export interface Mission {
   owns_company?: boolean; owns_project?: boolean; created_at?: string; updated_at?: string;
 }
 export interface Validation { valid: boolean; errors: Array<{ code: string; message: string; path: string | null }> }
-export interface PlannerValidationEvidence {
+export interface PlannerSchemaValidationEvidence {
   field: string;
   expected: string;
   received?: { type?: string; length?: number };
   error_type?: string;
 }
+export interface PlannerCanonicalValidationEvidence {
+  code: string;
+  path: string | null;
+  message: string;
+}
+export type PlannerValidationEvidence = PlannerSchemaValidationEvidence | PlannerCanonicalValidationEvidence;
 export interface PlannerErrorDetails {
   code?: string; message?: string; category?: string; phase?: string; retryable?: boolean;
   retry_exhausted?: boolean; provider_attempts?: number; max_provider_attempts?: number;

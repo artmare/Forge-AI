@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
+import "./fonts.css";
 import "./globals.css";
+import "./reference-design.css";
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://forge-clipmind-control-center.karnaukhovartem20.chatgpt.site"),

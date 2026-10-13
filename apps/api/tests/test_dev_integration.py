@@ -84,6 +84,147 @@ async def test_runtime_rollover_retains_truth_and_blocks_mutation_replay(client,
         assert "Forge context handoff" in provider.requests[1].user_prompt
 
 
+async def test_runtime_rollover_repairs_current_task_run_scope_without_replaying(
+    client, monkeypatch
+):
+    company = await create_company(client)
+    project = await create_project(client, company["id"])
+    agent = await create_agent(
+        client,
+        company["id"],
+        role="LEAD_ENGINEER",
+        permissions={"filesystem.write": True, "git.read": True},
+    )
+    response = await client.post(
+        "/api/v1/tasks",
+        json={
+            "company_id": company["id"],
+            "project_id": project["id"],
+            "assigned_agent_id": agent["id"],
+            "type": "IMPLEMENTATION",
+            "kind": "DEVELOPMENT",
+            "title": "PennyPilot rollover provenance regression",
+            "input": {"deliverables": ["index.html", "styles.css", "app.js"]},
+            "acceptance_criteria": [
+                "index.html, styles.css, and app.js exist and link correctly"
+            ],
+            "max_iterations": 2,
+        },
+    )
+    assert response.status_code == 201, response.text
+    task = response.json()
+    await transition_task(client, task["id"], "QUEUED")
+
+    invalid = final(
+        "Completed all three current TaskRun deliverables.",
+        ["index.html", "styles.css", "app.js"],
+    )
+    invalid["result"]["output"]["execution_claims"] = [
+        {
+            "kind": "FILE_MUTATION",
+            "reference": path,
+            "scope": "HISTORICAL" if path != "app.js" else "CURRENT_RUN",
+            "tool_call_id": None,
+        }
+        for path in ("index.html", "styles.css", "app.js")
+    ]
+    corrected = final(
+        "Completed all three current TaskRun deliverables.",
+        ["index.html", "styles.css", "app.js"],
+    )
+    corrected["result"]["output"]["execution_claims"] = [
+        {
+            "kind": "FILE_MUTATION",
+            "reference": path,
+            "scope": "CURRENT_RUN",
+            "tool_call_id": None,
+        }
+        for path in ("index.html", "styles.css", "app.js")
+    ]
+    provider = MockModelProvider(
+        responses=[
+            tool("filesystem.write", path="index.html", content="<main>PennyPilot</main>"),
+            tool("filesystem.write", path="styles.css", content="body{margin:0}"),
+            tool("filesystem.write", path="app.js", content="document.body.dataset.ready='true'"),
+            tool("git.status"),
+            tool("git.diff"),
+            invalid,
+            corrected,
+        ]
+    )
+    threshold_checks = 0
+
+    def rollover_after_two_writes(self, request, limit, *, reserve_tokens=0):
+        nonlocal threshold_checks
+        threshold_checks += 1
+        return threshold_checks == 3
+
+    monkeypatch.setattr(ContextRollover, "needed", rollover_after_two_writes)
+    settings = Settings(
+        forge_dev_mode_enabled=True,
+        forge_dev_context_reserve_tokens=0,
+    )
+    async with get_session_factory()() as session:
+        await ProjectBootstrapService(session, settings=settings).ensure_task(
+            UUID(task["id"]), checkpoint=True
+        )
+        run = await AgentRuntime(session, settings=settings, provider=provider).execute(
+            UUID(task["id"]), defer_review=True
+        )
+        calls = list(
+            await session.scalars(
+                select(ToolCall)
+                .where(ToolCall.task_id == UUID(task["id"]))
+                .order_by(ToolCall.created_at, ToolCall.id)
+            )
+        )
+        rollover = await session.scalar(
+            select(Event).where(
+                Event.task_id == UUID(task["id"]),
+                Event.type == "DEV_CONTEXT_ROLLOVER",
+            )
+        )
+        repair = await session.scalar(
+            select(Event).where(
+                Event.task_id == UUID(task["id"]),
+                Event.type == "DEV_EXECUTION_TRUTH_REPAIR_REQUIRED",
+            )
+        )
+
+    assert run.status.value == "SUCCEEDED"
+    assert rollover is not None
+    assert repair is not None
+    assert rollover.details["execution_scope"] == {
+        "active_task_run_id": str(calls[0].task_run_id),
+        "rollover_preserves_current_run": True,
+        "historical_requires_approved_recovery": True,
+    }
+    assert {
+        (item["reference"], item["scope"])
+        for item in rollover.details["current_execution_claims"]
+        if item["kind"] == "FILE_MUTATION"
+    } == {("index.html", "CURRENT_RUN"), ("styles.css", "CURRENT_RUN")}
+    rollover_request = next(
+        request
+        for request in provider.requests
+        if "Forge context handoff (continuation snapshot)" in request.user_prompt
+    )
+    assert '"rollover_preserves_current_run":true' in rollover_request.user_prompt
+    assert "CURRENT_RUN covers the entire active TaskRun" in rollover_request.system_prompt
+    assert '"supported_claim":{"kind":"FILE_MUTATION","reference":"index.html",' in (
+        provider.requests[-1].user_prompt
+    )
+    assert '"scope":"CURRENT_RUN"' in provider.requests[-1].user_prompt
+    assert [item.tool_name for item in calls] == [
+        "filesystem.write",
+        "filesystem.write",
+        "filesystem.write",
+        "git.status",
+        "git.diff",
+    ]
+    assert provider.call_count == 7
+
+
 async def test_missing_third_deliverable_rollover_cannot_force_completion(
     client, monkeypatch
 ):

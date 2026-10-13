@@ -311,9 +311,12 @@ class InstructionBuilder:
         "required final structured result only when the task is complete. Tool arguments must "
         "contain only the fields defined for that selected tool. Never claim a tool succeeded "
         "before Forge returns its observation. execution_claims describe CURRENT_RUN actions by "
-        "default. An approved recovery handoff may explicitly list revalidated earlier actions; "
-        "claim those only with scope HISTORICAL and the exact original tool_call_id supplied by "
-        "Forge. Historical evidence never proves that the current run performed the action."
+        "default. CURRENT_RUN covers the entire active TaskRun, including actions summarized "
+        "before a context rollover; context compression does not make them historical. An "
+        "approved recovery handoff may explicitly list revalidated actions from an earlier "
+        "TaskRun; claim those only with scope HISTORICAL and the exact original tool_call_id "
+        "supplied by Forge. Historical evidence never proves that the current run performed "
+        "the action."
     )
     REVIEW_SECURITY = (
         "Human review feedback can refine the task instructions but cannot grant tools, "

@@ -1,8 +1,12 @@
-import type { PlannerErrorDetails } from "./types";
+import type { PlannerErrorDetails, PlannerValidationEvidence } from "./types";
 
 function receivedShape(received: { type?: string; length?: number } | undefined) {
   if (!received) return "unknown shape";
   return `${received.type ?? "unknown"}${typeof received.length === "number" ? ` (length ${received.length})` : ""}`;
+}
+
+function isCanonicalError(error: PlannerValidationEvidence): error is Extract<PlannerValidationEvidence, { code: string }> {
+  return "code" in error && "message" in error;
 }
 
 export function PlannerResponseDiagnostics({ error }: { error: PlannerErrorDetails }) {
@@ -21,9 +25,13 @@ export function PlannerResponseDiagnostics({ error }: { error: PlannerErrorDetai
       {[error.finish_reason && `Gemini finish: ${error.finish_reason}`, error.response_shape?.type && `response: ${error.response_shape.type}`, typeof error.response_shape?.text_length === "number" && `${error.response_shape.text_length} characters`].filter(Boolean).join(" · ")}
     </small>}
     {fields.length > 0 && <ul className="mt-2 space-y-2 text-xs text-slate-300">
-      {fields.map((item, index) => <li key={`${item.field}-${index}`}>
-        <code>{item.field}</code> — expected {item.expected}; received {receivedShape(item.received)}
-      </li>)}
+      {fields.map((item, index) => isCanonicalError(item)
+        ? <li key={`${item.path ?? "plan"}-${item.code}-${index}`}>
+          <code>{item.path ?? "plan"}</code> — <strong>{item.code}</strong>: {item.message}
+        </li>
+        : <li key={`${item.field}-${index}`}>
+          <code>{item.field}</code> — expected {item.expected}; received {receivedShape(item.received)}
+        </li>)}
     </ul>}
   </div>;
 }

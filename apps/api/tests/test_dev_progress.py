@@ -103,6 +103,15 @@ def test_rollover_snapshot_is_action_oriented_and_omits_raw_file_content():
         observations=observations,
         tool_steps=4,
         duplicate_signals=0,
+        current_task_run_id="task-run",
+        current_execution_claims=[
+            {
+                "kind": "FILE_MUTATION",
+                "reference": "index.html",
+                "scope": "CURRENT_RUN",
+                "tool_call_id": str(observations[0].tool_call_id),
+            }
+        ],
         file_states=[
             {
                 "path": "index.html",
@@ -116,6 +125,19 @@ def test_rollover_snapshot_is_action_oriented_and_omits_raw_file_content():
     assert "Return the final structured result" in snapshot["next_action"]
     assert "secret-large-content" not in str(snapshot)
     assert snapshot["git_state"]["git.status"]["output_sha256"]
+    assert snapshot["execution_scope"] == {
+        "active_task_run_id": "task-run",
+        "rollover_preserves_current_run": True,
+        "historical_requires_approved_recovery": True,
+    }
+    assert snapshot["current_execution_claims"] == [
+        {
+            "kind": "FILE_MUTATION",
+            "reference": "index.html",
+            "scope": "CURRENT_RUN",
+            "tool_call_id": str(observations[0].tool_call_id),
+        }
+    ]
 
 
 def test_rollover_snapshot_does_not_reopen_a_repaired_schema_failure():

@@ -103,6 +103,8 @@ class ContextRollover:
         tool_steps: int,
         duplicate_signals: int,
         reason: str = "MODEL_CONTEXT_THRESHOLD",
+        current_task_run_id: str | None = None,
+        current_execution_claims: list[dict[str, str | None]] | None = None,
         file_states: list[dict[str, Any]] | None = None,
         required_actions: list[str] | None = None,
         completion_safety: dict[str, Any] | None = None,
@@ -237,6 +239,12 @@ class ContextRollover:
             "tool_steps": tool_steps,
             "duplicate_signals": duplicate_signals,
             "rollover_reason": reason,
+            "execution_scope": {
+                "active_task_run_id": current_task_run_id,
+                "rollover_preserves_current_run": True,
+                "historical_requires_approved_recovery": True,
+            },
+            "current_execution_claims": (current_execution_claims or [])[-30:],
             "completed": results,
             "successful_tool_counts": {
                 name: sum(item.tool == name and item.status == "success" for item in observations)
