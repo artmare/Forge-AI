@@ -39,6 +39,7 @@ describe("ControlCenter mission lifecycle", () => {
     let created = false;
     let planned = false;
     let activated = false;
+    const older = { ...mission, id: "22222222-2222-4222-8222-222222222222", title: "Older mission" };
     const calls: Array<{ path: string; method: string }> = [];
     vi.stubGlobal("EventSource", EventSourceStub);
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -47,12 +48,13 @@ describe("ControlCenter mission lifecycle", () => {
       calls.push({ path, method });
       const json = (payload: unknown, responseStatus = 200) => new Response(JSON.stringify(payload), { status: responseStatus, headers: { "content-type": "application/json" } });
       if (path === "/api/status") return json(status);
-      if (path.includes("missions?archive=active")) return json(created ? [{ ...mission, status: activated ? "ACTIVE" : planned ? "PLAN_READY" : "DRAFT", planning_attempts: planned ? 1 : 0 }] : []);
+      if (path.includes("missions?archive=active")) return json(created ? [{ ...mission, status: activated ? "ACTIVE" : planned ? "PLAN_READY" : "DRAFT", planning_attempts: planned ? 1 : 0 }, older] : [older]);
       if (path.includes("missions?archive=archived")) return json([]);
       if (path === "/api/forge/missions" && method === "POST") { created = true; return json(mission, 201); }
       if (path.endsWith(`/missions/${mission.id}/plan`) && method === "POST") { planned = true; return json({ planning_run: { status: "SUCCEEDED" }, proposal: {}, validation: { valid: true, errors: [] } }); }
       if (path.endsWith(`/missions/${mission.id}/activate`) && method === "POST") { activated = true; return json({ ...mission, status: "ACTIVE", planning_attempts: 1 }); }
       if (path.endsWith(`/missions/${mission.id}`)) return json({ ...mission, status: activated ? "ACTIVE" : planned ? "PLAN_READY" : "DRAFT", planning_attempts: planned ? 1 : 0 });
+      if (path.endsWith(`/missions/${older.id}`)) return json(older);
       if (path.endsWith(`/missions/${mission.id}/plan`)) return json({ planning_run: { status: "SUCCEEDED", provider: "test", model_alias: "planner", estimated_cost: null, validation_result: { valid: true, errors: [] } }, proposal: null, validation: { valid: true, errors: [] } });
       return json({ error: { message: `Unhandled test request: ${method} ${path}` } }, 404);
     }));
@@ -68,9 +70,10 @@ describe("ControlCenter mission lifecycle", () => {
     await waitFor(() => expect(calls.some((call) => call.path.endsWith(`/missions/${mission.id}/activate`) && call.method === "POST")).toBe(true));
     await waitFor(() => expect(new URLSearchParams(window.location.search).get("mission")).toBe(mission.id));
     expect(new URLSearchParams(window.location.search).get("view")).toBe("missions");
+    await waitFor(() => expect(screen.getByRole("heading", { name: mission.title })).toBeTruthy());
   });
 
-  it("retries the saved mission after planning fails without creating a duplicate", async () => {
+  it.each([false, true])("retries saved inputs or persists changed inputs (changed=%s)", async (changed) => {
     let createCount = 0;
     let planCount = 0;
     let planned = false;
@@ -102,10 +105,15 @@ describe("ControlCenter mission lifecycle", () => {
     await user.type(screen.getByLabelText("Mission title"), mission.title);
     await user.type(screen.getByLabelText("Outcome"), mission.goal);
     await user.click(screen.getByRole("button", { name: "Create & start" }));
+    await screen.findByRole("button", { name: "Retry saved mission" });
+    if (changed) {
+      await user.clear(screen.getByLabelText("Maximum tasks"));
+      await user.type(screen.getByLabelText("Maximum tasks"), "4");
+    }
     await user.click(await screen.findByRole("button", { name: "Retry saved mission" }));
 
     await waitFor(() => expect(activated).toBe(true));
-    expect(createCount).toBe(1);
+    expect(createCount).toBe(changed ? 2 : 1);
     expect(planCount).toBe(2);
   });
 });

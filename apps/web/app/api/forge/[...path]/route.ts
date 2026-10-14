@@ -26,7 +26,9 @@ async function proxy(
     method: request.method,
     headers,
     cache: "no-store",
-    signal: AbortSignal.timeout(35_000),
+    // Planning includes bounded provider retries, fallback and canonical repair.
+    // A single 30s provider attempt must not consume the entire HTTP budget.
+    signal: AbortSignal.timeout(joined.endsWith("/plan") && request.method === "POST" ? 600_000 : 35_000),
   };
   if (request.method !== "GET" && request.method !== "HEAD") {
     headers.set("content-type", "application/json");
@@ -41,7 +43,13 @@ async function proxy(
       status: response.status,
       headers: { "content-type": "application/json" },
     });
-  } catch {
+  } catch (cause) {
+    if (cause && typeof cause === "object" && "name" in cause && cause.name === "TimeoutError") {
+      return Response.json(
+        { error: { code: "backend_timeout", message: "Forge is still processing or the request timed out. Refresh the saved mission before retrying; it may already have completed.", retryable: true } },
+        { status: 504 },
+      );
+    }
     return Response.json(
       { error: { code: "backend_unavailable", message: "Forge API is unavailable." } },
       { status: 503 },

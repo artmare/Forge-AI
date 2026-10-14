@@ -258,6 +258,10 @@ def test_forge_git_acceptance_requires_an_observable_outcome() -> None:
         command_only = analyze_acceptance_criterion(command)
         assert not command_only.observable
 
+    assert AcceptanceMechanism.ARTIFACT in analyze_acceptance_criterion(
+        "reports/git.log exists"
+    ).mechanisms
+
 
 def test_static_acceptance_requires_a_concrete_file_path() -> None:
     exact = analyze_acceptance_criterion(

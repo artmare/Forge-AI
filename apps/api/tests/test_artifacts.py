@@ -49,6 +49,20 @@ async def test_artifact_list_and_valid_utf8_reads(client: AsyncClient) -> None:
     assert nested.json()["content"] == '{"ready":true}'
 
 
+@pytest.mark.parametrize("extension", ["mjs", "cjs"])
+async def test_javascript_modules_are_readable_source(client: AsyncClient, extension: str):
+    project, workspace = await artifact_project(client)
+    name = f"app.{extension}"
+    source = "console.log('<script>source only</script>');"
+    (workspace / name).write_text(source, encoding="utf-8")
+    response = await client.get(
+        f"/api/v1/projects/{project['id']}/artifacts/content", params={"path": name}
+    )
+    assert response.status_code == 200
+    assert response.json()["content"] == source
+    assert response.json()["preview_kind"] == "code"
+
+
 @pytest.mark.parametrize(
     "attack",
     [

@@ -88,6 +88,7 @@ export function ControlCenter() {
   const [busy, setBusy] = useState(false);
   const [createStage, setCreateStage] = useState<string | null>(null);
   const [pendingCreate, setPendingCreate] = useState<Mission | null>(null);
+  const pendingCreatePayload = useRef<string | null>(null);
   const [controlBusy, setControlBusy] = useState(false);
   const [selectedArtifact, setSelectedArtifact] = useState<ArtifactMetadata | null>(null);
   const [theme, setTheme] = useState<"light" | "dark">("dark");
@@ -133,10 +134,11 @@ export function ControlCenter() {
       const ordered = [...missions].sort((a, b) => missionPriority.indexOf(a.status) - missionPriority.indexOf(b.status));
       const archived = [...archivedMissions].sort((a, b) => Date.parse(b.archived_at ?? "") - Date.parse(a.archived_at ?? ""));
       const operationalStatus = { ...status, recentEvents: status.recentEvents.filter((event) => !archivedEvent(event, archived)) };
-      const all = [...ordered, ...archived];
       setData((current) => ({ ...current, status: operationalStatus, missions: ordered, archivedMissions: archived }));
       setSelectedId((current) => {
-        if (current && all.some((item) => item.id === current)) return current;
+        // A refresh may have started before the selected Mission was created.
+        // Never replace an explicit selection using an older list response.
+        if (current) return current;
         const next = ordered[0]?.id ?? archived[0]?.id ?? null;
         if (routeReady.current && next) {
           const route = readRoute();
@@ -152,15 +154,15 @@ export function ControlCenter() {
     }
   }, []);
 
-  const refreshDetail = useCallback(async () => {
+  const refreshDetail = useCallback(async (missionId: string | null = selectedId) => {
     const requestId = ++detailRequest.current;
-    if (!selectedId) {
+    if (!missionId) {
       setData((current) => ({ ...current, mission: null, plan: null, graph: null, company: null, project: null, developmentProfile: null, agents: [], focusTask: null, taskRuns: [], artifacts: null, artifactError: null }));
       return;
     }
-    setData((current) => current.mission?.id === selectedId ? current : ({ ...current, mission: null, plan: null, graph: null, company: null, project: null, developmentProfile: null, agents: [], focusTask: null, taskRuns: [], artifacts: null, artifactError: null }));
+    setData((current) => current.mission?.id === missionId ? current : ({ ...current, mission: null, plan: null, graph: null, company: null, project: null, developmentProfile: null, agents: [], focusTask: null, taskRuns: [], artifacts: null, artifactError: null }));
     try {
-      const mission = await forge<Mission>(`missions/${selectedId}`);
+      const mission = await forge<Mission>(`missions/${missionId}`);
       const [planResult, graphResult, companyResult, projectResult, profileResult, agentsResult, artifactsResult] = await Promise.allSettled([
         mission.planning_attempts > 0 ? forge<Plan>(`missions/${mission.id}/plan`) : Promise.resolve(null),
         mission.project_id ? forge<Graph>(`projects/${mission.project_id}/graph`) : Promise.resolve(null),
@@ -291,12 +293,14 @@ export function ControlCenter() {
     const payload = { ...body };
     delete payload.start_immediately;
     setBusy(true);
-    let mission: Mission | null = pendingCreate && pendingCreate.title === body.title && pendingCreate.goal === body.goal ? pendingCreate : null;
+    const payloadKey = JSON.stringify(payload);
+    let mission: Mission | null = pendingCreate && pendingCreatePayload.current === payloadKey ? pendingCreate : null;
     try {
       if (!mission) {
         setCreateStage("Creating mission…");
         mission = await forge<Mission>("missions", "POST", payload);
         setPendingCreate(mission);
+        pendingCreatePayload.current = payloadKey;
       } else {
         setCreateStage("Checking saved mission…");
         mission = await forge<Mission>(`missions/${mission.id}`);
@@ -318,9 +322,10 @@ export function ControlCenter() {
       }
       setCreateStage("Loading execution state…");
       await refreshCore();
-      await refreshDetail();
+      await refreshDetail(mission.id);
       setDrawer(false);
       setPendingCreate(null);
+      pendingCreatePayload.current = null;
       setError(null);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : "Mission could not be created.";

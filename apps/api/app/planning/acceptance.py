@@ -77,7 +77,12 @@ _SUBJECTIVE = re.compile(
 def analyze_acceptance_criterion(criterion: str) -> AcceptanceCriterionAnalysis:
     """Classify observable mechanisms without treating evidence prose as evidence itself."""
     mechanisms: set[AcceptanceMechanism] = set()
-    has_path = _PATH.search(criterion) is not None
+    # Forge tool names such as git.status are commands, not artifact filenames.
+    # Strip only whole command tokens; a path such as reports/git.log remains a file.
+    artifact_text = re.sub(
+        r"(?<![\w./-])git\.(?:status|diff|log)(?![\w./-])", "", criterion, flags=re.IGNORECASE
+    )
+    has_path = _PATH.search(artifact_text) is not None
     has_git_command = _GIT_COMMAND.search(criterion) is not None
     has_command = _COMMAND.search(criterion) is not None or has_git_command
     # `status` is also a supported Git operation name. Remove Forge-owned Git command

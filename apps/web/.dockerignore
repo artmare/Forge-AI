@@ -1,6 +1,8 @@
 node_modules
 .next
 .vinext
+.openai
+.wrangler
 dist
 tsconfig.tsbuildinfo
 npm-debug.log*

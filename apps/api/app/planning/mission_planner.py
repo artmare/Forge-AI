@@ -640,6 +640,7 @@ class MissionPlanner:
                 "mission_id": str(mission.id),
                 "mission_title": mission.title,
                 "planning_attempt": str(mission.planning_attempts),
+                "mock_scenario": str((mission.context or {}).get("mock_scenario", "")),
             },
             response_model=PlanProposal,
         )

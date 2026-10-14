@@ -65,16 +65,28 @@ class MockModelProvider:
         output = self.response
         if self.responses:
             output = self.responses[min(self.call_count - 1, len(self.responses) - 1)]
+        # Routing constructs a fresh provider per turn. Scenario progress belongs
+        # to the Forge execution, not the adapter instance. Scripted test responses
+        # above deliberately retain their instance-local sequence.
+        turn_number = int(request.metadata.get("turn_number", self.call_count))
+        if output is None and request.metadata.get("mock_scenario") == "todo_demo":
+            from app.agent_runtime.mock_development import proposal, turn
+
+            output = (
+                proposal(request.metadata.get("mission_title", "Mock Todo sample"))
+                if request.response_model.__name__ == "PlanProposal"
+                else turn(turn_number)
+            )
         if output is None and request.metadata.get("mock_scenario") == "filesystem_roundtrip":
             path = request.metadata.get("mock_path") or "forge-phase07.txt"
             content = request.metadata.get("mock_content") or "Forge autonomous execution"
-            if self.call_count == 1:
+            if turn_number == 1:
                 output = {
                     "type": "tool_call",
                     "tool_name": "filesystem.write",
                     "arguments": {"path": path, "content": content},
                 }
-            elif self.call_count == 2:
+            elif turn_number == 2:
                 output = {
                     "type": "tool_call",
                     "tool_name": "filesystem.read",
@@ -99,7 +111,7 @@ class MockModelProvider:
                     "tool_name": "filesystem.write",
                     "arguments": {"path": path, "content": content},
                 }
-                if self.call_count == 1
+                if turn_number == 1
                 else {
                     "type": "final",
                     "result": {
@@ -118,7 +130,7 @@ class MockModelProvider:
                     "tool_name": "filesystem.read",
                     "arguments": {"path": path},
                 }
-                if self.call_count == 1
+                if turn_number == 1
                 else {
                     "type": "final",
                     "result": {

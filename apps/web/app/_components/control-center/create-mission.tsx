@@ -13,6 +13,13 @@ interface Props {
   onCreate: (body: Record<string, unknown>) => Promise<void>;
 }
 function pretty(value: string) { return value.trim() ? JSON.stringify(JSON.parse(value), null, 2) : "{}"; }
+function jsonObject(value: string) {
+  const parsed: unknown = JSON.parse(value || "{}");
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new SyntaxError("Advanced fields must be JSON objects.");
+  }
+  return parsed as Record<string, unknown>;
+}
 type PlannerFailure = ForgeErrorDetails & { message: string; code?: string };
 
 function plannerFailure(cause: unknown): PlannerFailure {
@@ -50,8 +57,8 @@ export function CreateMission({ open, busy, stage, retrying, runtimePaused, onCl
   async function submit(event: FormEvent) {
     event.preventDefault();
     try {
-      const parsedConstraints = JSON.parse(constraints || "{}");
-      const parsedContext = JSON.parse(context || "{}");
+      const parsedConstraints = jsonObject(constraints);
+      const parsedContext = jsonObject(context);
       await onCreate({
         title, goal, start_immediately: startImmediately, paid_ai_budget: paidAiBudget,
         constraints: { ...parsedConstraints, max_agents: maxAgents, max_tasks: maxTasks, internet_access: internetAccess, browser_access: browserAccess },
@@ -61,7 +68,7 @@ export function CreateMission({ open, busy, stage, retrying, runtimePaused, onCl
       setMaxAgents(3); setMaxTasks(8); setInternetAccess(false); setBrowserAccess(false); setPaidAiBudget(0); setAdvanced(false); setStartImmediately(true); setError(null);
     } catch (cause) {
       setError(cause instanceof SyntaxError
-        ? { code: "INVALID_JSON", message: "Advanced fields must contain valid JSON.", retryable: false }
+        ? { code: "INVALID_JSON", message: "Advanced fields must contain valid JSON objects.", retryable: false }
         : plannerFailure(cause));
     }
   }
@@ -70,7 +77,8 @@ export function CreateMission({ open, busy, stage, retrying, runtimePaused, onCl
     <button className="drawer-backdrop" onClick={onClose} disabled={busy} aria-label="Close create mission dialog" />
     <aside className="create-drawer">
       <div className="drawer-header"><div><p className="eyebrow">New operation</p><h2 id="create-title">Create a mission</h2></div><button onClick={onClose} disabled={busy} className="icon-button" aria-label="Close"><Icon name="close" /></button></div>
-      <form onSubmit={submit} className="drawer-form">
+      <form onSubmit={submit} onChange={() => setError(null)} className="drawer-form">
+        {retrying && <p className="text-xs text-slate-400">Unchanged inputs retry the saved Mission. Changing inputs creates a new Mission with those settings.</p>}
         <div><label htmlFor="mission-title">Mission title</label><input id="mission-title" autoFocus required value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Launch the customer insight hub" /></div>
         <div><label htmlFor="mission-goal">Outcome</label><textarea id="mission-goal" required rows={5} value={goal} onChange={(event) => setGoal(event.target.value)} onInput={(event) => { event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 320)}px`; }} placeholder="Describe the concrete outcome Forge should organize and execute…" /></div>
         <label className="start-mission-control"><input type="checkbox" checked={startImmediately} onChange={(event) => setStartImmediately(event.target.checked)} /><span><strong>Plan and activate after creation</strong><small>{runtimePaused ? "The mission will be activated and queued. Resume autonomy when you want workers to execute it." : "Forge will create the plan and begin execution immediately."}</small></span></label>

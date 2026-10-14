@@ -7,6 +7,17 @@ import { ForgeRequestError } from "./helpers";
 afterEach(() => cleanup());
 
 describe("CreateMission", () => {
+  it.each(["null", "[]", '"text"', "42"])("rejects non-object advanced JSON %s", async (value) => {
+    const onCreate = vi.fn();
+    render(<CreateMission open busy={false} stage={null} retrying={false} runtimePaused onClose={vi.fn()} onCreate={onCreate} />);
+    fireEvent.change(screen.getByLabelText("Mission title"), { target: { value: "Validation" } });
+    fireEvent.change(screen.getByLabelText("Outcome"), { target: { value: "Test validation." } });
+    fireEvent.click(screen.getByRole("button", { name: /Advanced structured inputs/ }));
+    fireEvent.change(screen.getByLabelText("Constraints JSON"), { target: { value } });
+    fireEvent.click(screen.getByRole("button", { name: "Create & start" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("JSON objects");
+    expect(onCreate).not.toHaveBeenCalled();
+  });
   it("submits a real create-and-start request with bounded planning inputs", async () => {
     const onCreate = vi.fn(async () => undefined);
     const user = userEvent.setup();

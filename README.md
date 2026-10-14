@@ -3,7 +3,7 @@
 Forge Dev Mode architecture and configuration are documented in
 [`docs/forge-dev-mode.md`](docs/forge-dev-mode.md).
 
-Forge is an Autonomous Company OS. This repository contains the Phase 08 Mission planning runtime:
+Forge is an autonomous Mission execution platform. This repository contains the Mission planning runtime:
 domain APIs, a concurrency-safe task state machine, provider-neutral multi-turn model execution,
 durable AgentRun and ToolCall history, strict permission enforcement, isolated project workspaces,
 deterministic scheduling, leased workers, PostgreSQL transactional outbox, Redis Streams, live
@@ -13,8 +13,10 @@ human review gates, and automated tests.
 Users explicitly create and plan Missions, inspect a validated proposal, and activate it before Forge
 materializes topology. Queued tasks can be picked up after explicit resume. Autonomy is persistently paused
 by default after migration. The default mock provider is deterministic and free. The manual
-`POST /api/v1/tasks/{id}/execute` debug path remains available. Phase 08 adds no shell/network/browser
-tools, autonomous goal selection, autonomous Mission creation, or human-review bypass.
+`POST /api/v1/tasks/{id}/execute` debug path remains available. DEVELOPMENT tasks additionally use
+isolated development/install runners, deterministic verification and independent QA. An optional
+network-isolated browser runner captures static pages. These capabilities preserve permission
+checks and human review; see the development and verification documentation under `docs/`.
 
 ## Prerequisites
 
@@ -51,6 +53,35 @@ make up
 ```
 
 Open the dashboard at <http://localhost:3000>. The API is available at <http://localhost:8000>; interactive API documentation is at <http://localhost:8000/docs>.
+
+The self-hosted web build uses the Node standalone server. It does not require
+`.openai/hosting.json`, Cloudflare bindings, or a Sites deployment configuration.
+
+### Local Mission smoke test
+
+With the default mock provider, create a Mission in the Control Center and leave
+**Plan and activate after creation** selected. Resume autonomy if paused. The default
+mock creates a fixed brief-writing plan; it does not implement arbitrary goals.
+Approve the first task to release the dependent verification task, then approve
+that result to complete the Mission.
+
+To exercise DEVELOPMENT without a model credential, expand **Advanced structured
+inputs** and set **Context JSON** to `{"mock_scenario":"todo_demo"}`. This explicit
+scripted sample writes a minimal Todo application into an isolated project, runs
+its Node tests/build and passes through independent QA and human review. Inspect
+**Files** and **Inspect execution** before approving. It has no package dependencies
+and does not test package installation or live model intelligence.
+
+The Control Center previews bounded text/source artifacts. ZIP downloads and a
+hosted application preview are not currently implemented. The reproducible browser
+checks under `tests/browser/` require a host Playwright installation; run from the
+repository root with `node tests/browser/reliability.cjs todo`, then
+`node tests/browser/reliability.cjs review-todo` and
+`node tests/browser/generated-todo.cjs`. Set `PLAYWRIGHT_CHANNEL=msedge` when using
+installed Edge; otherwise install Playwright Chromium. These checks create audit
+Missions in the running local stack and save evidence under ignored
+`artifacts/reliability-audit/`. See [the reliability audit](docs/reliability-audit.md)
+for tested scope, outcomes and limitations.
 
 ```sh
 make logs

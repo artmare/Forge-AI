@@ -7,13 +7,23 @@ export async function forge<T>(path: string, method = "GET", body?: unknown): Pr
     body: body === undefined ? undefined : JSON.stringify(body),
     cache: "no-store",
   });
-  const payload = (await response.json()) as T & { error?: ForgeErrorDetails };
-  if (!response.ok) {
+  let payload: T & { error?: ForgeErrorDetails };
+  try {
+    payload = await response.json();
+  } catch {
     throw new ForgeRequestError(
-      payload.error?.message ?? `Forge returned HTTP ${response.status}`,
-      payload.error?.code ?? "forge_request_failed",
+      response.ok ? "Forge returned an invalid response. Refresh and try again." : `Forge returned HTTP ${response.status} without a valid error response.`,
+      response.ok ? "invalid_response" : "forge_request_failed",
       response.status,
-      payload.error ?? {},
+    );
+  }
+  if (!response.ok) {
+    const details = payload && typeof payload === "object" && payload.error && typeof payload.error === "object" ? payload.error : {};
+    throw new ForgeRequestError(
+      typeof details.message === "string" ? details.message : `Forge returned HTTP ${response.status}`,
+      typeof details.code === "string" ? details.code : "forge_request_failed",
+      response.status,
+      details,
     );
   }
   return payload;

@@ -903,8 +903,9 @@ async def test_stale_planning_recovery_is_replannable(client: AsyncClient) -> No
     assert detail["status"] == MissionStatus.DRAFT.value
 
 
+@pytest.mark.parametrize("injected_provider", [False, True])
 async def test_full_autonomous_mission_e2e_uses_mock_only(
-    client: AsyncClient, tmp_path: Path
+    client: AsyncClient, tmp_path: Path, injected_provider: bool
 ) -> None:
     mission = await create_mission(client, "Autonomous Mission")
     plan = await client.post(f"/api/v1/missions/{mission['id']}/plan")
@@ -930,7 +931,9 @@ async def test_full_autonomous_mission_e2e_uses_mock_only(
         assert started is not None and started.status == ExecutionJobStatus.RUNNING
         async with get_session_factory()() as session:
             run = await AgentRuntime(
-                session, settings=settings, provider=MockModelProvider()
+                session,
+                settings=settings,
+                provider=MockModelProvider() if injected_provider else None,
             ).execute(job.task_id)
         async with get_session_factory()() as session:
             assert await WorkerExecutionService(session).succeed(

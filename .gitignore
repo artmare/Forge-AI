@@ -16,3 +16,4 @@ dist/
 *.tsbuildinfo
 .DS_Store
 Thumbs.db
+/artifacts/reliability-*

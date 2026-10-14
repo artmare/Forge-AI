@@ -38,6 +38,8 @@ PREVIEW_TYPES = {
     ".ts": PreviewType("TypeScript", "code"),
     ".tsx": PreviewType("TypeScript JSX", "code"),
     ".js": PreviewType("JavaScript", "code"),
+    ".mjs": PreviewType("JavaScript module", "code"),
+    ".cjs": PreviewType("CommonJS", "code"),
     ".jsx": PreviewType("JavaScript JSX", "code"),
     ".css": PreviewType("CSS", "code"),
     ".html": PreviewType("HTML source", "code"),

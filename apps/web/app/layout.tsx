@@ -5,8 +5,9 @@ import "./globals.css";
 import "./reference-design.css";
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://forge-clipmind-control-center.karnaukhovartem20.chatgpt.site"),
+  metadataBase: new URL(process.env.PUBLIC_APP_URL ?? "http://localhost:3000"),
   title: "Forge Control Center",
+  icons: { icon: "/favicon.svg" },
   description: "Autonomous Developer + QA Mission Control",
   openGraph: {
     title: "Forge Control Center",
